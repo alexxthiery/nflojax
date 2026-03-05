@@ -1,4 +1,4 @@
-# Extending nflows
+# Extending nflojax
 
 Recipes for adding custom Transforms, Distributions, and Conditioners.
 
@@ -55,7 +55,7 @@ def init_params(self, key, context_dim=0):
 Use with `CompositeTransform` to chain transforms:
 
 ```python
-from nflows.transforms import CompositeTransform
+from nflojax.transforms import CompositeTransform
 
 composite = CompositeTransform(blocks=[transform1, transform2, transform3])
 y, log_det = composite.forward(params_list, x)
@@ -94,7 +94,7 @@ def init_params() -> params  # Initialize parameters (no key needed)
 Use with `Flow` as the base distribution:
 
 ```python
-from nflows.flows import Flow
+from nflojax.flows import Flow
 
 flow = Flow(base_dist=my_distribution, transform=my_transform)
 log_prob = flow.log_prob(params, x)

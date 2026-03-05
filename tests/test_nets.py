@@ -11,7 +11,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflows.nets import MLP, ResNet, init_mlp, init_resnet
+from nflojax.nets import MLP, ResNet, init_mlp, init_resnet
 
 
 # ---------------------------------------------------------------------------

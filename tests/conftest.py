@@ -1,5 +1,5 @@
 # tests/conftest.py
-"""Shared pytest fixtures for nflows tests."""
+"""Shared pytest fixtures for nflojax tests."""
 from __future__ import annotations
 
 import pytest

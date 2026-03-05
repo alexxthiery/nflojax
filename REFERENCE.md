@@ -18,7 +18,7 @@
 Normalizing flow distribution: base distribution + invertible transform.
 
 ```python
-from nflows.flows import Flow
+from nflojax.flows import Flow
 
 flow = Flow(base_dist, transform, feature_extractor=None, identity_gate=None)
 ```
@@ -38,7 +38,7 @@ Shapes: `x`, `z` are `(..., dim)`. `log_det`, `log_prob` are `(...,)`. `context`
 Invertible transform with tractable Jacobian, no base distribution.
 
 ```python
-from nflows.flows import Bijection
+from nflojax.flows import Bijection
 
 bijection = Bijection(transform, feature_extractor=None, identity_gate=None)
 ```
@@ -53,7 +53,7 @@ bijection = Bijection(transform, feature_extractor=None, identity_gate=None)
 ### build_realnvp
 
 ```python
-from nflows.builders import build_realnvp
+from nflojax.builders import build_realnvp
 
 flow_or_bijection, params = build_realnvp(
     key, dim, num_layers, hidden_dim, n_hidden_layers, **options
@@ -63,7 +63,7 @@ flow_or_bijection, params = build_realnvp(
 ### build_spline_realnvp
 
 ```python
-from nflows.builders import build_spline_realnvp
+from nflojax.builders import build_spline_realnvp
 
 flow_or_bijection, params = build_spline_realnvp(
     key, dim, num_layers, hidden_dim, n_hidden_layers, **options
@@ -116,7 +116,7 @@ For custom architectures (mixing coupling types, non-standard layer order).
 ### assemble_bijection
 
 ```python
-from nflows.builders import assemble_bijection
+from nflojax.builders import assemble_bijection
 
 bijection, params = assemble_bijection(
     blocks_and_params,
@@ -133,7 +133,7 @@ Returns params dict: `{"transform": [...], "feature_extractor": ...}`.
 ### assemble_flow
 
 ```python
-from nflows.builders import assemble_flow
+from nflojax.builders import assemble_flow
 
 flow, params = assemble_flow(
     blocks_and_params,
@@ -151,7 +151,7 @@ Returns params dict: `{"base": ..., "transform": [...], "feature_extractor": ...
 ### Utilities
 
 ```python
-from nflows.builders import make_alternating_mask, create_feature_extractor
+from nflojax.builders import make_alternating_mask, create_feature_extractor
 
 mask = make_alternating_mask(dim, parity)    # parity: 0 or 1
 fe, fe_params = create_feature_extractor(key, in_dim, hidden_dim, out_dim, n_layers=2)
@@ -179,7 +179,7 @@ transform, params = TransformClass.create(key, **kwargs)
 ## Distributions
 
 ```python
-from nflows.distributions import StandardNormal, DiagNormal
+from nflojax.distributions import StandardNormal, DiagNormal
 ```
 
 | Distribution | Constructor | Params | Description |

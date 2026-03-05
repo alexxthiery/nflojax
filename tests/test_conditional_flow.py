@@ -11,7 +11,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflows.builders import build_realnvp, build_spline_realnvp
+from nflojax.builders import build_realnvp, build_spline_realnvp
 
 
 # ---------------------------------------------------------------------------

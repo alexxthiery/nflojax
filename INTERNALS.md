@@ -1,6 +1,6 @@
 # Internals
 
-Mathematical foundations and design decisions behind nflows.
+Mathematical foundations and design decisions behind nflojax.
 
 **Contents:**
 

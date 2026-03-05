@@ -29,7 +29,7 @@ This is JAX scientific computing code. Every decision follows from that.
 ## Project Structure
 
 ```
-nflows/
+nflojax/
   __init__.py          empty
   builders.py          High-level constructors + assembly API
   flows.py             Flow and Bijection classes
@@ -103,7 +103,7 @@ Previously fixed:
 
 - `identity_gate` single-sample contract: gate function receives `(context_dim,)`, not batched. `jax.vmap` handles batching. Writing a batch-aware gate silently produces wrong results. Validated at build time via `jax.eval_shape`.
 - Raw context vs extracted: when using a feature extractor, the gate still gets raw context.
-- No `__init__.py` exports: must use `from nflows.builders import build_realnvp`.
+- No `__init__.py` exports: must use `from nflojax.builders import build_realnvp`.
 
 ## Documentation Map
 

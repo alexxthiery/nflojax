@@ -1,4 +1,4 @@
-# nflows/scalar_function.py
+# nflojax/scalar_function.py
 from __future__ import annotations
 
 import jax

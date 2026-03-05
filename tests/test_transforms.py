@@ -6,7 +6,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflows.transforms import (
+from nflojax.transforms import (
     LinearTransform,
     Permutation,
     AffineCoupling,
@@ -14,7 +14,7 @@ from nflows.transforms import (
     CompositeTransform,
     LoftTransform,
 )
-from nflows.nets import init_mlp
+from nflojax.nets import init_mlp
 from conftest import check_logdet_vs_autodiff
 
 
@@ -437,7 +437,7 @@ class TestAffineCouplingErrors:
 
     def test_non_1d_mask_raises(self):
         """Non-1D mask raises ValueError."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mlp = MLP(x_dim=4, hidden_dim=8, n_hidden_layers=1, out_dim=8)
 
         with pytest.raises(ValueError, match="must be 1D"):
@@ -445,7 +445,7 @@ class TestAffineCouplingErrors:
 
     def test_missing_mlp_key_raises(self, dim):
         """Missing 'mlp' in params raises KeyError."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mask = jnp.array([1, 0, 1, 0], dtype=jnp.float32)
         mlp = MLP(x_dim=dim, hidden_dim=8, n_hidden_layers=1, out_dim=2 * dim)
         coupling = AffineCoupling(mask=mask, conditioner=mlp)
@@ -475,7 +475,7 @@ class TestSplineCouplingErrors:
 
     def test_non_1d_mask_raises(self):
         """Non-1D mask raises ValueError."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mlp = MLP(x_dim=4, hidden_dim=8, n_hidden_layers=1, out_dim=92)  # 4 * (3*8 - 1)
 
         with pytest.raises(ValueError, match="must be 1D"):
@@ -483,7 +483,7 @@ class TestSplineCouplingErrors:
 
     def test_missing_mlp_key_raises(self, dim):
         """Missing 'mlp' in params raises KeyError."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mask = jnp.array([1, 0, 1, 0], dtype=jnp.float32)
         num_bins = 8
         out_dim = dim * (3 * num_bins - 1)
@@ -591,7 +591,7 @@ class TestInitParams:
 
     def test_spline_coupling_init_params_structure(self, key, dim):
         """SplineCoupling.init_params returns correct structure."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
         num_bins = 8
         out_dim = dim * (3 * num_bins - 1)
@@ -606,7 +606,7 @@ class TestInitParams:
 
     def test_spline_coupling_init_params_near_identity(self, key, dim):
         """SplineCoupling default init produces near-identity transform."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
         num_bins = 8
         out_dim = dim * (3 * num_bins - 1)
@@ -626,7 +626,7 @@ class TestInitParams:
 
     def test_spline_coupling_init_params_with_context(self, key, dim, context_dim):
         """SplineCoupling.init_params works with context_dim > 0."""
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
         num_bins = 8
         out_dim = dim * (3 * num_bins - 1)
@@ -867,7 +867,7 @@ class TestCustomConditionerWithRequiredOutDim:
         out_dim = AffineCoupling.required_out_dim(dim)
 
         # Custom MLP with different config
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         custom_mlp = MLP(
             x_dim=dim, context_dim=0, hidden_dim=128, n_hidden_layers=5, out_dim=out_dim
         )
@@ -887,7 +887,7 @@ class TestCustomConditionerWithRequiredOutDim:
         out_dim = SplineCoupling.required_out_dim(dim, num_bins)
 
         # Custom MLP with different config
-        from nflows.nets import MLP
+        from nflojax.nets import MLP
         custom_mlp = MLP(
             x_dim=dim, context_dim=0, hidden_dim=128, n_hidden_layers=5, out_dim=out_dim
         )
@@ -1124,7 +1124,7 @@ class TestLoftOverflow:
 
     def test_loft_inv_large_input_finite(self):
         """loft_inv must return finite values for |y| >> tau."""
-        from nflows.scalar_function import loft_inv
+        from nflojax.scalar_function import loft_inv
         y = jnp.array([2000.0, -2000.0, 1100.0, -1100.0])
         x = loft_inv(y, tau=1000.0)
         assert jnp.all(jnp.isfinite(x)), f"loft_inv produced non-finite: {x}"
@@ -1135,7 +1135,7 @@ class TestLoftOverflow:
         The clamp at 80 means exact roundtrip works for |y| <= tau + 80.
         Values beyond that saturate but remain finite.
         """
-        from nflows.scalar_function import loft, loft_inv
+        from nflojax.scalar_function import loft, loft_inv
         # Values within recoverable range (tau=1000, max exact = 1080)
         y = jnp.array([1050.0, -1050.0, 1079.0, -1079.0])
         x = loft_inv(y, tau=1000.0)
@@ -1147,7 +1147,7 @@ class TestLoftOverflow:
 
     def test_loft_inv_beyond_clamp_saturates_finitely(self):
         """Values beyond tau+80 saturate but remain finite (no inf/nan)."""
-        from nflows.scalar_function import loft_inv
+        from nflojax.scalar_function import loft_inv
         y = jnp.array([1200.0, -1200.0, 5000.0, -5000.0])
         x = loft_inv(y, tau=1000.0)
         assert jnp.all(jnp.isfinite(x)), f"loft_inv produced non-finite: {x}"

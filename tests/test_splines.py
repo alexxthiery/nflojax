@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from nflows.splines import (
+from nflojax.splines import (
     _normalize_bin_params,
     _select_bins,
     _gather_bin_params,
