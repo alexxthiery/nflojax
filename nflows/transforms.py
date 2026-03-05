@@ -11,7 +11,7 @@ import jax.scipy.linalg as jsp
 from flax import linen as nn
 
 from .nets import MLP, Array, PRNGKey, validate_conditioner
-import nflows.scalar_function as scalar_function
+from . import scalar_function
 from .splines import rational_quadratic_spline
 
 

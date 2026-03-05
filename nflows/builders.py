@@ -165,57 +165,6 @@ def create_feature_extractor(
 # ====================================================================
 # Shared helpers
 # ====================================================================
-def _resolve_base_distribution(dim: int, trainable_base: bool, base_dist, base_params):
-    """
-    Resolve the base distribution and its parameters.
-
-    Returns:
-        (base, base_params_resolved): The distribution object and its parameters.
-    """
-    if base_dist is not None:
-        return base_dist, (base_dist.init_params() if base_params is None else base_params)
-    elif trainable_base:
-        base = DiagNormal(dim=dim)
-        return base, base.init_params()
-    else:
-        base = StandardNormal(dim=dim)
-        return base, base.init_params()
-
-
-def _init_context_extractor(
-    key: PRNGKey,
-    context_dim: int,
-    extractor_hidden_dim: int,
-    extractor_n_layers: int,
-    feature_dim: int | None,
-    activation: Callable[[Array], Array],
-    res_scale: float,
-):
-    """
-    Initialize context feature extractor if extractor_hidden_dim > 0.
-
-    Returns:
-        (feature_extractor, fe_params, effective_context_dim):
-            - feature_extractor: ResNet callable or None
-            - fe_params: Parameters for the extractor or None
-            - effective_context_dim: Dimension of context fed to coupling layers
-    """
-    if extractor_hidden_dim <= 0:
-        return None, None, context_dim
-
-    effective_dim = feature_dim if feature_dim is not None else context_dim
-    feature_extractor, fe_params = init_resnet(
-        key,
-        in_dim=context_dim,
-        hidden_dim=extractor_hidden_dim,
-        out_dim=effective_dim,
-        n_hidden_layers=extractor_n_layers,
-        activation=activation,
-        res_scale=res_scale,
-    )
-    return feature_extractor, fe_params, effective_dim
-
-
 # ====================================================================
 # Flow/Bijection assembly from blocks
 # ====================================================================
@@ -561,18 +510,33 @@ def _build_coupling_flow(
     """
     # Context feature extractor (optional)
     key, fe_key = jax.random.split(key)
-    feature_extractor, fe_params, effective_context_dim = _init_context_extractor(
-        fe_key, context_dim, context_extractor_hidden_dim, context_extractor_n_layers,
-        context_feature_dim, activation, res_scale,
-    )
+    if context_extractor_hidden_dim > 0:
+        effective_context_dim = context_feature_dim if context_feature_dim is not None else context_dim
+        feature_extractor, fe_params = init_resnet(
+            fe_key,
+            in_dim=context_dim,
+            hidden_dim=context_extractor_hidden_dim,
+            out_dim=effective_context_dim,
+            n_hidden_layers=context_extractor_n_layers,
+            activation=activation,
+            res_scale=res_scale,
+        )
+    else:
+        feature_extractor, fe_params, effective_context_dim = None, None, context_dim
 
     # Base distribution (skip if only returning transform)
     base = None
     base_params_resolved = None
     if not return_transform_only:
-        base, base_params_resolved = _resolve_base_distribution(
-            dim, trainable_base, base_dist, base_params
-        )
+        if base_dist is not None:
+            base = base_dist
+            base_params_resolved = base_dist.init_params() if base_params is None else base_params
+        elif trainable_base:
+            base = DiagNormal(dim=dim)
+            base_params_resolved = base.init_params()
+        else:
+            base = StandardNormal(dim=dim)
+            base_params_resolved = base.init_params()
 
     # Build transform blocks
     keys = jax.random.split(key, num_layers)
