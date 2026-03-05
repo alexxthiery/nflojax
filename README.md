@@ -11,11 +11,18 @@ A minimal, hackable normalizing flows library in JAX.
 
 ## Installation
 
+Stable release from PyPI:
+
 ```bash
-git clone <repo-url>
+pip install nflojax
+```
+
+Development version (latest on main):
+
+```bash
+git clone https://github.com/alexxthiery/nflojax.git
 cd nflojax
-pip install -e .          # installs jax, jaxlib, flax
-pip install -e ".[test]"  # also installs pytest
+pip install -e ".[test]"
 ```
 
 ## Quick Start
