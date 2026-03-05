@@ -6,7 +6,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflows.builders import (
+from nflojax.builders import (
     build_realnvp,
     build_spline_realnvp,
     analyze_mask_coverage,
@@ -15,15 +15,15 @@ from nflows.builders import (
     assemble_bijection,
     assemble_flow,
 )
-from nflows.flows import Bijection, Flow
-from nflows.transforms import (
+from nflojax.flows import Bijection, Flow
+from nflojax.transforms import (
     AffineCoupling,
     SplineCoupling,
     Permutation,
     LinearTransform,
     LoftTransform,
 )
-from nflows.distributions import DiagNormal, StandardNormal
+from nflojax.distributions import DiagNormal, StandardNormal
 
 
 # ============================================================================
@@ -307,8 +307,8 @@ class TestAnalyzeMaskCoverage:
 
     def test_valid_coverage_passes(self, dim):
         """Valid mask schedule passes without error."""
-        from nflows.transforms import AffineCoupling
-        from nflows.nets import MLP
+        from nflojax.transforms import AffineCoupling
+        from nflojax.nets import MLP
 
         mask0 = jnp.array([1, 0, 1, 0], dtype=jnp.float32)
         mask1 = jnp.array([0, 1, 0, 1], dtype=jnp.float32)
@@ -324,8 +324,8 @@ class TestAnalyzeMaskCoverage:
 
     def test_incomplete_coverage_raises(self, dim):
         """Incomplete mask coverage raises ValueError."""
-        from nflows.transforms import AffineCoupling
-        from nflows.nets import MLP
+        from nflojax.transforms import AffineCoupling
+        from nflojax.nets import MLP
 
         # Same mask twice - dims 0 and 2 never transformed
         mask = jnp.array([1, 0, 1, 0], dtype=jnp.float32)

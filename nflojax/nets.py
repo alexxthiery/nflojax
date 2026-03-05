@@ -1,4 +1,4 @@
-# nflows/nets.py
+# nflojax/nets.py
 """
 Neural network modules for normalizing flow conditioners.
 

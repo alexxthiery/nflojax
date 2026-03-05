@@ -1,4 +1,4 @@
-# nflows
+# nflojax
 
 A minimal, hackable normalizing flows library in JAX.
 
@@ -13,7 +13,7 @@ A minimal, hackable normalizing flows library in JAX.
 
 ```bash
 git clone <repo-url>
-cd nflows
+cd nflojax
 pip install -e .          # installs jax, jaxlib, flax
 pip install -e ".[test]"  # also installs pytest
 ```
@@ -22,7 +22,7 @@ pip install -e ".[test]"  # also installs pytest
 
 ```python
 import jax
-from nflows.builders import build_realnvp
+from nflojax.builders import build_realnvp
 
 key = jax.random.PRNGKey(0)
 flow, params = build_realnvp(

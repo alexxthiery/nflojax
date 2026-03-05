@@ -1,4 +1,4 @@
-# nflows/transforms.py
+# nflojax/transforms.py
 from __future__ import annotations
 
 import warnings

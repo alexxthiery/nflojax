@@ -4,7 +4,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflows.transforms import (
+from nflojax.transforms import (
     AffineCoupling,
     SplineCoupling,
     LinearTransform,
@@ -13,8 +13,8 @@ from nflows.transforms import (
     _compute_gate_value,
     validate_identity_gate,
 )
-from nflows.builders import build_realnvp, build_spline_realnvp, make_alternating_mask
-from nflows.distributions import StandardNormal
+from nflojax.builders import build_realnvp, build_spline_realnvp, make_alternating_mask
+from nflojax.distributions import StandardNormal
 
 
 # ============================================================================

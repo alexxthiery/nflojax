@@ -1,4 +1,4 @@
-# nflows/builders.py
+# nflojax/builders.py
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Tuple
@@ -283,8 +283,8 @@ def assemble_bijection(
         ValueError: If validation fails.
 
     Example:
-        >>> from nflows.builders import make_alternating_mask, assemble_bijection
-        >>> from nflows.transforms import AffineCoupling, SplineCoupling, LoftTransform
+        >>> from nflojax.builders import make_alternating_mask, assemble_bijection
+        >>> from nflojax.transforms import AffineCoupling, SplineCoupling, LoftTransform
         >>>
         >>> keys = jax.random.split(key, 4)
         >>> mask0 = make_alternating_mask(4, parity=0)
@@ -374,9 +374,9 @@ def assemble_flow(
         ValueError: If validation fails or base is None.
 
     Example:
-        >>> from nflows.builders import make_alternating_mask, assemble_flow
-        >>> from nflows.transforms import AffineCoupling, LoftTransform
-        >>> from nflows.distributions import StandardNormal
+        >>> from nflojax.builders import make_alternating_mask, assemble_flow
+        >>> from nflojax.transforms import AffineCoupling, LoftTransform
+        >>> from nflojax.distributions import StandardNormal
         >>>
         >>> keys = jax.random.split(key, 3)
         >>> mask0 = make_alternating_mask(4, parity=0)

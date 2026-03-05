@@ -6,7 +6,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflows.distributions import StandardNormal, DiagNormal
+from nflojax.distributions import StandardNormal, DiagNormal
 
 
 class TestStandardNormal:

@@ -1,6 +1,6 @@
 # Usage
 
-How-to cookbook for nflows. Each section is self-contained with a copy-pasteable example.
+How-to cookbook for nflojax. Each section is self-contained with a copy-pasteable example.
 For API details, see [REFERENCE.md](REFERENCE.md). For math, see [INTERNALS.md](INTERNALS.md).
 
 **Contents:**
@@ -21,7 +21,7 @@ Affine coupling layers as in Dinh et al. (2017). Build a flow, draw samples, eva
 
 ```python
 import jax
-from nflows.builders import build_realnvp
+from nflojax.builders import build_realnvp
 
 key = jax.random.PRNGKey(0)
 flow, params = build_realnvp(
@@ -40,7 +40,7 @@ Full options: [REFERENCE.md#builder-options](REFERENCE.md#builder-options)
 Rational-quadratic splines are more expressive than affine couplings.
 
 ```python
-from nflows.builders import build_spline_realnvp
+from nflojax.builders import build_spline_realnvp
 
 flow, params = build_spline_realnvp(
     key, dim=16, num_layers=8, hidden_dim=256, n_hidden_layers=2,
@@ -121,7 +121,7 @@ x, log_det = bijection.forward(params, z, context=context)
 **Custom base distribution:**
 
 ```python
-from nflows.flows import Flow
+from nflojax.flows import Flow
 
 bijection, bij_params = build_realnvp(..., return_transform_only=True)
 my_flow = Flow(
@@ -138,7 +138,7 @@ The gate function maps context to a scalar; wherever it returns 0, the transform
 
 ```python
 import jax.numpy as jnp
-from nflows.builders import build_realnvp
+from nflojax.builders import build_realnvp
 
 # Gate = sin(pi * t): identity at t=0 and t=1, full transform at t=0.5
 gate_fn = lambda ctx: jnp.sin(jnp.pi * ctx[0])
@@ -174,9 +174,9 @@ Mix coupling types and control layer order using the assembly API.
 
 ```python
 import jax
-from nflows.builders import make_alternating_mask, assemble_bijection, assemble_flow
-from nflows.transforms import AffineCoupling, SplineCoupling, LinearTransform, LoftTransform
-from nflows.distributions import StandardNormal
+from nflojax.builders import make_alternating_mask, assemble_bijection, assemble_flow
+from nflojax.transforms import AffineCoupling, SplineCoupling, LinearTransform, LoftTransform
+from nflojax.distributions import StandardNormal
 
 keys = jax.random.split(jax.random.PRNGKey(0), 5)
 dim = 8
@@ -205,8 +205,8 @@ Assembly API reference: [REFERENCE.md#assembly-api](REFERENCE.md#assembly-api)
 When using the assembly API with conditioning, create the feature extractor separately and pass the output dimension as `context_dim` to each coupling.
 
 ```python
-from nflows.builders import make_alternating_mask, create_feature_extractor, assemble_bijection
-from nflows.transforms import AffineCoupling, LoftTransform
+from nflojax.builders import make_alternating_mask, create_feature_extractor, assemble_bijection
+from nflojax.transforms import AffineCoupling, LoftTransform
 
 keys = jax.random.split(key, 4)
 dim = 8
