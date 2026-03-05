@@ -6,6 +6,19 @@ Project context for coding agents (Claude Code, Cursor, Copilot, etc.).
 
 Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, and an assembly API for custom architectures. Not a pip package; clone and import directly.
 
+## Philosophy
+
+This is JAX scientific computing code. Every decision follows from that.
+
+- **Lean and hackable.** Small codebase a researcher can read in an afternoon. No framework magic, no plugin systems, no registries. A user who wants to add a new transform reads one file and follows the pattern.
+- **Readable over clever.** Plain functions and dataclasses. If a piece of code needs a comment to explain what it does (not why), rewrite it.
+- **No unnecessary abstractions.** One level of indirection is fine; two needs justification. Don't wrap things that don't need wrapping. Three similar lines beat a premature helper.
+- **JIT-friendly throughout.** All numerical code must trace cleanly under `jax.jit`. No Python-level control flow on array values. No side effects in forward/inverse paths. Pure functions operating on explicit PyTree params.
+- **Numerically robust.** Clamp exponents before `exp`. Use `jax.nn.log_sigmoid` not `log(sigmoid(x))`. Test log-det against full Jacobian autodiff. Treat NaN/Inf as bugs, not edge cases.
+- **Documented at the right level.** Docstrings explain the math and the interface contract. Comments explain "why", never "what". AGENTS.md and REFERENCE.md carry the rest.
+- **Tests prove correctness, not coverage.** Every transform gets its log-det checked against full Jacobian autodiff. Round-trip `forward(inverse(x)) == x` is tested. Property-based checks over random inputs. Don't write tests for the sake of lines; write tests that catch real bugs.
+- **Match the math.** Variable names, function signatures, and docstrings should map clearly to the underlying equations. A reader familiar with the normalizing flows literature should recognize the notation. Don't rename standard quantities for "readability".
+
 ## Tech Stack
 
 - **JAX** (core compute, JIT, vmap, autodiff)
