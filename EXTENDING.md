@@ -12,43 +12,78 @@ Recipes for adding custom Transforms, Distributions, and Conditioners.
 
 ## Adding a Custom Transform
 
-### Required Interface
+Transforms must be `@dataclass` classes.
+No base class or ABC is required; `CompositeTransform` relies on duck typing.
+
+### Required Methods
 
 ```python
-def forward(params, x, context=None) -> (y, log_det)
-def inverse(params, y, context=None) -> (x, log_det)
+def forward(self, params, x, context=None, g_value=None) -> (y, log_det)
+def inverse(self, params, y, context=None, g_value=None) -> (x, log_det)
+def init_params(self, key, context_dim=0) -> params
 ```
 
 - `params`: PyTree of learnable parameters (can be empty dict `{}`)
 - `x`, `y`: Arrays of shape `(..., dim)`
 - `context`: Optional conditioning tensor, shape `(..., context_dim)` or `None`
+- `g_value`: Optional identity gate scalar or array (see INTERNALS.md)
 - `log_det`: Log absolute Jacobian determinant, shape `(...,)`
+
+All transforms must accept `context_dim=0` in `init_params`, even if unused.
+This ensures a uniform interface for `CompositeTransform`.
 
 ### Optional Methods
 
 ```python
-def init_params(key, context_dim=0) -> params     # Initialize parameters
 @classmethod
 def create(cls, key, ...) -> (transform, params)  # Factory method
 ```
 
-**Important:** All transforms must use the signature `init_params(key, context_dim=0)`.
-Transforms that don't use `context_dim` should accept but ignore the argument.
-This ensures uniform interface for `CompositeTransform`.
-
-Example for a parameter-free transform:
+### Minimal Skeleton
 
 ```python
-def init_params(self, key, context_dim=0):
-    del key, context_dim  # Unused
-    return {}
+from dataclasses import dataclass
+from typing import Any, Tuple
+from jaxtyping import Array, PRNGKeyArray as PRNGKey
+
+@dataclass
+class MyTransform:
+    dim: int
+
+    def forward(
+        self, params: Any, x: Array, context: Array | None = None,
+        g_value: Array | None = None,
+    ) -> Tuple[Array, Array]:
+        batch_shape = x.shape[:-1]
+        y = ...           # transform x
+        log_det = ...     # shape batch_shape
+        return y, log_det
+
+    def inverse(
+        self, params: Any, y: Array, context: Array | None = None,
+        g_value: Array | None = None,
+    ) -> Tuple[Array, Array]:
+        batch_shape = y.shape[:-1]
+        x = ...           # invert y
+        log_det = ...     # shape batch_shape (negative of forward log_det)
+        return x, log_det
+
+    def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
+        del key, context_dim  # if unused
+        return {}
+
+    @classmethod
+    def create(cls, key: PRNGKey, dim: int) -> Tuple["MyTransform", dict]:
+        transform = cls(dim=dim)
+        params = transform.init_params(key)
+        return transform, params
 ```
 
 ### Templates
 
-- **`Permutation`** — Simplest: no learnable parameters, just shuffles dimensions
-- **`LoftTransform`** — Parameter-free but with nontrivial computation
-- **`AffineCoupling`** — Full example with conditioner network
+- **`Permutation`**: no learnable parameters, just shuffles dimensions
+- **`LoftTransform`**: parameter-free but with nontrivial computation
+- **`AffineCoupling`**: full example with conditioner network and identity gating
 
 ### Integration
 
