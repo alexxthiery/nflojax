@@ -435,6 +435,118 @@ class TestLinearTransformGate:
 
 
 # ============================================================================
+# LinearTransform conditional shift + gate tests
+# ============================================================================
+class TestLinearTransformConditionalShiftGate:
+    """Tests for LinearTransform context-dependent shift with identity gating."""
+
+    @pytest.fixture
+    def cond_transform_and_params(self):
+        """Create conditional LinearTransform with non-trivial params."""
+        key = jax.random.PRNGKey(42)
+        dim = 4
+        context_dim = 8
+        transform, params = LinearTransform.create(
+            key, dim=dim, context_dim=context_dim, hidden_dim=32, n_hidden_layers=2
+        )
+        # Perturb params away from identity so shift/scale are non-trivial
+        k1, k2, k3 = jax.random.split(key, 3)
+        params["lower"] = jax.random.normal(k1, (dim, dim)) * 0.1
+        params["upper"] = jax.random.normal(k2, (dim, dim)) * 0.1
+        # Perturb MLP output layer so conditioner produces non-zero output
+        net_params = params["mlp"]["net"]
+        net_params["dense_out"]["kernel"] = jax.random.normal(
+            k3, net_params["dense_out"]["kernel"].shape
+        ) * 0.5
+        return transform, params, dim, context_dim
+
+    def test_shift_applied_with_context(self, cond_transform_and_params):
+        """Conditional transform with non-zero conditioner output differs from unconditional."""
+        transform, params, dim, context_dim = cond_transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        context = jax.random.normal(jax.random.PRNGKey(1), (10, context_dim))
+
+        y_with_ctx, _ = transform.forward(params, x, context)
+        # Without context, no shift is applied
+        y_no_ctx, _ = transform.forward(params, x)
+
+        assert not jnp.allclose(y_with_ctx, y_no_ctx, atol=1e-3)
+
+    def test_conditional_invertibility(self, cond_transform_and_params):
+        """Conditional transform with shift is invertible."""
+        transform, params, dim, context_dim = cond_transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        context = jax.random.normal(jax.random.PRNGKey(1), (10, context_dim))
+
+        y, ld_fwd = transform.forward(params, x, context)
+        x_rec, ld_inv = transform.inverse(params, y, context)
+
+        # Relaxed tolerance: triangular solves have ~1e-2 error (same as unconditional)
+        max_err = float(jnp.abs(x - x_rec).max())
+        assert max_err < 1e-2, f"Max reconstruction error: {max_err}"
+        assert jnp.allclose(ld_fwd + ld_inv, 0.0, atol=1e-5)
+
+    def test_gate_zero_gives_identity_with_context(self, cond_transform_and_params):
+        """When g_value=0, conditional transform is identity (shift vanishes)."""
+        transform, params, dim, context_dim = cond_transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        context = jax.random.normal(jax.random.PRNGKey(1), (10, context_dim))
+        g_value = jnp.zeros(10)
+
+        y, log_det = transform.forward(params, x, context, g_value=g_value)
+
+        assert jnp.allclose(y, x, atol=1e-6), "y should equal x when g=0"
+        assert jnp.allclose(log_det, 0.0, atol=1e-6), "log_det should be 0 when g=0"
+
+    def test_gate_one_gives_full_transform_with_context(self, cond_transform_and_params):
+        """When g_value=1, gated result matches ungated result."""
+        transform, params, dim, context_dim = cond_transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        context = jax.random.normal(jax.random.PRNGKey(1), (10, context_dim))
+
+        y_ungated, ld_ungated = transform.forward(params, x, context)
+        g_value = jnp.ones(10)
+        y_gated, ld_gated = transform.forward(params, x, context, g_value=g_value)
+
+        assert jnp.allclose(y_gated, y_ungated, atol=1e-5)
+        assert jnp.allclose(ld_gated, ld_ungated, atol=1e-5)
+
+    def test_gate_invertibility_with_context(self, cond_transform_and_params):
+        """Conditional transform with gate is invertible."""
+        transform, params, dim, context_dim = cond_transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        context = jax.random.normal(jax.random.PRNGKey(1), (10, context_dim))
+        g_value = jnp.ones(10) * 0.7
+
+        y, _ = transform.forward(params, x, context, g_value=g_value)
+        x_rec, _ = transform.inverse(params, y, context, g_value=g_value)
+
+        assert jnp.allclose(x_rec, x, atol=1e-5)
+
+    def test_varying_gate_values_per_sample_with_context(self, cond_transform_and_params):
+        """Per-sample gate values work correctly with context-dependent shift."""
+        transform, params, dim, context_dim = cond_transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (5, dim))
+        context = jax.random.normal(jax.random.PRNGKey(1), (5, context_dim))
+        g_values = jnp.array([0.0, 0.25, 0.5, 0.75, 1.0])
+
+        y_batch, ld_batch = transform.forward(params, x, context, g_value=g_values)
+
+        for i in range(5):
+            x_i = x[i:i+1]
+            ctx_i = context[i:i+1]
+            g_i = jnp.array([g_values[i]])
+            y_i, ld_i = transform.forward(params, x_i, ctx_i, g_value=g_i)
+
+            assert jnp.allclose(y_batch[i], y_i[0], atol=1e-5), (
+                f"Sample {i} with g={g_values[i]}: batched differs from individual"
+            )
+            assert jnp.allclose(ld_batch[i], ld_i[0], atol=1e-5), (
+                f"Sample {i} with g={g_values[i]}: batched log_det differs"
+            )
+
+
+# ============================================================================
 # Builder tests
 # ============================================================================
 class TestBuildRealNVPIdentityGate:

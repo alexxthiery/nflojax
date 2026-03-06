@@ -184,9 +184,10 @@ def stable_logit(p: Array) -> Array:
 @dataclass
 class LinearTransform:
     """
-    Global linear transform with LU-style parameterization.
+    Global linear (or affine, when conditional) transform with LU-style
+    parameterization.
 
-    We parameterize an invertible matrix W ∈ R^{dim×dim} as:
+    We parameterize an invertible matrix W in R^{dim x dim} as:
 
       L = tril(lower_raw, k = -1) + I        (unit-diagonal lower)
       U = triu(upper_raw, k = 1)             (zero diagonal upper)
@@ -197,22 +198,18 @@ class LinearTransform:
     Where delta is either 0 (unconditional) or produced by a conditioner
     network that takes context as input (conditional).
 
-    For a column vector u, the forward map is:
+    Unconditional forward map:  y = x W^T
+    Conditional forward map:    y = x W^T + shift(context)
 
-      a = T @ u
-      u' = L @ a
+    The shift is produced by the same conditioner MLP and does not affect the
+    log-determinant (Jacobian is still W).
 
-    For batched row-vectors x with shape (..., dim), we flatten batch
-    dimensions and apply this to the last dimension.
+    log |det W| = sum(log(s)) = sum(log(softplus(raw_diag + delta))).
 
-    The Jacobian of the forward map y = x W^T has determinant det(W), and
+    Inverse uses triangular solves (after subtracting shift if conditional):
 
-      log |det W| = sum(log(s)) = sum(log(softplus(raw_diag + delta))).
-
-    Inverse uses triangular solves:
-
-      L a = u'      (forward substitution, unit diagonal)
-      T u = a       (back substitution)
+      L a = (y - shift)^T    (forward substitution, unit diagonal)
+      T u = a                (back substitution)
 
     Parameters (per block):
       params["lower"]:    unconstrained raw lower-tri part, shape (dim, dim)
@@ -221,9 +218,13 @@ class LinearTransform:
       params["mlp"]:      conditioner params (only if context_dim > 0)
 
     Conditional flows:
-      When context_dim > 0, a conditioner MLP maps context to delta_diag,
-      which is added to raw_diag before softplus. The MLP is initialized
-      with zero output, so the transform starts at identity.
+      When context_dim > 0, a conditioner MLP maps context to (delta_diag, shift).
+      delta_diag is added to raw_diag before softplus; shift is added after the
+      linear map. The MLP is zero-initialized so the transform starts at identity.
+
+    Identity gating:
+      When g_value is provided, shift is scaled by g: shift_eff = g * shift.
+      At g=0 the full transform (including shift) collapses to identity.
 
     This yields O(dim^2) apply / inverse and O(dim) log-det, without any
     repeated matrix factorizations inside the forward pass.
@@ -261,31 +262,33 @@ class LinearTransform:
 
         return lower_raw, upper_raw, raw_diag
 
-    def _compute_diagonal(
+    def _compute_conditioner_outputs(
         self,
         params: Any,
         raw_diag: Array,
         context: Array | None,
-    ) -> Array:
+    ) -> Tuple[Array, Array | None]:
         """
-        Compute diagonal scaling s from raw_diag and optional context.
+        Compute diagonal scaling s and optional shift from raw_diag and context.
 
-        If conditioner exists and context is provided, adds delta from conditioner.
-        Uses softplus for numerical stability.
+        If conditioner exists and context is provided, the MLP outputs 2*dim
+        values split into (delta_diag, shift). delta_diag is added to raw_diag
+        before softplus; shift is returned separately.
 
         Returns:
-            s: positive diagonal scaling, shape (dim,) or (batch, dim) if batched context.
+            s: positive diagonal scaling, shape (dim,) or (batch, dim).
+            shift: context-dependent shift, shape (batch, dim) or None.
         """
         if self.conditioner is not None and context is not None:
-            # Conditioner maps context -> delta_diag
             mlp_params = params["mlp"]
-            # MLP with x_dim=context_dim, context_dim=0: pass context as x
-            delta = self.conditioner.apply({"params": mlp_params}, context, None)
-            # delta shape: (batch, dim) or (dim,)
-            s = jax.nn.softplus(raw_diag + delta)
+            out = self.conditioner.apply({"params": mlp_params}, context, None)
+            # out shape: (batch, 2*dim) or (2*dim,)
+            delta_diag, shift = jnp.split(out, 2, axis=-1)
+            s = jax.nn.softplus(raw_diag + delta_diag)
+            return s, shift
         else:
             s = jax.nn.softplus(raw_diag)
-        return s
+            return s, None
 
     def _forward_batched_gate(
         self,
@@ -293,6 +296,7 @@ class LinearTransform:
         lower_raw: Array,
         upper_raw: Array,
         s: Array,
+        shift: Array | None,
         g_value: Array,
         batch_shape: tuple,
     ) -> Tuple[Array, Array]:
@@ -306,16 +310,22 @@ class LinearTransform:
         g_diag = g_value[:, None]  # (B, 1)
         s_gated = 1.0 - g_diag + g_diag * s  # broadcasts for both (dim,) and (B, dim)
 
+        # Gate the shift: shift_gated = g * shift
+        if shift is not None:
+            shift_gated = g_diag * shift
+        else:
+            shift_gated = None
+
         dim = self.dim
         dtype = lower_raw.dtype
 
-        def forward_single(x_i, g_i, s_i):
+        def forward_single(x_i, g_i, s_i, shift_i):
             # Build gated LU factors: when g=0, L=I and U=0, so W=I (identity).
             # When g=1, we get the full learned transform.
             L_i = jnp.tril(g_i * lower_raw, k=-1) + jnp.eye(dim, dtype=dtype)
             U_i = jnp.triu(g_i * upper_raw, k=1)
             T_i = U_i + jnp.diag(s_i)
-            y_i = L_i @ T_i @ x_i
+            y_i = L_i @ T_i @ x_i + shift_i
             log_det_i = jnp.sum(jnp.log(s_i))
             return y_i, log_det_i
 
@@ -323,7 +333,11 @@ class LinearTransform:
         x_flat = x.reshape((-1, dim))
         g_flat = g_value.reshape((-1,))
         s_flat = s_gated.reshape((-1, dim))
-        y_flat, log_det_flat = jax.vmap(forward_single)(x_flat, g_flat, s_flat)
+        if shift_gated is not None:
+            shift_flat = shift_gated.reshape((-1, dim))
+        else:
+            shift_flat = jnp.zeros_like(x_flat)
+        y_flat, log_det_flat = jax.vmap(forward_single)(x_flat, g_flat, s_flat, shift_flat)
         y = y_flat.reshape(batch_shape + (dim,))
         log_det_forward = log_det_flat.reshape(batch_shape)
         return y, log_det_forward
@@ -334,6 +348,7 @@ class LinearTransform:
         lower_raw: Array,
         upper_raw: Array,
         s: Array,
+        shift: Array | None,
         g_value: Array,
         batch_shape: tuple,
     ) -> Tuple[Array, Array]:
@@ -347,16 +362,23 @@ class LinearTransform:
         g_diag = g_value[:, None]  # (B, 1)
         s_gated = 1.0 - g_diag + g_diag * s  # broadcasts for both (dim,) and (B, dim)
 
+        # Gate the shift: shift_gated = g * shift
+        if shift is not None:
+            shift_gated = g_diag * shift
+        else:
+            shift_gated = None
+
         dim = self.dim
         dtype = lower_raw.dtype
 
-        def inverse_single(y_i, g_i, s_i):
+        def inverse_single(y_i, g_i, s_i, shift_i):
             # Build gated LU factors (same as forward).
             L_i = jnp.tril(g_i * lower_raw, k=-1) + jnp.eye(dim, dtype=dtype)
             U_i = jnp.triu(g_i * upper_raw, k=1)
             T_i = U_i + jnp.diag(s_i)
-            # Solve L @ T @ x = y via two triangular solves.
-            a_i = jsp.solve_triangular(L_i, y_i, lower=True, unit_diagonal=True)
+            # Subtract shift, then solve L @ T @ x = (y - shift).
+            z_i = y_i - shift_i
+            a_i = jsp.solve_triangular(L_i, z_i, lower=True, unit_diagonal=True)
             x_i = jsp.solve_triangular(T_i, a_i, lower=False)
             log_det_i = -jnp.sum(jnp.log(s_i))
             return x_i, log_det_i
@@ -365,7 +387,11 @@ class LinearTransform:
         y_flat = y.reshape((-1, dim))
         g_flat = g_value.reshape((-1,))
         s_flat = s_gated.reshape((-1, dim))
-        x_flat, log_det_flat = jax.vmap(inverse_single)(y_flat, g_flat, s_flat)
+        if shift_gated is not None:
+            shift_flat = shift_gated.reshape((-1, dim))
+        else:
+            shift_flat = jnp.zeros_like(y_flat)
+        x_flat, log_det_flat = jax.vmap(inverse_single)(y_flat, g_flat, s_flat, shift_flat)
         x = x_flat.reshape(batch_shape + (dim,))
         log_det_inverse = log_det_flat.reshape(batch_shape)
         return x, log_det_inverse
@@ -380,6 +406,9 @@ class LinearTransform:
         """
         Forward map: x -> y, returning (y, log_det_forward).
 
+        Unconditional: y = x W^T.
+        Conditional:   y = x W^T + shift(context).
+
         Arguments:
           params: PyTree with leaves 'lower', 'upper', 'raw_diag', and optionally 'mlp'.
           x: input tensor of shape (..., dim).
@@ -389,6 +418,7 @@ class LinearTransform:
         Returns:
           y: transformed tensor of shape (..., dim).
           log_det: log |det ∂y/∂x| = sum(log(s)), shape x.shape[:-1].
+                   Shift does not affect log-det.
         """
         if x.shape[-1] != self.dim:
             raise ValueError(
@@ -400,14 +430,18 @@ class LinearTransform:
         lower_raw, upper_raw, raw_diag = self._get_raw_params(params)
         batch_shape = x.shape[:-1]
 
-        # Compute diagonal scaling (context-dependent if conditioner exists)
-        s = self._compute_diagonal(params, raw_diag, context)  # shape (dim,) or (batch, dim)
+        # Compute diagonal scaling and optional shift
+        s, shift = self._compute_conditioner_outputs(params, raw_diag, context)
 
         # Batched gate requires per-sample L, U - use dedicated vmap path
         if g_value is not None and g_value.ndim > 0:
             return self._forward_batched_gate(
-                x, lower_raw, upper_raw, s, g_value, batch_shape
+                x, lower_raw, upper_raw, s, shift, g_value, batch_shape
             )
+
+        # Gate shift (scalar gate or no gate)
+        if shift is not None and g_value is not None:
+            shift = g_value * shift
 
         # Fast path: shared L, U (possibly scaled by scalar gate)
         if g_value is not None:
@@ -448,6 +482,10 @@ class LinearTransform:
             y = y_flat.reshape(batch_shape + (self.dim,))
             log_det_forward = log_det_flat.reshape(batch_shape)
 
+        # Add shift (does not affect log-det)
+        if shift is not None:
+            y = y + shift
+
         return y, log_det_forward
 
     def inverse(
@@ -460,6 +498,9 @@ class LinearTransform:
         """
         Inverse map: y -> x, returning (x, log_det_inverse).
 
+        Unconditional: x = W^{-T} y.
+        Conditional:   x = W^{-T} (y - shift(context)).
+
         Arguments:
           params: PyTree with leaves 'lower', 'upper', 'raw_diag', and optionally 'mlp'.
           y: input tensor of shape (..., dim).
@@ -469,6 +510,7 @@ class LinearTransform:
         Returns:
           x: inverse-transformed tensor of shape (..., dim).
           log_det: log |det ∂x/∂y| = -sum(log(s)), shape y.shape[:-1].
+                   Shift does not affect log-det.
         """
         if y.shape[-1] != self.dim:
             raise ValueError(
@@ -480,14 +522,22 @@ class LinearTransform:
         lower_raw, upper_raw, raw_diag = self._get_raw_params(params)
         batch_shape = y.shape[:-1]
 
-        # Compute diagonal scaling (context-dependent if conditioner exists)
-        s = self._compute_diagonal(params, raw_diag, context)  # shape (dim,) or (batch, dim)
+        # Compute diagonal scaling and optional shift
+        s, shift = self._compute_conditioner_outputs(params, raw_diag, context)
 
         # Batched gate requires per-sample L, U - use dedicated vmap path
         if g_value is not None and g_value.ndim > 0:
             return self._inverse_batched_gate(
-                y, lower_raw, upper_raw, s, g_value, batch_shape
+                y, lower_raw, upper_raw, s, shift, g_value, batch_shape
             )
+
+        # Gate shift (scalar gate or no gate)
+        if shift is not None and g_value is not None:
+            shift = g_value * shift
+
+        # Subtract shift before linear inverse (does not affect log-det)
+        if shift is not None:
+            y = y - shift
 
         # Fast path: shared L, U (possibly scaled by scalar gate)
         if g_value is not None:
@@ -538,8 +588,9 @@ class LinearTransform:
         """
         Initialize parameters for this transform.
 
-        Returns identity transform params (L=I, U=0, s=1 => W=I).
+        Returns identity transform params (L=I, U=0, s=1 => W=I, shift=0).
         For softplus parametrization, raw_diag is initialized so softplus(raw_diag) = 1.
+        Conditioner MLP output layer is zero-initialized so both delta_diag and shift start at 0.
 
         Arguments:
             key: JAX PRNGKey for conditioner initialization.
@@ -626,12 +677,13 @@ class LinearTransform:
             if hidden_dim <= 0:
                 raise ValueError(f"LinearTransform.create: hidden_dim must be positive, got {hidden_dim}.")
             # MLP with x_dim=context_dim, context_dim=0: context goes in x slot
+            # Output 2*dim: first dim entries are delta_diag, last dim are shift
             conditioner = MLP(
                 x_dim=context_dim,
                 context_dim=0,
                 hidden_dim=hidden_dim,
                 n_hidden_layers=n_hidden_layers,
-                out_dim=dim,  # output delta for each diagonal entry
+                out_dim=2 * dim,
                 activation=activation,
                 res_scale=res_scale,
             )

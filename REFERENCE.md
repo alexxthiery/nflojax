@@ -171,7 +171,7 @@ transform, params = TransformClass.create(key, **kwargs)
 |-----------|-------------------|----------------------|-------|
 | `AffineCoupling` | `dim, mask, hidden_dim, n_hidden_layers, context_dim=0, max_log_scale=1.0` | `{"mlp": {...}}` | RealNVP-style; output dim = 2*dim |
 | `SplineCoupling` | `dim, mask, hidden_dim, n_hidden_layers, context_dim=0, num_bins=8, tail_bound=5.0` | `{"mlp": {...}}` | RQ-spline; output dim = dim*(3K-1) |
-| `LinearTransform` | `dim` | `{"lower": (d,d), "upper": (d,d), "log_diag": (d,)}` | LU-parameterized invertible linear |
+| `LinearTransform` | `dim, context_dim=0` | `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,), "mlp": {...}}` | LU-parameterized invertible linear; conditional mode adds context-dependent shift |
 | `Permutation` | `perm` (1D index array) | `{}` | Fixed dimension shuffle; log_det=0 |
 | `LoftTransform` | `dim, tau=1000.0` | `{}` | Log-soft tails for stability |
 | `CompositeTransform` | `blocks` (list of transforms) | list of per-block params | Sequential composition |
