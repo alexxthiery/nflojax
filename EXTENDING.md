@@ -100,11 +100,14 @@ y, log_det = composite.forward(params_list, x)
 
 ## Adding a Custom Distribution
 
-### Required Interface
+Distributions must be `@dataclass` classes.
+
+### Required Methods
 
 ```python
-def log_prob(params, x) -> log_prob
-def sample(params, key, shape) -> samples
+def log_prob(self, params, x) -> log_prob
+def sample(self, params, key, shape) -> samples
+def init_params(self) -> params
 ```
 
 - `params`: PyTree of parameters (can be `None` for parameter-free distributions)
@@ -113,16 +116,38 @@ def sample(params, key, shape) -> samples
 - `key`: JAX PRNGKey
 - `shape`: Tuple for batch dimensions (samples will be `shape + (dim,)`)
 
-### Optional Methods
+### Minimal Skeleton
 
 ```python
-def init_params() -> params  # Initialize parameters (no key needed)
+from dataclasses import dataclass
+from typing import Any, Tuple
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, PRNGKeyArray as PRNGKey
+
+@dataclass
+class MyDistribution:
+    dim: int
+
+    def log_prob(self, params: Any, x: Array) -> Array:
+        # x shape: (..., dim)
+        log_p = ...  # shape (...,)
+        return log_p
+
+    def sample(self, params: Any, key: PRNGKey, shape: Tuple[int, ...]) -> Array:
+        # return samples of shape (*shape, dim)
+        return ...
+
+    def init_params(self) -> Any:
+        # None for parameter-free, dict for learnable
+        return None
 ```
 
 ### Templates
 
-- **`StandardNormal`** — Simplest: isotropic Gaussian, no learnable params
-- **`DiagNormal`** — Diagonal Gaussian with learnable `loc` and `log_scale`
+- **`StandardNormal`**: isotropic Gaussian, no learnable params
+- **`DiagNormal`**: diagonal Gaussian with learnable `loc` and `log_scale`
 
 ### Integration
 
@@ -140,36 +165,70 @@ samples = flow.sample(params, key, (batch_size,))
 
 ## Adding a Custom Conditioner
 
+Conditioners must be Flax `nn.Module` subclasses.
+Coupling layers call `conditioner.apply({"params": params}, x, context)`.
+
 ### Required Interface
 
 ```python
-def apply({"params": params}, x, context) -> output  # Flax convention
-context_dim: int  # Attribute (0 for unconditional)
+# Flax __call__ method
+def __call__(self, x, context=None) -> output
+
+# Attributes
+context_dim: int   # 0 for unconditional
 ```
 
-- Must follow Flax module conventions
 - `x`: Input tensor, shape `(..., x_dim)`
 - `context`: Optional conditioning tensor or `None`
 - `output`: Shape `(..., out_dim)` where `out_dim` depends on the coupling type
 
-### Optional Methods (for auto-initialization)
+### Required Methods (for auto-initialization)
 
 ```python
-def get_output_layer(params) -> {"kernel": Array, "bias": Array}
-def set_output_layer(params, kernel, bias) -> params
+def get_output_layer(self, params) -> {"kernel": Array, "bias": Array}
+def set_output_layer(self, params, kernel, bias) -> params
 ```
 
-If present, coupling layers will automatically initialize the output layer:
-- `AffineCoupling`: Zero-initializes for identity start
-- `SplineCoupling`: Sets biases for identity spline (raises error if methods missing)
+Coupling layers use these to zero-initialize the output layer at init:
 
-**Note:** `SplineCoupling` emits a warning if the derivative range `[min_derivative, max_derivative]`
-does not contain 1.0, since identity-like initialization requires `derivative ≈ 1`. In this case,
-the midpoint derivative is used instead.
+- `AffineCoupling`: zeros kernel and bias so shift=0, scale=1
+- `SplineCoupling`: sets biases for identity spline (raises error if methods are missing)
 
-### Template
+### Minimal Skeleton
 
-- **`MLP`** in `nets.py` — Full implementation with context handling and output layer access
+```python
+import jax.numpy as jnp
+import flax.linen as nn
+from jaxtyping import Array
+
+class MyConditioner(nn.Module):
+    x_dim: int
+    context_dim: int = 0
+    hidden_dim: int = 64
+    out_dim: int = 1
+
+    @nn.compact
+    def __call__(self, x: Array, context: Array | None = None) -> Array:
+        # Concatenate context if provided
+        if context is not None:
+            inp = jnp.concatenate([x, context], axis=-1)
+        else:
+            inp = x
+
+        # Your network here
+        h = nn.Dense(self.hidden_dim, name="dense_in")(inp)
+        h = nn.relu(h)
+        out = nn.Dense(self.out_dim, name="dense_out")(h)
+        return out
+
+    def get_output_layer(self, params: dict) -> dict:
+        return params["dense_out"]
+
+    def set_output_layer(self, params: dict, kernel, bias) -> dict:
+        params = dict(params)
+        params["dense_out"] = {"kernel": kernel, "bias": bias}
+        return params
+```
 
 ### Output Dimensions
 
@@ -179,3 +238,7 @@ Conditioner output size depends on the coupling type:
 AffineCoupling.required_out_dim(dim)           # Returns 2 * dim
 SplineCoupling.required_out_dim(dim, num_bins) # Returns dim * (3 * num_bins - 1)
 ```
+
+### Template
+
+- **`MLP`** in `nets.py`: full implementation with residual blocks, context handling, and output layer access
