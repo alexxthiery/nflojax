@@ -213,7 +213,8 @@ When `identity_gate` is provided, each coupling layer scales its conditioner out
 For affine coupling, this means $s \to g \cdot s$ and $t \to g \cdot t$.
 For spline coupling, the raw spline parameters are scaled by $g$, pulling the spline toward identity.
 
-`LinearTransform` also supports gating: $W \to g \cdot W + (1-g) \cdot I$.
+`LinearTransform` also supports gating: $W \to g \cdot W + (1-g) \cdot I$ and $\text{shift} \to g \cdot \text{shift}$.
+In conditional mode, the conditioner MLP outputs both a diagonal scaling delta and a shift; both vanish at $g=0$.
 
 ### Raw Context vs Extracted Features
 
