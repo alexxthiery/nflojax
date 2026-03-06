@@ -171,10 +171,33 @@ transform, params = TransformClass.create(key, **kwargs)
 |-----------|-------------------|----------------------|-------|
 | `AffineCoupling` | `dim, mask, hidden_dim, n_hidden_layers, context_dim=0, max_log_scale=1.0` | `{"mlp": {...}}` | RealNVP-style; output dim = 2*dim |
 | `SplineCoupling` | `dim, mask, hidden_dim, n_hidden_layers, context_dim=0, num_bins=8, tail_bound=5.0` | `{"mlp": {...}}` | RQ-spline; output dim = dim*(3K-1) |
-| `LinearTransform` | `dim, context_dim=0` | `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,), "mlp": {...}}` | LU-parameterized invertible linear; conditional mode adds context-dependent shift |
+| `LinearTransform` | `dim, context_dim=0` | `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,), "mlp": {...}}` | LU-parameterized; see details below |
 | `Permutation` | `perm` (1D index array) | `{}` | Fixed dimension shuffle; log_det=0 |
 | `LoftTransform` | `dim, tau=1000.0` | `{}` | Log-soft tails for stability |
 | `CompositeTransform` | `blocks` (list of transforms) | list of per-block params | Sequential composition |
+
+### LinearTransform
+
+LU-parameterized invertible matrix $W = L \cdot T$ where $L$ is unit-diagonal lower triangular, $T = U + \text{diag}(s)$ is upper triangular with positive diagonal $s = \text{softplus}(\text{raw\_diag})$.
+
+**Unconditional** (`context_dim=0`):
+
+- Forward: `y = x @ W^T`
+- Inverse: triangular solves (no matrix inversion)
+- Log-det: `sum(log(s))`
+- Params: `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,)}`
+
+**Conditional** (`context_dim > 0`):
+
+- A conditioner MLP maps context to `(delta_diag, shift)`, each of shape `(dim,)`
+- Forward: `y = x @ W^T + shift(context)`, where `s = softplus(raw_diag + delta_diag(context))`
+- Inverse: `x = W^{-T} (y - shift(context))`
+- Log-det: `sum(log(s))` (shift does not affect the Jacobian)
+- Params: `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,), "mlp": {...}}`
+
+**Identity gating**: when `g_value` is provided, both the matrix and shift interpolate toward identity: $W \to g \cdot W + (1-g) \cdot I$, $\text{shift} \to g \cdot \text{shift}$. At $g=0$ the transform is exactly identity.
+
+**Initialization**: all params are set so $W = I$ and $\text{shift} = 0$ at init (MLP output layer is zero-initialized).
 
 ## Distributions
 
