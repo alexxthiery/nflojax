@@ -201,6 +201,13 @@ class MLP(nn.Module):
                 "Set context_dim to match your context features."
             )
 
+        # Reject missing context when context_dim>0 (silent misconfiguration).
+        if context is None and self.context_dim > 0:
+            raise ValueError(
+                f"context_dim={self.context_dim} but context was not passed. "
+                "Pass context to all flow methods when using a conditional flow."
+            )
+
         # Context handling.
         if context is not None and self.context_dim > 0:
             # Check context feature dimension.

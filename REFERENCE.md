@@ -151,15 +151,21 @@ Returns params dict: `{"base": ..., "transform": [...], "feature_extractor": ...
 ### Utilities
 
 ```python
-from nflojax.builders import make_alternating_mask, create_feature_extractor
+from nflojax.builders import make_alternating_mask, create_feature_extractor, analyze_mask_coverage
 
 mask = make_alternating_mask(dim, parity)    # parity: 0 or 1
-fe, fe_params = create_feature_extractor(key, in_dim, hidden_dim, out_dim, n_layers=2)
+fe, fe_params = create_feature_extractor(
+    key, in_dim, hidden_dim, out_dim,
+    n_layers=2, activation=jax.nn.tanh, res_scale=0.1,
+)
+analyze_mask_coverage(blocks, dim)           # warns if any dimension is never transformed
 ```
+
+`analyze_mask_coverage` is called automatically by `assemble_bijection`, `assemble_flow`, and the builders. It traces mask/permutation interactions across coupling layers and prints a warning if any original dimension is never in the "transformed" role.
 
 ## Transforms
 
-All transforms share the interface:
+All transforms share this interface:
 
 ```python
 y, log_det = transform.forward(params, x, context=None, g_value=None)
@@ -167,37 +173,213 @@ x, log_det = transform.inverse(params, y, context=None, g_value=None)
 transform, params = TransformClass.create(key, **kwargs)
 ```
 
-| Transform | `.create()` params | Per-block param shape | Notes |
-|-----------|-------------------|----------------------|-------|
-| `AffineCoupling` | `dim, mask, hidden_dim, n_hidden_layers, context_dim=0, max_log_scale=1.0` | `{"mlp": {...}}` | RealNVP-style; output dim = 2*dim |
-| `SplineCoupling` | `dim, mask, hidden_dim, n_hidden_layers, context_dim=0, num_bins=8, tail_bound=5.0` | `{"mlp": {...}}` | RQ-spline; output dim = dim*(3K-1) |
-| `LinearTransform` | `dim, context_dim=0` | `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,), "mlp": {...}}` | LU-parameterized; see details below |
-| `Permutation` | `perm` (1D index array) | `{}` | Fixed dimension shuffle; log_det=0 |
-| `LoftTransform` | `dim, tau=1000.0` | `{}` | Log-soft tails for stability |
-| `CompositeTransform` | `blocks` (list of transforms) | list of per-block params | Sequential composition |
+Shapes: `x`, `y` are `(..., dim)`. `log_det` is `(...,)` (one scalar per sample). `context` is `(..., context_dim)` or `None`. `g_value` is `()` or `(batch,)` or `None`.
+
+**Mask convention** (couplings): `mask[i] = 1` means dimension `i` is frozen (passed through); `mask[i] = 0` means transformed.
+
+**Identity gating**: all transforms except `Permutation` accept an optional `g_value`. At `g=0` the transform is identity; at `g=1` it acts normally. Intermediate values interpolate smoothly. `Permutation` has no `g_value` parameter (it has no learnable components to gate). `CompositeTransform` skips `g_value` for blocks that don't support it.
+
+**Zero initialization**: conditioner output layers are initialized to zero, so all learnable transforms start as identity.
+
+| Transform | Purpose |
+|-----------|---------|
+| `AffineCoupling` | RealNVP affine coupling layer |
+| `SplineCoupling` | Rational-quadratic spline coupling layer |
+| `LinearTransform` | LU-parameterized invertible linear map |
+| `Permutation` | Fixed dimension shuffle |
+| `LoftTransform` | Log-soft tail compression |
+| `CompositeTransform` | Sequential composition of transforms |
+
+### AffineCoupling
+
+**What:** RealNVP-style coupling. Frozen dimensions condition an MLP that produces shift and log-scale for the transformed dimensions.
+
+**Forward:**
+
+```
+x1 = x * mask                                    # frozen
+(shift, log_scale) = MLP(x1, context) * (1-mask)  # bounded by tanh
+y = x1 + (x * (1-mask)) * exp(log_scale) + shift
+log_det = sum(log_scale)
+```
+
+**Inverse:** `x2 = (y2 - shift) * exp(-log_scale)`, log_det = `-sum(log_scale)`.
+
+**Create:**
+
+```python
+coupling, params = AffineCoupling.create(
+    key, dim, mask, hidden_dim, n_hidden_layers, **kwargs
+)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `dim` | int | required | Input/output dimensionality |
+| `mask` | Array | required | Binary mask of shape `(dim,)` |
+| `hidden_dim` | int | required | Conditioner MLP hidden width |
+| `n_hidden_layers` | int | required | Residual blocks in conditioner MLP |
+| `context_dim` | int | `0` | Context dimension; 0 = unconditional |
+| `activation` | callable | `nn.elu` | MLP activation function |
+| `res_scale` | float | `0.1` | Residual connection scale |
+| `max_log_scale` | float | `5.0` | Bound on `log_scale` via `tanh(. / max) * max` |
+| `max_shift` | float | `None` | Bound on shift; defaults to `exp(max_log_scale)` |
+
+**Params dict:**
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `"mlp"` | PyTree | Flax params for conditioner MLP (output dim = `2 * dim`) |
+
+**Context:** MLP receives `concat(x_masked, context)`. When `g_value` is provided, both shift and log_scale are scaled by `g`.
+
+### SplineCoupling
+
+**What:** Coupling layer using monotone rational-quadratic splines. More expressive than affine: each transformed dimension gets a flexible monotone function parameterized by `K` bins.
+
+**Forward:** Frozen dimensions condition an MLP that outputs spline knot parameters (widths, heights, derivatives) for each transformed dimension. The spline acts on `[-B, B]` with linear identity tails outside.
+
+**Inverse:** Analytical inverse of the rational-quadratic spline (closed-form per bin).
+
+**Create:**
+
+```python
+coupling, params = SplineCoupling.create(
+    key, dim, mask, hidden_dim, n_hidden_layers, **kwargs
+)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `dim` | int | required | Input/output dimensionality |
+| `mask` | Array | required | Binary mask of shape `(dim,)` |
+| `hidden_dim` | int | required | Conditioner MLP hidden width |
+| `n_hidden_layers` | int | required | Residual blocks in conditioner MLP |
+| `context_dim` | int | `0` | Context dimension; 0 = unconditional |
+| `num_bins` | int | `8` | Number of spline bins (K) |
+| `tail_bound` | float | `5.0` | Spline domain `[-B, B]`; identity outside |
+| `min_bin_width` | float | `1e-2` | Floor for bin widths (numerical stability) |
+| `min_bin_height` | float | `1e-2` | Floor for bin heights (numerical stability) |
+| `min_derivative` | float | `1e-2` | Lower bound for knot derivatives |
+| `max_derivative` | float | `10.0` | Upper bound for knot derivatives |
+| `activation` | callable | `nn.elu` | MLP activation function |
+| `res_scale` | float | `0.1` | Residual connection scale |
+
+**Params dict:**
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `"mlp"` | PyTree | Flax params for conditioner MLP (output dim = `dim * (3K - 1)`) |
+
+The `3K - 1` per dimension breaks down as: K widths + K heights + (K-1) interior derivatives.
+
+**Note:** The low-level `rational_quadratic_spline` function in `splines.py` defaults to `min_bin_width=1e-3` and `min_bin_height=1e-3`, while `SplineCoupling.create` and `build_spline_realnvp` default to `1e-2`. Users calling the spline primitive directly will get tighter bin floors.
+
+**Context:** Same as AffineCoupling: MLP receives `concat(x_masked, context)`. When `g_value` is provided, spline params interpolate toward identity: widths and heights are scaled by `g` (uniform bins at g=0), and derivatives are interpolated in logit space toward derivative=1.
 
 ### LinearTransform
 
-LU-parameterized invertible matrix $W = L \cdot T$ where $L$ is unit-diagonal lower triangular, $T = U + \text{diag}(s)$ is upper triangular with positive diagonal $s = \text{softplus}(\text{raw\_diag})$.
+**What:** LU-parameterized invertible matrix. Mixes all dimensions via a learned linear map $W = L \cdot T$ where $L$ is unit-diagonal lower triangular and $T = U + \text{diag}(s)$ is upper triangular with $s = \text{softplus}(\text{raw\_diag})$.
 
-**Unconditional** (`context_dim=0`):
+**Forward (unconditional):** `y = x @ W^T`, log_det = `sum(log(s))`.
 
-- Forward: `y = x @ W^T`
-- Inverse: triangular solves (no matrix inversion)
-- Log-det: `sum(log(s))`
-- Params: `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,)}`
+**Forward (conditional):** MLP maps context to `(delta_diag, shift)` each of shape `(dim,)`. Then `s = softplus(raw_diag + delta_diag)`, `y = x @ W^T + shift`. The shift does not affect log_det.
 
-**Conditional** (`context_dim > 0`):
+**Inverse:** Triangular solves (no explicit matrix inversion). Conditional: subtract shift first.
 
-- A conditioner MLP maps context to `(delta_diag, shift)`, each of shape `(dim,)`
-- Forward: `y = x @ W^T + shift(context)`, where `s = softplus(raw_diag + delta_diag(context))`
-- Inverse: `x = W^{-T} (y - shift(context))`
-- Log-det: `sum(log(s))` (shift does not affect the Jacobian)
-- Params: `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,), "mlp": {...}}`
+**Create:**
 
-**Identity gating**: when `g_value` is provided, both the matrix and shift interpolate toward identity: $W \to g \cdot W + (1-g) \cdot I$, $\text{shift} \to g \cdot \text{shift}$. At $g=0$ the transform is exactly identity.
+```python
+transform, params = LinearTransform.create(key, dim, **kwargs)
+```
 
-**Initialization**: all params are set so $W = I$ and $\text{shift} = 0$ at init (MLP output layer is zero-initialized).
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `dim` | int | required | Input/output dimensionality |
+| `context_dim` | int | `0` | Context dimension; 0 = unconditional |
+| `hidden_dim` | int | `64` | Conditioner MLP hidden width (only when `context_dim > 0`) |
+| `n_hidden_layers` | int | `2` | Residual blocks in conditioner MLP |
+| `activation` | callable | `nn.tanh` | MLP activation function |
+| `res_scale` | float | `0.1` | Residual connection scale |
+
+**Params dict:**
+
+| Key | Shape | When | Description |
+|-----|-------|------|-------------|
+| `"lower"` | `(dim, dim)` | always | Lower triangular matrix (unit diagonal enforced) |
+| `"upper"` | `(dim, dim)` | always | Upper triangular matrix (zero diagonal enforced) |
+| `"raw_diag"` | `(dim,)` | always | Pre-softplus diagonal entries |
+| `"mlp"` | PyTree | `context_dim > 0` | Conditioner MLP (output dim = `2 * dim`) |
+
+**Gating:** The LU factors are gated component-wise: $L_{\text{off}} \to g \cdot L_{\text{off}}$, $U_{\text{off}} \to g \cdot U_{\text{off}}$, $s \to 1 - g + g \cdot s$, $\text{shift} \to g \cdot \text{shift}$. At $g=0$ this gives $L=I$, $T=I$, so the transform is exactly identity. At $g=1$ it acts as the full learned transform. The interpolation path is not the same as $g \cdot W + (1-g) \cdot I$ due to cross-terms in the LU product.
+
+**Init:** $W = I$, shift = 0 (MLP output layer zero-initialized).
+
+### Permutation
+
+**What:** Fixed dimension reordering. No learnable parameters.
+
+**Forward:** `y[..., i] = x[..., perm[i]]`, log_det = 0.
+
+**Inverse:** applies the inverse permutation.
+
+**Create:**
+
+```python
+transform, params = Permutation.create(key, perm)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `perm` | Array | required | Integer index array of shape `(dim,)` |
+
+**Params dict:** `{}` (empty, no learnable parameters).
+
+### LoftTransform
+
+**What:** Element-wise log-soft tail compression. Linear for $\lvert z \rvert \leq \tau$, logarithmic for $\lvert z \rvert > \tau$. Prevents overflow in high dimensions. No learnable parameters.
+
+**Forward:**
+
+$$
+g(z) = \text{sign}(z) \left[ \min(\lvert z \rvert, \tau) + \log(\max(\lvert z \rvert - \tau, 0) + 1) \right]
+$$
+
+log_det = $\sum_i \log \lvert g'(z_i) \rvert$ where $g'(z) = 1 / (\max(\lvert z \rvert - \tau, 0) + 1)$.
+
+**Inverse:** $g^{-1}(y) = \text{sign}(y) [\min(\lvert y \rvert, \tau) + \text{expm1}(\max(\lvert y \rvert - \tau, 0))]$, clamped to prevent overflow.
+
+**Create:**
+
+```python
+transform, params = LoftTransform.create(key, dim, tau=1000.0)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `dim` | int | required | Input/output dimensionality |
+| `tau` | float | `1000.0` | Threshold: linear below, logarithmic above |
+
+**Params dict:** `{}` (empty, no learnable parameters).
+
+**Gating:** When `g_value` is provided, `y = (1-g)*x + g*loft(x)` with matched log_det. Inverse uses 10 Newton iterations (hardcoded, no convergence check) starting from `y` as initial guess. The inverse also clamps the exponent argument to 80.0 to prevent float32 overflow in `expm1`.
+
+### CompositeTransform
+
+**What:** Sequential composition $T = T_n \circ \cdots \circ T_1$. Forward applies blocks left-to-right, inverse applies them right-to-left.
+
+**Forward:** Chains all blocks, accumulating log_det. Passes `context` and `g_value` to each block that supports them (Permutation does not receive `g_value`). When `jax_enable_x64` is set, log_det is accumulated in float64 for numerical precision, then cast back to input dtype.
+
+**Inverse:** Same blocks in reverse order.
+
+**Create:** No `.create()` class method. Constructed directly:
+
+```python
+transform = CompositeTransform(blocks=[t1, t2, t3])
+params = [params1, params2, params3]  # list matching block order
+```
+
+**Params:** A list of per-block param dicts, one per block in the same order as `blocks`.
 
 ## Distributions
 
@@ -243,7 +425,7 @@ params = {
 ```
 
 Optional blocks when enabled:
-- `use_linear=True`: first entry is `{"lower": (d,d), "upper": (d,d), "log_diag": (d,)}`
+- `use_linear=True`: first entry is `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,)}`
 - `use_permutation=True`: empty dict `{}` entries between couplings
 
 ## Forward/Inverse Convention
@@ -288,3 +470,21 @@ bijection, params = assemble_bijection(blocks, feature_extractor=fe, feature_ext
 
 See [USAGE.md](USAGE.md#assembly-with-context-and-feature-extractor) for full examples.
 For the math behind conditioning, see [INTERNALS.md](INTERNALS.md#conditional-normalizing-flows).
+
+## Gotchas
+
+**Identity gate constraints.** `identity_gate` requires `context_dim > 0` and is incompatible with `use_permutation=True`. Both constraints are enforced at build time with clear error messages.
+
+**Identity gate single-sample contract.** The gate function receives a single context vector `(context_dim,)`, not a batch. Batching is handled via `jax.vmap`. Writing a batch-aware gate silently produces wrong results. The builders validate this via `jax.eval_shape`.
+
+**Raw context vs extracted features.** When using a feature extractor, the identity gate still receives the raw context, not extracted features. Coupling layers see extracted features. This is intentional: the gate encodes known structure (e.g., boundary conditions) and operates on interpretable inputs.
+
+**Residual scaling defaults to 0.1.** Both MLP and ResNet conditioners use `res_scale=0.1`, scaling residual branch outputs. Most implementations default to 1.0. This improves stability but can make convergence appear slower. Adjustable via the `res_scale` parameter.
+
+**LOFT tau=1000 barely activates.** The default `loft_tau=1000.0` only compresses values beyond magnitude 1000, acting as a gentle safety net. For active tail compression, lower tau significantly.
+
+**MLP context validation is symmetric.** Passing `context` when `context_dim=0` raises `ValueError`. Omitting `context` when `context_dim > 0` also raises `ValueError`. Both cases produce clear error messages.
+
+**Zero-initialized output layers.** `init_mlp` always zero-initializes the conditioner output layer. This ensures identity-start flows but can be surprising if reusing the MLP for other purposes.
+
+**Conditioner receives full-dim masked vector.** Coupling layers pass `x * mask` (shape `(dim,)` with zeros in transformed positions) to the MLP, not a reduced vector of only the frozen dimensions. The MLP's input dimension equals `dim`, not the count of frozen dimensions.

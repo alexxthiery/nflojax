@@ -337,6 +337,16 @@ class TestMLP:
 
         assert jnp.allclose(out1, out2)
 
+    def test_missing_context_when_context_dim_positive_raises(self, key):
+        """context_dim>0 but context=None raises ValueError."""
+        mlp, params = init_mlp(
+            key, x_dim=4, context_dim=3, hidden_dim=16, n_hidden_layers=2, out_dim=8
+        )
+        x = jax.random.normal(key, (10, 4))
+
+        with pytest.raises(ValueError, match="context_dim=3 but context was not passed"):
+            mlp.apply({"params": params}, x, None)
+
     def test_get_output_layer(self, key):
         """get_output_layer returns correct structure and shapes."""
         mlp, params = init_mlp(
