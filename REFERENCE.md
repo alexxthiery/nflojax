@@ -279,7 +279,7 @@ The `3K - 1` per dimension breaks down as: K widths + K heights + (K-1) interior
 
 ### LinearTransform
 
-**What:** LU-parameterized invertible matrix. Mixes all dimensions via a learned linear map $W = L \cdot T$ where $L$ is unit-diagonal lower triangular and $T = U + \text{diag}(s)$ is upper triangular with $s = \text{softplus}(\text{raw\_diag})$.
+**What:** LU-parameterized invertible matrix. Mixes all dimensions via a learned linear map `W = L * T` where `L` is unit-diagonal lower triangular and `T = U + diag(s)` is upper triangular with `s = softplus(raw_diag)`.
 
 **Forward (unconditional):** `y = x @ W^T`, log_det = `sum(log(s))`.
 
@@ -311,9 +311,9 @@ transform, params = LinearTransform.create(key, dim, **kwargs)
 | `"raw_diag"` | `(dim,)` | always | Pre-softplus diagonal entries |
 | `"mlp"` | PyTree | `context_dim > 0` | Conditioner MLP (output dim = `2 * dim`) |
 
-**Gating:** The LU factors are gated component-wise: $L_{\text{off}} \to g \cdot L_{\text{off}}$, $U_{\text{off}} \to g \cdot U_{\text{off}}$, $s \to 1 - g + g \cdot s$, $\text{shift} \to g \cdot \text{shift}$. At $g=0$ this gives $L=I$, $T=I$, so the transform is exactly identity. At $g=1$ it acts as the full learned transform. The interpolation path is not the same as $g \cdot W + (1-g) \cdot I$ due to cross-terms in the LU product.
+**Gating:** The LU factors are gated component-wise: `L_off -> g * L_off`, `U_off -> g * U_off`, `s -> 1 - g + g * s`, `shift -> g * shift`. At `g=0` this gives `L=I`, `T=I`, so the transform is exactly identity. At `g=1` it acts as the full learned transform. The interpolation path is not the same as `g * W + (1-g) * I` due to cross-terms in the LU product.
 
-**Init:** $W = I$, shift = 0 (MLP output layer zero-initialized).
+**Init:** `W = I`, shift = 0 (MLP output layer zero-initialized).
 
 ### Permutation
 
@@ -337,17 +337,17 @@ transform, params = Permutation.create(key, perm)
 
 ### LoftTransform
 
-**What:** Element-wise log-soft tail compression. Linear for $\lvert z \rvert \leq \tau$, logarithmic for $\lvert z \rvert > \tau$. Prevents overflow in high dimensions. No learnable parameters.
+**What:** Element-wise log-soft tail compression. Linear for `|z| <= tau`, logarithmic for `|z| > tau`. Prevents overflow in high dimensions. No learnable parameters.
 
 **Forward:**
 
-$$
-g(z) = \text{sign}(z) \left[ \min(\lvert z \rvert, \tau) + \log(\max(\lvert z \rvert - \tau, 0) + 1) \right]
-$$
+```
+g(z) = sign(z) * [ min(|z|, tau) + log( max(|z| - tau, 0) + 1 ) ]
+```
 
-log_det = $\sum_i \log \lvert g'(z_i) \rvert$ where $g'(z) = 1 / (\max(\lvert z \rvert - \tau, 0) + 1)$.
+`log_det = sum_i log|g'(z_i)|` where `g'(z) = 1 / (max(|z| - tau, 0) + 1)`.
 
-**Inverse:** $g^{-1}(y) = \text{sign}(y) [\min(\lvert y \rvert, \tau) + \text{expm1}(\max(\lvert y \rvert - \tau, 0))]$, clamped to prevent overflow.
+**Inverse:** `g_inv(y) = sign(y) * [min(|y|, tau) + expm1(max(|y| - tau, 0))]`, clamped to prevent overflow.
 
 **Create:**
 
@@ -366,7 +366,7 @@ transform, params = LoftTransform.create(key, dim, tau=1000.0)
 
 ### CompositeTransform
 
-**What:** Sequential composition $T = T_n \circ \cdots \circ T_1$. Forward applies blocks left-to-right, inverse applies them right-to-left.
+**What:** Sequential composition `T = T_n ... T_1`. Forward applies blocks left-to-right, inverse applies them right-to-left.
 
 **Forward:** Chains all blocks, accumulating log_det. Passes `context` and `g_value` to each block that supports them (Permutation does not receive `g_value`). When `jax_enable_x64` is set, log_det is accumulated in float64 for numerical precision, then cast back to input dtype.
 
@@ -432,8 +432,8 @@ Optional blocks when enabled:
 
 | Method | Direction | Log-det sign |
 |--------|-----------|--------------|
-| `forward(z)` | $z \to x$ | $+\log\lvert\det \partial x/\partial z\rvert$ |
-| `inverse(x)` | $x \to z$ | $+\log\lvert\det \partial z/\partial x\rvert$ |
+| `forward(z)` | `z -> x` | `+log|det dx/dz|` |
+| `inverse(x)` | `x -> z` | `+log|det dz/dx|` |
 
 `inverse` returns the log-det of the inverse map (negative of the forward log-det).
 
