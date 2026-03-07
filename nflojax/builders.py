@@ -678,9 +678,7 @@ def build_realnvp(
                  If provided, this takes precedence over trainable_base.
 
       base_params: Optional initial parameters for base_dist. If None and
-                   base_dist is provided, defaults to {}. For DiagNormal, you
-                   typically want:
-                       {"loc": zeros(dim), "log_scale": zeros(dim)}.
+                   base_dist is provided, calls base_dist.init_params().
       activation: Activation function for conditioner MLPs.
       loft_tau: Threshold parameter for LOFT (stabilizing transform) in the affine coupling.
       return_transform_only: If True, return a Bijection (transform + optional feature
@@ -823,8 +821,7 @@ def build_spline_realnvp(
       trainable_base: If True and base_dist is None, use a DiagNormal base with trainable params.
       base_dist: Optional explicit base distribution object; takes precedence over trainable_base.
       base_params: Optional initial parameters for base_dist. If None and base_dist is provided,
-                   defaults to {}. For DiagNormal, typical init is:
-                      {"loc": zeros(dim), "log_scale": zeros(dim)}.
+                   calls base_dist.init_params().
 
       activation: Activation function for conditioner MLPs.
       loft_tau: Threshold parameter for LOFT (stabilizing transform) appended at the end.
