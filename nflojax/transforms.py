@@ -1700,9 +1700,12 @@ class CompositeTransform:
         y = x
         # Use float64 for log-det accumulation to avoid precision loss in deep flows.
         # Only use float64 if JAX x64 mode is enabled, otherwise fall back silently.
+        # Start as scalar zero; each block's log_det has shape = batch_shape and
+        # broadcasts the accumulator up. This keeps CompositeTransform agnostic
+        # to the event rank (rank-1 flat flows, rank-2 particle flows, ...).
         use_f64 = jax.config.read("jax_enable_x64")
         accum_dtype = jnp.float64 if use_f64 else x.dtype
-        log_det_total = jnp.zeros(x.shape[:-1], dtype=accum_dtype)
+        log_det_total = jnp.zeros((), dtype=accum_dtype)
 
         for block, p in zip(self.blocks, params):
             # Pass g_value to blocks that support it (check for keyword argument)
@@ -1747,9 +1750,10 @@ class CompositeTransform:
         x = y
         # Use float64 for log-det accumulation to avoid precision loss in deep flows.
         # Only use float64 if JAX x64 mode is enabled, otherwise fall back silently.
+        # Scalar zero initializer; broadcasts to whatever batch shape the blocks return.
         use_f64 = jax.config.read("jax_enable_x64")
         accum_dtype = jnp.float64 if use_f64 else y.dtype
-        log_det_total = jnp.zeros(y.shape[:-1], dtype=accum_dtype)
+        log_det_total = jnp.zeros((), dtype=accum_dtype)
 
         # Reverse both blocks and parameter sequence.
         for block, p in zip(reversed(self.blocks), reversed(params)):

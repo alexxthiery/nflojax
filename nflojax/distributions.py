@@ -1,6 +1,7 @@
 # nflojax/distributions.py
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Tuple
 
@@ -11,59 +12,96 @@ from .nets import Array, PRNGKey
 
 
 # ----------------------------------------------------------------------
+# Shape convention
+# ----------------------------------------------------------------------
+# An event may have rank >= 1. The canonical representation is a tuple:
+# `event_shape = (d1, d2, ..., dk)`. For rank-1 events, passing `dim=N` or
+# `event_shape=N` is sugar for `event_shape=(N,)`. A `.dim` property on each
+# distribution returns `event_shape[-1]` (the last-axis size) for back-compat
+# with the historic rank-1 `dim=int` API and error messages.
+def _as_event_tuple(raw: Any) -> Tuple[int, ...]:
+    return (raw,) if isinstance(raw, int) else tuple(int(d) for d in raw)
+
+
+# ----------------------------------------------------------------------
 # Standard Normal
 # ----------------------------------------------------------------------
-@dataclass
+@dataclass(init=False)
 class StandardNormal:
     """
-    Isotropic Gaussian N(0, I) in R^dim.
+    Isotropic Gaussian N(0, I) on an event of shape `event_shape`.
 
-    x is expected to have shape (..., dim).
+    `x` is expected to have shape `(*batch, *event_shape)`; `log_prob`
+    returns shape `batch`. `params` is ignored (no learnable parameters).
 
-    params is ignored for this distribution; included only for API uniformity.
+    Construct with either form:
+      StandardNormal(event_shape=(N, d))   # rank-N
+      StandardNormal(event_shape=N)        # rank-1 (int is sugar)
+      StandardNormal(dim=N)                # legacy; equivalent to the above
     """
-    dim: int
+    event_shape: Tuple[int, ...]
 
-    def log_prob(self, params: Any, x: Array) -> Array:
-        if x.shape[-1] != self.dim:
+    def __init__(self, event_shape: Any = None, *, dim: Any = None):
+        if event_shape is None and dim is None:
+            raise TypeError("StandardNormal requires `event_shape` or `dim`.")
+        raw = event_shape if event_shape is not None else dim
+        self.event_shape = _as_event_tuple(raw)
+
+    @property
+    def dim(self) -> int:
+        """Last-axis size of event_shape; kept for back-compat."""
+        return self.event_shape[-1]
+
+    def _check_event_shape(self, x: Array) -> None:
+        rank = len(self.event_shape)
+        if x.shape[-rank:] != self.event_shape:
             raise ValueError(
-                f"StandardNormal: expected last dim {self.dim}, got {x.shape[-1]}"
+                f"StandardNormal: expected trailing event_shape {self.event_shape}, "
+                f"got {x.shape[-rank:]}"
             )
 
-        quad = jnp.sum(x * x, axis=-1)
-        log_norm = 0.5 * self.dim * jnp.log(2.0 * jnp.pi)
+    def log_prob(self, params: Any, x: Array) -> Array:
+        self._check_event_shape(x)
+        axes = tuple(range(-len(self.event_shape), 0))
+        quad = jnp.sum(x * x, axis=axes)
+        log_norm = 0.5 * math.prod(self.event_shape) * jnp.log(2.0 * jnp.pi)
         return -0.5 * quad - log_norm
 
     def sample(self, params: Any, key: PRNGKey, shape: Tuple[int, ...]) -> Array:
-        return jax.random.normal(key, shape=shape + (self.dim,))
+        return jax.random.normal(key, shape=shape + self.event_shape)
 
     def init_params(self) -> None:
-        """
-        Initialize parameters for this distribution.
-
-        StandardNormal has no learnable parameters.
-
-        Returns:
-            None (this distribution is parameter-free).
-        """
+        """StandardNormal has no learnable parameters."""
         return None
 
 
 # ----------------------------------------------------------------------
 # Diagonal Gaussian
 # ----------------------------------------------------------------------
-@dataclass
+@dataclass(init=False)
 class DiagNormal:
     """
-    Diagonal-covariance Gaussian N(loc, diag(scale^2)) in R^dim.
+    Diagonal-covariance Gaussian on an event of shape `event_shape`.
 
     Required params leaves:
-      params["loc"]       shape (dim,)
-      params["log_scale"] shape (dim,)
+      params["loc"]       shape event_shape
+      params["log_scale"] shape event_shape
 
-    Both log_prob and sample broadcast batch dimensions naturally.
+    `log_prob` sums over all event axes and returns shape `batch`.
+    Construction mirrors StandardNormal (accepts `event_shape` or `dim`).
     """
-    dim: int
+    event_shape: Tuple[int, ...]
+
+    def __init__(self, event_shape: Any = None, *, dim: Any = None):
+        if event_shape is None and dim is None:
+            raise TypeError("DiagNormal requires `event_shape` or `dim`.")
+        raw = event_shape if event_shape is not None else dim
+        self.event_shape = _as_event_tuple(raw)
+
+    @property
+    def dim(self) -> int:
+        """Last-axis size of event_shape; kept for back-compat."""
+        return self.event_shape[-1]
 
     def _extract_params(self, params: Any) -> Tuple[Array, Array]:
         try:
@@ -74,51 +112,47 @@ class DiagNormal:
                 "DiagNormal expected params to contain 'loc' and 'log_scale'"
             ) from e
 
-        if loc.shape != (self.dim,):
+        if loc.shape != self.event_shape:
             raise ValueError(
-                f"DiagNormal: loc must have shape ({self.dim},), got {loc.shape}"
+                f"DiagNormal: loc must have shape {self.event_shape}, got {loc.shape}"
             )
-        if log_scale.shape != (self.dim,):
+        if log_scale.shape != self.event_shape:
             raise ValueError(
-                f"DiagNormal: log_scale must have shape ({self.dim},), got {log_scale.shape}"
+                f"DiagNormal: log_scale must have shape {self.event_shape}, got {log_scale.shape}"
             )
 
         return loc, log_scale
 
-    def log_prob(self, params: Any, x: Array) -> Array:
-        if x.shape[-1] != self.dim:
+    def _check_event_shape(self, x: Array) -> None:
+        rank = len(self.event_shape)
+        if x.shape[-rank:] != self.event_shape:
             raise ValueError(
-                f"DiagNormal: expected last dim {self.dim}, got {x.shape[-1]}"
+                f"DiagNormal: expected trailing event_shape {self.event_shape}, "
+                f"got {x.shape[-rank:]}"
             )
 
+    def log_prob(self, params: Any, x: Array) -> Array:
+        self._check_event_shape(x)
         loc, log_scale = self._extract_params(params)
         scale = jnp.exp(log_scale)
 
         z = (x - loc) / scale
-        quad = jnp.sum(z * z, axis=-1)
-        log_norm = 0.5 * self.dim * jnp.log(2.0 * jnp.pi)
-        log_det = jnp.sum(log_scale)
+        axes = tuple(range(-len(self.event_shape), 0))
+        quad = jnp.sum(z * z, axis=axes)
+        log_norm = 0.5 * math.prod(self.event_shape) * jnp.log(2.0 * jnp.pi)
+        log_det = jnp.sum(log_scale)  # scalar; same for every batch element
 
         return -0.5 * quad - log_norm - log_det
 
     def sample(self, params: Any, key: PRNGKey, shape: Tuple[int, ...]) -> Array:
         loc, log_scale = self._extract_params(params)
         scale = jnp.exp(log_scale)
-
-        eps = jax.random.normal(key, shape=shape + (self.dim,))
+        eps = jax.random.normal(key, shape=shape + self.event_shape)
         return loc + eps * scale
 
     def init_params(self) -> dict:
-        """
-        Initialize parameters for this distribution.
-
-        Returns a dict with 'loc' and 'log_scale' arrays initialized to zeros,
-        corresponding to a standard normal N(0, I).
-
-        Returns:
-            Dict with keys 'loc' (shape (dim,)) and 'log_scale' (shape (dim,)).
-        """
+        """Zero loc and log_scale; evaluates to StandardNormal on the same event."""
         return {
-            "loc": jnp.zeros(self.dim),
-            "log_scale": jnp.zeros(self.dim),
+            "loc": jnp.zeros(self.event_shape),
+            "log_scale": jnp.zeros(self.event_shape),
         }
