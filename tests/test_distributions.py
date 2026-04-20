@@ -57,7 +57,7 @@ class TestStandardNormal:
         dist = StandardNormal(dim=dim)
         x_wrong = jnp.zeros((5, dim + 1))
 
-        with pytest.raises(ValueError, match="expected last dim"):
+        with pytest.raises(ValueError, match="event_shape"):
             dist.log_prob({}, x_wrong)
 
 
@@ -140,7 +140,7 @@ class TestDiagNormal:
         dist = DiagNormal(dim=dim)
         x_wrong = jnp.zeros((5, dim + 1))
 
-        with pytest.raises(ValueError, match="expected last dim"):
+        with pytest.raises(ValueError, match="event_shape"):
             dist.log_prob(diag_params, x_wrong)
 
     def test_missing_loc_raises(self, dim):
@@ -198,3 +198,141 @@ class TestDiagNormal:
 
         assert lp.shape == (10,)
         assert s.shape == (10, dim)
+
+
+# ----------------------------------------------------------------------
+# Rank-N (structured) event_shape support.
+#
+# The event may have rank >= 1; log_prob sums over all trailing event axes.
+# For rank-1 the behavior is bit-identical to the original `dim=int` path.
+# For rank >= 2 this unlocks particle-system flows like (B, N, d).
+# ----------------------------------------------------------------------
+class TestStandardNormalStructured:
+    """StandardNormal with rank-N event_shape."""
+
+    def test_event_shape_int_matches_dim(self, key, batch_size):
+        """event_shape=N is identical to dim=N (back-compat)."""
+        dist_int = StandardNormal(event_shape=5)
+        dist_dim = StandardNormal(dim=5)
+        x = jax.random.normal(key, (batch_size, 5))
+
+        assert dist_int.event_shape == (5,)
+        assert dist_dim.event_shape == (5,)
+        assert jnp.allclose(
+            dist_int.log_prob({}, x), dist_dim.log_prob({}, x), atol=1e-6
+        )
+
+    def test_rank2_sample_shape(self, key):
+        """event_shape=(N, d) produces samples of shape (*batch, N, d)."""
+        dist = StandardNormal(event_shape=(8, 3))
+        samples = dist.sample({}, key, (16,))
+        assert samples.shape == (16, 8, 3)
+
+    def test_rank2_log_prob_shape(self, key):
+        """log_prob for rank-2 event returns a scalar per batch element."""
+        dist = StandardNormal(event_shape=(8, 3))
+        x = jax.random.normal(key, (16, 8, 3))
+        lp = dist.log_prob({}, x)
+        assert lp.shape == (16,)
+        assert not jnp.isnan(lp).any()
+
+    def test_rank2_log_prob_value_at_zero(self):
+        """At x=0 the log-prob equals the analytic log-normalizer of N(0, I_{N*d})."""
+        N, d = 8, 3
+        dist = StandardNormal(event_shape=(N, d))
+        x = jnp.zeros((1, N, d))
+
+        expected = -0.5 * (N * d) * jnp.log(2.0 * jnp.pi)
+        assert jnp.allclose(dist.log_prob({}, x), expected, atol=1e-6)
+
+    def test_rank2_equals_flattened(self, key):
+        """log_prob of rank-2 event = log_prob of flattened rank-1 event."""
+        N, d = 4, 3
+        dist_struct = StandardNormal(event_shape=(N, d))
+        dist_flat = StandardNormal(event_shape=N * d)
+        x = jax.random.normal(key, (10, N, d))
+
+        lp_struct = dist_struct.log_prob({}, x)
+        lp_flat = dist_flat.log_prob({}, x.reshape(10, N * d))
+        assert jnp.allclose(lp_struct, lp_flat, atol=1e-6)
+
+    def test_rank2_wrong_trailing_shape_raises(self):
+        """log_prob raises when trailing axes don't match event_shape."""
+        dist = StandardNormal(event_shape=(8, 3))
+        x_wrong = jnp.zeros((4, 8, 4))
+        with pytest.raises(ValueError, match="event_shape"):
+            dist.log_prob({}, x_wrong)
+
+
+class TestDiagNormalStructured:
+    """DiagNormal with rank-N event_shape."""
+
+    def test_event_shape_int_matches_dim(self, key, batch_size):
+        """event_shape=N is identical to dim=N (back-compat)."""
+        dist_int = DiagNormal(event_shape=5)
+        dist_dim = DiagNormal(dim=5)
+        params = {"loc": jnp.zeros(5), "log_scale": jnp.zeros(5)}
+        x = jax.random.normal(key, (batch_size, 5))
+
+        assert dist_int.event_shape == (5,)
+        assert dist_dim.event_shape == (5,)
+        assert jnp.allclose(
+            dist_int.log_prob(params, x), dist_dim.log_prob(params, x), atol=1e-6
+        )
+
+    def test_rank2_param_shapes(self):
+        """loc and log_scale have shape event_shape for rank-2."""
+        N, d = 8, 3
+        dist = DiagNormal(event_shape=(N, d))
+        params = dist.init_params()
+        assert params["loc"].shape == (N, d)
+        assert params["log_scale"].shape == (N, d)
+
+    def test_rank2_sample_shape(self, key):
+        """Samples of rank-2 distribution have the right shape."""
+        dist = DiagNormal(event_shape=(8, 3))
+        params = dist.init_params()
+        samples = dist.sample(params, key, (16,))
+        assert samples.shape == (16, 8, 3)
+
+    def test_rank2_log_prob_matches_standard_normal(self, key):
+        """loc=0, log_scale=0 collapses DiagNormal to StandardNormal on the same event."""
+        N, d = 4, 3
+        diag = DiagNormal(event_shape=(N, d))
+        std = StandardNormal(event_shape=(N, d))
+        params = diag.init_params()
+        x = jax.random.normal(key, (16, N, d))
+
+        assert jnp.allclose(
+            diag.log_prob(params, x), std.log_prob({}, x), atol=1e-6
+        )
+
+    def test_rank2_log_prob_shifted(self, key):
+        """log_prob at loc is greater than at loc + 1 (per-batch-element)."""
+        N, d = 4, 3
+        dist = DiagNormal(event_shape=(N, d))
+        loc = jnp.ones((N, d)) * 2.0
+        params = {"loc": loc, "log_scale": jnp.zeros((N, d))}
+
+        lp_at_loc = dist.log_prob(params, loc[None])
+        lp_away = dist.log_prob(params, (loc + 1.0)[None])
+        assert lp_at_loc[0] > lp_away[0]
+
+
+class TestDistributionRepr:
+    """repr/equality should reflect the canonical event_shape, not legacy dim."""
+
+    def test_standard_normal_repr_has_event_shape(self):
+        r = repr(StandardNormal(event_shape=(8, 3)))
+        assert "event_shape=(8, 3)" in r
+        assert "dim=" not in r  # dim is a property, not a dataclass field
+
+    def test_diag_normal_repr_has_event_shape(self):
+        r = repr(DiagNormal(event_shape=(8, 3)))
+        assert "event_shape=(8, 3)" in r
+        assert "dim=" not in r
+
+    def test_equality_by_event_shape(self):
+        assert StandardNormal(dim=4) == StandardNormal(event_shape=(4,))
+        assert DiagNormal(dim=4) == DiagNormal(event_shape=4)
+        assert StandardNormal(event_shape=(8, 3)) != StandardNormal(event_shape=(3, 8))
