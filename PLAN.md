@@ -20,10 +20,12 @@
   - `_params_per_scalar` / `_validate_boundary_slopes` helpers de-duplicating 6 sites.
   - Gate + context tests on `SplineCoupling` in circular mode.
   - `@requires_x64` skip marker covering 5 pre-existing float32-only round-trip failures.
-- Full test suite: 402 passed / 5 skipped under float32; 402 passed under `JAX_ENABLE_X64=1`.
+- **Stage A fully closed.** A1 (`Rescale`, `28b735f`), A3 (`Permutation` event_axis, Stage-0), A4 (context-type story, §5.2 contract narrowed), A2 (`CoMProjection`, Convention (1) zero log-det + `ambient_correction` helper).
+- Test infrastructure: `pytest-xdist` adopted as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`); AGENTS.md rewritten as a one-command "Testing Strategy". Landed `9ef1141`.
+- Full test suite (parallel): 428 passed / 6 skipped under float32 (~90s); 434 passed under `JAX_ENABLE_X64=1` (~99s). The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
 - DESIGN.md checked in; `AGENTS.md` updated to point at it.
 
-Known pending: DESIGN.md and this file need to be committed; no branch strategy chosen yet (see §6).
+Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
 
 ### Stage-0 pre-work (landed in the same session, before Stage A)
 
@@ -49,19 +51,22 @@ Small, high-leverage bijections that every particle-system flow needs. All live 
 
 ### Tasks
 
-- [ ] **A1. `Rescale(geometry, target=(-1, 1))`** per-axis affine that maps `geometry.box` to the canonical spline range.
+- [x] **A1. `Rescale(geometry, target=(-1, 1))`** per-axis affine that maps `geometry.box` to the canonical spline range.
   - Dataclass takes a `Geometry` (per Stage-0 retrofit pattern) plus a scalar or per-axis `target` pair.
   - Closed-form log-det (sum of `log(scale_i)` over event axes).
   - Supports arbitrary trailing-axis rescaling; default last axis.
   - Tests: round-trip, log-det-vs-autodiff, jit, `target` default vs explicit.
-- [ ] **A2. `CoMProjection(event_axis=-2)`** (replaces the earlier `ShiftCenterOfMass` proposal per audit §9.3).
+  - Landed `28b735f`: dataclass with `Geometry` + per-axis `target` + `event_shape`; no params; closed-form log-det; 14 tests green under both dtypes.
+- [x] **A2. `CoMProjection(event_axis=-2)`** (replaces the earlier `ShiftCenterOfMass` proposal per audit §9.3).
   - `(N, d)` ↔ `(N-1, d)` bijection: subtract the mean along `event_axis`, drop the last slot, reconstruct from the invariance.
   - Log-det: constant correction `-½ · d · log(N)` (or whichever sign the convention demands; derive explicitly and document on the class).
   - Blocked on picking one CoM strategy; DM / bgmat use different mechanisms. Audit §9.3 recommends B (CoM projection) as the ship-today primitive.
   - Tests: round-trip via the full `(N, d)` ambient space, autodiff-Jacobian determinant sanity on the subspace, jit.
+  - **Resolved via Convention (1): log-det is zero on the `(N-1)d` subspace; the `(d/2)·log(N)` volume correction is a caller-applied constant exposed as `CoMProjection.ambient_correction(N, d)`.** Heavy documentation at six contact points: class docstring WARNING block, `REFERENCE.md` subsection with decision box, `USAGE.md` pointer + recipe, new `EXTENDING.md` §"CoM handling" with augmented-coupling alternative and a **do-not-stack** warning, `INTERNALS.md` full derivation (Gram matrix `I + 11^T`, `det = N`), `AGENTS.md` Gotcha one-liner. 12 tests green under both dtypes.
 - [x] **A3. `Permutation` generalised to non-last axes.** Landed in Stage-0. `event_axis: int = -1` default preserves last-axis behaviour; `event_axis=-2` shuffles particles on `(B, N, d)`. 4 new tests.
-- [ ] **A4. Context-type story.** First-pass audit flagged DESIGN.md §5.2 ("context is PyTree") is not matched by `_compute_gate_value` (indexes `.ndim`) or `MLP` (concatenates). Decide: (a) narrow the doc claim to "Array for built-in conditioners, PyTree for custom"; (b) accept PyTree in the built-in path (flatten via `ravel_pytree` in MLP). Update docstrings + `validate_conditioner.validate=False` opt-out accordingly.
+- [x] **A4. Context-type story.** First-pass audit flagged DESIGN.md §5.2 ("context is PyTree") is not matched by `_compute_gate_value` (indexes `.ndim`) or `MLP` (concatenates). Decide: (a) narrow the doc claim to "Array for built-in conditioners, PyTree for custom"; (b) accept PyTree in the built-in path (flatten via `ravel_pytree` in MLP). Update docstrings + `validate_conditioner.validate=False` opt-out accordingly.
   - Tests: if (b), pytree context (dict with two arrays) traces through an MLP conditioner without error; opt-out path covered by a custom-conditioner test.
+  - **Resolved: option (a).** DESIGN.md §5.2 rewritten as a two-tier contract (PyTree at flow layer; Array for built-in MLP; PyTree for custom conditioners). `MLP.__call__` docstring tightened. `tests/test_conditional_flow.py::TestCustomConditionerPyTreeContext` locks in the custom-conditioner PyTree path (round-trip + jit).
 
 ### Acceptance
 
@@ -256,13 +261,15 @@ Lives in `bgmat/`, not nflojax. Track it here so it isn't forgotten.
 
 ## 8. Cross-cutting checklist (run after every stage)
 
-- [ ] `pytest tests/ -q` green under default float32.
-- [ ] `JAX_ENABLE_X64=1 pytest tests/ -q` green.
-- [ ] Every new primitive satisfies identity-at-init where applicable.
-- [ ] No new energy / training / observable term (DESIGN.md §11 greps).
-- [ ] No new heavy dependency (DESIGN.md §4 item 10).
-- [ ] Total nflojax LOC (excluding tests) ≤ 5000.
-- [ ] Every public name in `REFERENCE.md`.
+Stage A checklist (2026-04-21):
+
+- [x] `pytest tests/ -q` green under default float32 (428 passed / 6 skipped; the 6 float32 skips carry `@requires_x64`).
+- [x] `JAX_ENABLE_X64=1 pytest tests/ -q` green (434 passed).
+- [x] Every new primitive satisfies identity-at-init where applicable (`Rescale` with target=source is identity; `CoMProjection` is non-learnable).
+- [x] No new energy / training / observable term (DESIGN.md §11 greps).
+- [x] No new heavy dependency (DESIGN.md §4 item 10). `pytest-xdist` added to **test** extras only, not runtime deps.
+- [x] Total nflojax LOC (excluding tests) ≤ 5000.
+- [x] Every public name in `REFERENCE.md` (`Rescale`, `CoMProjection`).
 
 ---
 
@@ -338,7 +345,7 @@ Things explicitly deferred. Each entry has a one-line reason.
 Items that need a decision before the relevant stage can close.
 
 - [ ] Branch strategy for Stages A–F. One branch `feature/particle-flow-framework`, or stage-per-branch? (Default: one long-lived branch, stage-per-commit.)
-- [ ] `ShiftCenterOfMass` log-det convention: document as "zero on the (N−1)d subspace; caller is responsible for the embedding-space correction" vs. "constant $-d \log(N)/2$ correction baked in"? Pick when writing A2.
+- [x] `ShiftCenterOfMass` log-det convention: document as "zero on the (N−1)d subspace; caller is responsible for the embedding-space correction" vs. "constant $-d \log(N)/2$ correction baked in"? Pick when writing A2. **Resolved 2026-04-21: Convention (1) — zero log-det on the subspace; caller applies `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)` when an ambient density is needed. Rationale + full derivation in §11 decision log and `INTERNALS.md` "CoM Projection and the Volume Correction".**
 - [ ] `LatticeBase.hex_ice` unit-cell parameters: follow DM's convention (8 atoms per cell) or bgmat's (re-derive)? Likely DM.
 - [ ] `Transformer` attention norm placement: pre-norm (more stable for deeper stacks) vs. post-norm (closer to DM's original). Default: pre-norm; record the choice in INTERNALS.md.
 - [ ] GNN default `num_neighbours`: 12 (common) vs. 18 (bgmat). Ship 12; let apps override.
@@ -348,3 +355,7 @@ Items that need a decision before the relevant stage can close.
 ## 11. Decision log
 
 - *2026-04-21* — Plan drafted alongside DESIGN.md. Adopted: thick-on-flows / thin-on-physics scope; reference conditioner family is MLP + DeepSets + Transformer + MPNN; no energy or training helpers in nflojax.
+- *2026-04-21* — Stage A1 closed (`28b735f`). `Rescale` ships as a fixed, non-learnable geometry→canonical affine; `LinearTransform` retains the learnable-affine role. API: `Rescale(geometry, target=(-1, 1), event_shape=None)`; scalar or per-axis target; `event_shape` default `(geometry.d,)` with `event_factor = prod(event_shape[:-1])` so log-det accumulates correctly on rank-N particle events.
+- *2026-04-21* — Adopted `pytest-xdist` as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`; `pytest-xdist` added to test extras). Rewrote AGENTS.md Dev Commands as a one-command "Testing Strategy" (`pytest tests/` after edits, x64 at stage close). Full suite wall-clock: float32 6:28 → 1:25 (4.5×), x64 12:11 → 1:34 (7.8×). Rationale: cheap full suite removes the agent triage problem; a file→tests mapping would push judgement onto the agent, and agents get that wrong.
+- *2026-04-21* — Stage A4 closed via option (a): narrow the built-in contract, keep PyTree at the flow layer. DESIGN.md §5.2 now a two-tier contract (PyTree through flows, Array for built-in `MLP` and `_compute_gate_value`, any PyTree for custom conditioners). Option (b) rejected because target apps (DM, bgmat) bring their own conditioner anyway, so `ravel_pytree` + PyTree-aware batching in the common path would add complexity for no one. A new `TestCustomConditionerPyTreeContext` test in `tests/test_conditional_flow.py` exercises a dict-context conditioner end-to-end (round-trip + jit).
+- *2026-04-21* — Stage A2 closed; Stage A fully done. `CoMProjection` ships with **Convention (1)** log-det: the bijection is a relabelling between two `(N-1)d`-dim spaces (reduced Euclidean and zero-CoM subspace of `R^(Nd)`), so `log_det = 0` both directions. The volume-element constant relating the two embeddings is `(d/2)·log(N)` (derived from `det(I + 11^T) = N` for the parameterisation `x_N = -Σy_i`), exposed as `CoMProjection.ambient_correction(N, d)`. Convention (2) — baking the constant into the log-det — was rejected: it silently double-counts in the augmented-coupling composition (bgmat's pattern), where translation invariance is handled separately and densities are already ambient-valid. Explicit caller-applied correction keeps the two patterns cleanly separable. Heavy documentation placed at six contact points to prevent silent misuse: class docstring, REFERENCE.md decision box, USAGE.md recipe, EXTENDING.md "CoM handling" (with do-not-stack warning), INTERNALS.md derivation, AGENTS.md Gotcha.

@@ -1,12 +1,14 @@
 # Extending nflojax
 
-Recipes for adding custom Transforms, Distributions, and Conditioners.
+Recipes for adding custom Transforms, Distributions, and Conditioners, plus
+pattern-level guidance for composing library primitives.
 
 **Contents:**
 
 - [Adding a Custom Transform](#adding-a-custom-transform)
 - [Adding a Custom Distribution](#adding-a-custom-distribution)
 - [Adding a Custom Conditioner](#adding-a-custom-conditioner)
+- [CoM handling: projection vs augmented coupling](#com-handling)
 
 ---
 
@@ -274,3 +276,96 @@ single `x.reshape(*x.shape[:-1], N, d)` at the top of the conditioner.
 ### Template
 
 - **`MLP`** in `nets.py`: full implementation with residual blocks, context handling, and output layer access
+
+---
+
+## CoM handling
+
+Translation `T(d)` invariance of a particle-system target (no preferred
+origin) creates a redundant degree of freedom: `E(x + c · 1)` is the same
+energy for any constant shift `c ∈ R^d`. A flow that learns this redundancy
+wastes capacity and its log-density is only defined up to the CoM, which
+breaks log-density bookkeeping.
+
+Two composition patterns fix this. **Pick one, apply it once, and document
+which.** Stacking both silently double-counts the `(d/2) · log(N)` volume
+factor and corrupts `logZ` / ESS / absolute density values — the gradient
+still flows, so the symptoms are subtle.
+
+### Pattern A: `CoMProjection`
+
+Base distribution lives on the `(N−1, d)` reduced space. The last bijection
+before ambient coordinates is `CoMProjection.inverse`, which embeds into
+the zero-CoM subspace of `R^(Nd)`.
+
+```python
+from nflojax.distributions import DiagNormal
+from nflojax.transforms import CoMProjection, CompositeTransform
+from nflojax.flows import Flow
+
+# Inner flow operates on (N-1, d).
+inner = CompositeTransform(blocks=[...])
+proj, proj_params = CoMProjection.create(key)
+
+# Composite: inner first, then CoMProjection.inverse at sampling time.
+# (Remember composition is T_n o ... o T_1 — place CoMProjection last.)
+flow = Flow(
+    base_dist=DiagNormal(event_shape=(N - 1, d)),
+    transform=CompositeTransform(blocks=[inner, proj]),
+)
+
+# Sampling: base (N-1, d) -> inner -> CoMProjection.inverse -> x in ambient
+# zero-CoM subspace.
+samples = flow.sample(params, key, (batch_size,))
+
+# Log-prob on the REDUCED space (this is what `flow.log_prob` returns).
+log_q_reduced = flow.log_prob(params, samples)
+
+# To compare against an ambient energy E(x), add the correction:
+log_q_ambient = log_q_reduced + CoMProjection.ambient_correction(N, d)
+
+# For gradient-based training, the constant is irrelevant — either form
+# gives the same gradient. Keep the form that matches the downstream
+# quantity you measure.
+```
+
+**When to apply the correction**: see the decision box in
+[REFERENCE.md#comprojection](REFERENCE.md#comprojection). Short version —
+*yes* for importance weights / ESS / `logZ` / absolute density, *no* for
+training-loss gradients.
+
+### Pattern B: Augmented coupling (bgmat-style)
+
+Double the degrees of freedom with auxiliary Gaussian variables, train the
+inner flow on the `(2N, d)` augmented state, and marginalise the auxiliary
+half at inference. Translation invariance is handled *inside* the augmented
+flow by centring both halves symmetrically — no `CoMProjection` needed.
+
+Sketch (full implementation lives in the bgmat application, not in
+nflojax):
+
+```python
+# Base: Gaussian on (2N, d); inner flow: SplitCoupling acting across the
+# physical/auxiliary split_axis. At sampling time, drop the auxiliary half.
+# At log-prob time, integrate over auxiliaries via closed-form or MC.
+# No CoMProjection in the chain.
+```
+
+The augmented pattern encodes translation invariance via the symmetric
+Gaussian base (both halves zero-centred) rather than explicitly removing a
+DoF. The `(d/2) · log(N)` factor is *not* applicable here — doubling the
+degrees of freedom keeps the ambient dimension intact, and the auxiliary
+marginalisation absorbs the bookkeeping.
+
+> ⚠️  **Do not stack Pattern A and Pattern B.** If the flow already uses
+> augmented coupling, do not also wrap it with `CoMProjection`, and do not
+> add `ambient_correction` anywhere. The augmented pattern's density is
+> already ambient-valid. Adding the correction over-counts.
+
+### Why this distinction is in `EXTENDING.md` and not `transforms.py`
+
+Both patterns are composition recipes, not primitives. nflojax ships the
+pieces (`CoMProjection`, the standard coupling/spline bijections, the
+structured `SplitCoupling` used inside augmented flows) but does not ship
+an "augmented coupling" class — the pattern lives here as documentation.
+See DESIGN.md §4 item 9 for why.

@@ -222,6 +222,7 @@ Shapes: `x`, `y` are `(..., dim)`. `log_det` is `(...,)` (one scalar per sample)
 | `LinearTransform` | LU-parameterized invertible linear map |
 | `Permutation` | Fixed shuffle along any negative event axis |
 | `Rescale` | Fixed per-axis affine from `geometry.box` to a canonical target range |
+| `CoMProjection` | Translation-gauge bijection `(N, d) ↔ (N−1, d)`; zero log-det on subspace |
 | `CircularShift` | Rigid per-coord shift mod box (torus rotation) |
 | `LoftTransform` | Log-soft tail compression |
 | `CompositeTransform` | Sequential composition of transforms |
@@ -496,6 +497,101 @@ rescale = Rescale(
 **Params dict:** `{}` (empty, no learnable parameters).
 
 **Log-det:** scalar (broadcasts over batch). Constant across all samples.
+
+### CoMProjection
+
+**What:** Translation-gauge bijection between a particle configuration `(N, d)` and its reduced `(N−1, d)` space. Removes the centre-of-mass degree of freedom so a flow can sample a `T(d)`-invariant target without learning the trivial translational redundancy.
+
+**Forward (centre + drop last):**
+
+```
+mean   = mean(x, axis=event_axis)
+y      = (x - mean)[..., :N-1, :]      # drop the last particle along event_axis
+log_det = 0                             # see WARNING below
+```
+
+**Inverse (reconstruct from zero-CoM constraint):**
+
+```
+x_last = -sum(y, axis=event_axis)
+x      = concat([y, x_last], axis=event_axis)
+log_det = 0
+```
+
+**Create:**
+
+```python
+from nflojax.transforms import CoMProjection
+
+transform, params = CoMProjection.create(key)          # event_axis=-2 default
+transform, params = CoMProjection.create(key, event_axis=-3)  # (B, species, N, d) events
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `event_axis` | int | `-2` | Negative axis along which particles are stacked. Must be negative and not `-1` (the coord axis). |
+
+**Params dict:** `{}` (empty; non-learnable).
+
+**Log-det shape:** scalar zero.
+
+---
+
+> ### ⚠️  LOG-DET CONVENTION — READ BEFORE USE
+>
+> `CoMProjection` is **not** a bijection on `R^(Nd)`. It is a bijection between
+> the `(N−1, d)` reduced space and the zero-CoM subspace of `R^(Nd)`. These
+> spaces have the same intrinsic dimension but are embedded differently in
+> ambient `R^(Nd)`.
+>
+> `nflojax` uses **Convention (1)**: the log-det is the log-det of the linear
+> isomorphism viewed *on the reduced space*, which is **zero**. The flow
+> composed with this bijection produces a density on the `(N−1, d)` reduced
+> space.
+>
+> **If you need a density on the ambient zero-CoM subspace** (the usual case
+> when training reverse-KL against an ambient energy `E(x)` and you care
+> about absolute log-density values), add the constant volume-element
+> correction:
+>
+> ```python
+> log_q_ambient = flow.log_prob(params, x) + CoMProjection.ambient_correction(N, d)
+> #                                             = (d / 2) * log(N)
+> ```
+>
+> **When the constant matters:**
+>
+> | Use case | Add the correction? |
+> |---|---|
+> | Gradient-based training loss (reverse-KL, forward-KL) | **No** — constant → zero gradient |
+> | Importance weights `w = exp(−β E − log q)` / SNIS / ESS | **Yes** |
+> | `logZ` estimates | **Yes** |
+> | Absolute density comparisons across models | **Yes** |
+> | Ratios of `q` values (same flow, same CoM treatment) | **No** |
+>
+> **Why not bake the constant into the log-det?** It would silently double-
+> count in the augmented-coupling pattern (bgmat-style) where CoM is handled
+> by a different mechanism. See [EXTENDING.md — CoM handling](EXTENDING.md#com-handling)
+> for when to use `CoMProjection` vs. augmented coupling.
+>
+> **Math** (for reference): parameterise the zero-CoM subspace by
+> `y ∈ R^((N−1)d)` with `x_N = −Σy_i`. The embedding's per-axis Jacobian `J ∈
+> R^(N × (N−1))` has `J^T J = I + 11^T`, so `det(J^T J) = 1 + (N−1) = N`. The
+> induced ambient volume element is `sqrt(N)` per coord axis, and
+> `sqrt(N)^d = N^(d/2)` across `d` axes; hence the `(d/2) · log(N)` correction.
+> See also `INTERNALS.md` for the full derivation.
+
+---
+
+**Forward-on-non-zero-CoM is lossy.** If you pass an input whose per-particle-axis mean is not zero, `forward` silently centres it — the original CoM is discarded. This matches how the bijection is used in a flow (inputs arriving at `forward` for log-prob have typically come from `inverse` and are zero-CoM by construction), but be aware when using `CoMProjection` outside a flow pipeline.
+
+**Pairing with base distributions:** A typical particle-flow stack is
+
+```
+base on (N-1, d)  →  inner flow on (N-1, d)  →  CoMProjection.inverse  →  x ambient zero-CoM
+```
+
+Sampling chain (left-to-right) yields `x` whose particle-axis sum is identically zero. Evaluate log-prob by running `forward` first to drop back to the reduced space.
 
 ### CircularShift
 

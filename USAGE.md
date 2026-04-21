@@ -339,6 +339,24 @@ For flows on a periodic box, two pieces cooperate:
 - `nflojax.transforms.CircularShift` — rigid per-coord shift mod the box
   length (the "rotation" half of a torus diffeomorphism).
   See [REFERENCE.md#circularshift](REFERENCE.md#circularshift).
+- `nflojax.transforms.CoMProjection` — removes the centre-of-mass degree of
+  freedom for `T(d)`-invariant targets: `(N, d) ↔ (N−1, d)`. **Log-det is
+  zero on the reduced space**; add `CoMProjection.ambient_correction(N, d)
+  = (d/2)·log(N)` when you need an ambient log-density (reverse-KL training
+  against ambient `E(x)`, ESS / logZ estimates). See
+  [REFERENCE.md#comprojection](REFERENCE.md#comprojection) and
+  [EXTENDING.md#com-handling](EXTENDING.md#com-handling) for the "when to
+  apply" decision box.
+
+```python
+from nflojax.transforms import CoMProjection
+
+# Reduced-space base: (N-1, d). CoMProjection.inverse embeds to (N, d).
+proj, params = CoMProjection.create(key)         # event_axis=-2 default
+
+# When you need ambient log-density (e.g. comparing against E(x)):
+log_q_ambient = flow.log_prob(params, x) + CoMProjection.ambient_correction(N, d)
+```
 
 ```python
 from nflojax.geometry import Geometry

@@ -101,11 +101,11 @@ Two commands total for the full float32+x64 check (~3 min combined). If you
 find yourself wanting "just this file", you're probably over-triaging; run
 the full suite unless you have a specific reason.
 
-### Known pre-existing flakes
+### Float32 skips
 
-- `TestLinearTransformConditionalShiftGate::test_conditional_invertibility`
-  (in `test_identity_gate.py`) fails under float32 at `0.010172 > 0.01`.
-  Passes under x64. Not blocking; unrelated to any in-flight work.
+Six tests carry `@requires_x64` and skip under float32 (RQS-inverse and
+triangular-solve roundoff exceeds their `atol`); all pass under
+`JAX_ENABLE_X64=1`. Expect `pytest tests/` to report `... passed, 6 skipped`.
 
 ## Known Issues
 
@@ -122,6 +122,7 @@ Previously fixed:
 - `identity_gate` single-sample contract: gate function receives `(context_dim,)`, not batched. `jax.vmap` handles batching. Writing a batch-aware gate silently produces wrong results. Validated at build time via `jax.eval_shape`.
 - Raw context vs extracted: when using a feature extractor, the gate still gets raw context.
 - No `__init__.py` exports: must use `from nflojax.builders import build_realnvp`.
+- **`CoMProjection` log-det is zero by design** (Convention 1: density on the `(N−1, d)` reduced space). If you need an ambient log-density (reverse-KL with ambient `E(x)`, ESS, `logZ`), add `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)`. Do **not** stack `CoMProjection` with an augmented-coupling pattern — they double-count. See [REFERENCE.md — CoMProjection](REFERENCE.md#comprojection) and [EXTENDING.md — CoM handling](EXTENDING.md#com-handling).
 
 ## Documentation Map
 

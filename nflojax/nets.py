@@ -180,7 +180,11 @@ class MLP(nn.Module):
 
         Arguments:
             x: Input tensor of shape (..., x_dim).
-            context: Optional context tensor:
+            context: Optional context tensor. Must be a single JAX `Array`
+                (or `None`); the MLP concatenates it with `x` and does not
+                flatten nested PyTrees. For structured (PyTree) contexts,
+                supply a custom conditioner instead — the flow threads
+                context through without inspection. See DESIGN.md §5.2.
                 - None (unconditional)
                 - shape (context_dim,) for shared context
                 - shape (..., context_dim) for per-sample context
