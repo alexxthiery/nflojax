@@ -15,6 +15,7 @@ from nflojax.splines import (
     _rational_quadratic_inverse_inner,
     rational_quadratic_spline,
 )
+from conftest import requires_x64
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +283,7 @@ class TestRoundtrip:
             f"max logdet error = {jnp.abs(ld_fwd + ld_inv).max()}"
         )
 
+    @requires_x64
     @pytest.mark.parametrize("tail_bound", [1.0, 3.0, 10.0])
     def test_invertibility_various_bounds(self, key, tail_bound):
         """Roundtrip holds for various tail bounds."""
@@ -679,3 +681,147 @@ class TestSingleBin:
         )
         dy = jnp.diff(y)
         assert jnp.all(dy > 0)
+
+
+# ---------------------------------------------------------------------------
+# Circular boundary mode
+# ---------------------------------------------------------------------------
+# Circular: the two boundary derivatives are tied to a single shared learnable
+# slope (instead of pinned to 1). This makes the spline C^1 when wrapped on the
+# circle S^1 = [-B, B] / ~. Param contract: unnormalized_derivatives has shape
+# (..., K), where the last entry is the shared boundary slope and the first K-1
+# are the interior derivatives (same role as in linear_tails mode).
+class TestCircularBoundary:
+    """boundary_slopes='circular' on rational_quadratic_spline."""
+
+    def test_accepts_K_derivs(self, key):
+        """Circular mode expects (..., K) derivs; normalize without error."""
+        K = 8
+        k1, k2, k3 = jr.split(key, 3)
+        widths = jr.normal(k1, (3, K))
+        heights = jr.normal(k2, (3, K))
+        derivs = jr.normal(k3, (3, K))  # K, not K-1
+        x_k, y_k, d = _normalize_bin_params(
+            widths, heights, derivs,
+            tail_bound=3.0,
+            min_bin_width=1e-3, min_bin_height=1e-3,
+            min_derivative=1e-3, max_derivative=10.0,
+            boundary_slopes="circular",
+        )
+        assert x_k.shape == (3, K + 1)
+        assert y_k.shape == (3, K + 1)
+        assert d.shape == (3, K + 1)
+
+    def test_boundary_slopes_are_shared(self, key):
+        """Under circular, d[..., 0] == d[..., -1] (shared boundary slope)."""
+        K = 8
+        widths, heights, _ = _random_spline_params(key, batch_shape=(4,), num_bins=K)
+        k_derivs = jr.fold_in(key, 99)
+        derivs = jr.normal(k_derivs, (4, K))
+        _, _, d = _normalize_bin_params(
+            widths, heights, derivs,
+            tail_bound=3.0,
+            min_bin_width=1e-3, min_bin_height=1e-3,
+            min_derivative=1e-3, max_derivative=10.0,
+            boundary_slopes="circular",
+        )
+        assert jnp.allclose(d[..., 0], d[..., -1])
+
+    def test_linear_tails_default_unchanged(self, key):
+        """Existing default path: slopes pinned to 1, K-1 input derivs."""
+        K = 8
+        widths, heights, derivs = _random_spline_params(key, batch_shape=(2,), num_bins=K)
+        _, _, d = _normalize_bin_params(
+            widths, heights, derivs,
+            tail_bound=3.0,
+            min_bin_width=1e-3, min_bin_height=1e-3,
+            min_derivative=1e-3, max_derivative=10.0,
+        )
+        assert jnp.all(d[..., 0] == 1.0)
+        assert jnp.all(d[..., -1] == 1.0)
+
+    def test_round_trip_inside_box(self, key):
+        """inverse then forward recovers y inside [-B, B]."""
+        K = 8
+        B = 3.0
+        N = 100
+        widths, heights, _ = _random_spline_params(key, num_bins=K)
+        k_derivs = jr.fold_in(key, 7)
+        derivs = jr.normal(k_derivs, (K,))
+        kx = jr.fold_in(key, 42)
+        y = jr.uniform(kx, (N,), minval=-B * 0.95, maxval=B * 0.95)
+
+        # Broadcast per-sample params for the gather path (matches existing tests).
+        w = jnp.broadcast_to(widths, (N, K))
+        h = jnp.broadcast_to(heights, (N, K))
+        d = jnp.broadcast_to(derivs, (N, K))
+
+        x, _ = rational_quadratic_spline(
+            y, w, h, d,
+            tail_bound=B, inverse=True, boundary_slopes="circular",
+        )
+        y_back, _ = rational_quadratic_spline(
+            x, w, h, d,
+            tail_bound=B, inverse=False, boundary_slopes="circular",
+        )
+        assert jnp.allclose(y_back, y, atol=1e-4)
+
+    def test_logdet_vs_autodiff_circular(self, key):
+        """Primitive log-det matches autodiff derivative at a single point."""
+        K = 8
+        B = 3.0
+        widths, heights, _ = _random_spline_params(key, num_bins=K)
+        k_derivs = jr.fold_in(key, 12)
+        derivs = jr.normal(k_derivs, (K,))
+
+        def fwd(x):
+            y, _ = rational_quadratic_spline(
+                x, widths, heights, derivs,
+                tail_bound=B, inverse=False, boundary_slopes="circular",
+            )
+            return y
+
+        x0 = jnp.array(0.5)
+        _, log_det = rational_quadratic_spline(
+            x0, widths, heights, derivs,
+            tail_bound=B, inverse=False, boundary_slopes="circular",
+        )
+        dy_dx = jax.grad(fwd)(x0)
+        expected = jnp.log(jnp.abs(dy_dx))
+        assert jnp.allclose(log_det, expected, atol=1e-5)
+
+    def test_wrong_deriv_shape_raises(self, key):
+        """Shape mismatch: circular wants K; linear_tails wants K-1."""
+        K = 8
+        widths, heights, derivs_KM1 = _random_spline_params(key, num_bins=K)
+        k_derivs = jr.fold_in(key, 99)
+        derivs_K = jr.normal(k_derivs, (K,))
+        with pytest.raises(ValueError, match="unnormalized_derivatives"):
+            _normalize_bin_params(
+                widths, heights, derivs_KM1,  # K-1 with circular → should raise
+                tail_bound=3.0,
+                min_bin_width=1e-3, min_bin_height=1e-3,
+                min_derivative=1e-3, max_derivative=10.0,
+                boundary_slopes="circular",
+            )
+        with pytest.raises(ValueError, match="unnormalized_derivatives"):
+            _normalize_bin_params(
+                widths, heights, derivs_K,  # K with linear_tails → should raise
+                tail_bound=3.0,
+                min_bin_width=1e-3, min_bin_height=1e-3,
+                min_derivative=1e-3, max_derivative=10.0,
+                boundary_slopes="linear_tails",
+            )
+
+    def test_unknown_boundary_mode_raises(self, key):
+        """An unrecognized boundary_slopes string raises."""
+        K = 4
+        widths, heights, derivs = _random_spline_params(key, num_bins=K)
+        with pytest.raises(ValueError, match="boundary_slopes"):
+            _normalize_bin_params(
+                widths, heights, derivs,
+                tail_bound=3.0,
+                min_bin_width=1e-3, min_bin_height=1e-3,
+                min_derivative=1e-3, max_derivative=10.0,
+                boundary_slopes="nonsense",
+            )

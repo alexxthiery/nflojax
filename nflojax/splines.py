@@ -40,6 +40,7 @@ def _normalize_bin_params(
     min_bin_height: float,
     min_derivative: float,
     max_derivative: float,
+    boundary_slopes: str = "linear_tails",
 ) -> Tuple[Array, Array, Array]:
     """
     Convert raw NN outputs into valid spline parameters.
@@ -47,21 +48,31 @@ def _normalize_bin_params(
     Inputs:
         unnormalized_widths:    (..., K)
         unnormalized_heights:   (..., K)
-        unnormalized_derivatives: (..., K-1)  internal knot derivatives
+        unnormalized_derivatives:
+            - (..., K-1) under 'linear_tails': interior knot derivatives only;
+              both boundary derivatives are fixed to 1 to match the identity
+              linear tails outside [-B, B].
+            - (..., K) under 'circular': K-1 interior plus 1 shared boundary
+              derivative (last entry). Both boundary derivatives share this
+              single learnable slope, making the spline C^1 on the circle
+              [-B, B]/~. Use together with a CircularShift layer to handle
+              transport across the seam.
         tail_bound:             scalar B
         min_bin_width:          lower bound for each bin width (fraction of total)
         min_bin_height:         lower bound for each bin height (fraction of total)
-        min_derivative:         lower bound for derivatives at internal knots
-        max_derivative:         upper bound for derivatives at internal knots
-        
+        min_derivative:         lower bound for internal / shared boundary derivs
+        max_derivative:         upper bound for internal / shared boundary derivs
+        boundary_slopes:        'linear_tails' (default) or 'circular'. See above.
+
     Outputs:
       x_k:        (..., K+1)  x-knots in [-B, B], strictly increasing
       y_k:        (..., K+1)  y-knots in [-B, B], strictly increasing
-      derivatives:(..., K+1)  derivatives at all knots, positive, with
-                              boundary derivatives fixed to 1 (for smooth tails)
+      derivatives:(..., K+1)  derivatives at all knots, positive; boundary
+                              entries are 1 ('linear_tails') or shared
+                              learnable slope ('circular').
     """
     num_bins = unnormalized_widths.shape[-1]
-    
+
     # Sanity checks: min widths/heights must be feasible.
     if min_bin_width * num_bins >= 1.0:
         raise ValueError(
@@ -71,7 +82,7 @@ def _normalize_bin_params(
         raise ValueError(
             f"min_bin_height * num_bins must be < 1, got {min_bin_height * num_bins}."
         )
-    
+
     if num_bins < 1:
         raise ValueError(
             f"_normalize_bin_params: expected at least 1 bin, got {num_bins}."
@@ -111,25 +122,47 @@ def _normalize_bin_params(
     y_k = y_k.at[..., 0].set(-tail_bound)
     y_k = y_k.at[..., -1].set(tail_bound)
 
-    # Derivatives at internal knots: positive via softplus + epsilon.
-    # Boundary derivatives are set to 1 to match identity tails.
-    if unnormalized_derivatives.shape[-1] != num_bins - 1:
-        raise ValueError(
-            "_normalize_bin_params: expected unnormalized_derivatives last dim "
-            f"{num_bins - 1}, got {unnormalized_derivatives.shape[-1]}."
+    # Dispatch on boundary mode to build the full (..., K+1) derivatives array.
+    if boundary_slopes == "linear_tails":
+        if unnormalized_derivatives.shape[-1] != num_bins - 1:
+            raise ValueError(
+                "_normalize_bin_params('linear_tails'): expected "
+                f"unnormalized_derivatives last dim {num_bins - 1}, got "
+                f"{unnormalized_derivatives.shape[-1]}."
+            )
+        internal = (
+            min_derivative
+            + (max_derivative - min_derivative)
+            * jnn.sigmoid(unnormalized_derivatives)
+        )
+        ones = jnp.ones_like(internal[..., :1])
+        derivatives = jnp.concatenate([ones, internal, ones], axis=-1)
+
+    elif boundary_slopes == "circular":
+        # (K-1) interior + 1 shared boundary slope. The boundary slope is
+        # repeated at both ends so the spline is C^1 on the circle.
+        if unnormalized_derivatives.shape[-1] != num_bins:
+            raise ValueError(
+                "_normalize_bin_params('circular'): expected "
+                f"unnormalized_derivatives last dim {num_bins}, got "
+                f"{unnormalized_derivatives.shape[-1]}."
+            )
+        all_unbounded = unnormalized_derivatives
+        bounded = (
+            min_derivative
+            + (max_derivative - min_derivative) * jnn.sigmoid(all_unbounded)
+        )
+        internal = bounded[..., :-1]
+        shared_boundary = bounded[..., -1:]
+        derivatives = jnp.concatenate(
+            [shared_boundary, internal, shared_boundary], axis=-1
         )
 
-    # Use sigmoid to enforce a lower/upper bound on derivatives for stability.
-    internal_derivatives = (
-        min_derivative
-        + (max_derivative - min_derivative)
-        * jnn.sigmoid(unnormalized_derivatives)
+    else:
+        raise ValueError(
+            f"_normalize_bin_params: unknown boundary_slopes={boundary_slopes!r}. "
+            f"Expected 'linear_tails' or 'circular'."
         )
-    
-    ones = jnp.ones_like(internal_derivatives[..., :1])
-    derivatives = jnp.concatenate(
-        [ones, internal_derivatives, ones], axis=-1
-    )  # (..., K+1)
 
     return x_k, y_k, derivatives
 
@@ -421,6 +454,7 @@ def rational_quadratic_spline(
     min_derivative: float = 1e-3,
     max_derivative: float = 10.0,
     inverse: bool = False,
+    boundary_slopes: str = "linear_tails",
 ) -> Tuple[Array, Array]:
     """
     Monotonic rational-quadratic spline transform (Durkan et al., 2019).
@@ -433,12 +467,21 @@ def rational_quadratic_spline(
       inputs:                 (...,)  values to transform
       unnormalized_widths:    (..., K)
       unnormalized_heights:   (..., K)
-      unnormalized_derivatives:(..., K-1)
-      tail_bound:             scalar B; spline acts on [-B, B], outside is linear
-      min_bin_width:          lower bound for each bin width (fraction of total)
-      min_bin_height:         lower bound for each bin height (fraction of total)
-      min_derivative:         lower bound for derivatives at internal knots
-      inverse:                if True, apply inverse transform
+      unnormalized_derivatives:
+        (..., K-1) if boundary_slopes='linear_tails' (default) — interior only,
+        boundary slopes pinned to 1.
+        (..., K)   if boundary_slopes='circular' — K-1 interior + 1 shared
+        boundary slope. Pair with CircularShift for full torus diffeomorphism.
+      tail_bound:             scalar B; spline acts on [-B, B]. Outside [-B, B]
+                              the map falls back to the identity (slope 1);
+                              for circular mode, callers are expected to keep
+                              inputs inside the box by composing with a wrap.
+      min_bin_width / min_bin_height: lower bound for width/height
+      min_derivative / max_derivative: sigmoid bounds on internal / shared
+                              boundary derivatives.
+      inverse:                if True, apply inverse transform.
+      boundary_slopes:        'linear_tails' or 'circular'. See the
+                              `unnormalized_derivatives` description above.
 
     Returns:
       outputs:                (...,)
@@ -453,6 +496,7 @@ def rational_quadratic_spline(
         min_bin_height=min_bin_height,
         min_derivative=min_derivative,
         max_derivative=max_derivative,
+        boundary_slopes=boundary_slopes,
     )
 
     if not inverse:

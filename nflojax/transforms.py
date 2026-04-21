@@ -180,44 +180,77 @@ def stable_logit(p: Array) -> Array:
     return jnp.log(p) - jnp.log1p(-p)
 
 
+_BOUNDARY_SLOPE_MODES = ("linear_tails", "circular")
+
+
+def _params_per_scalar(num_bins: int, boundary_slopes: str) -> int:
+    """Per-scalar spline param count.
+
+    - 'linear_tails': K widths + K heights + (K-1) interior derivs = 3K-1.
+    - 'circular':     K widths + K heights + K derivs (K-1 interior + 1
+                      shared boundary) = 3K.
+    """
+    if boundary_slopes == "linear_tails":
+        return 3 * num_bins - 1
+    if boundary_slopes == "circular":
+        return 3 * num_bins
+    raise ValueError(
+        f"_params_per_scalar: unknown boundary_slopes={boundary_slopes!r}. "
+        f"Expected one of {_BOUNDARY_SLOPE_MODES}."
+    )
+
+
+def _validate_boundary_slopes(boundary_slopes: str, *, where: str) -> None:
+    """Raise if `boundary_slopes` is not a supported mode.
+
+    `where` identifies the call site for the error message (e.g. 'SplineCoupling').
+    """
+    if boundary_slopes not in _BOUNDARY_SLOPE_MODES:
+        raise ValueError(
+            f"{where}: boundary_slopes must be one of {_BOUNDARY_SLOPE_MODES}, "
+            f"got {boundary_slopes!r}."
+        )
+
+
 def identity_spline_bias(
     num_scalars: int,
     num_bins: int,
     min_derivative: float,
     max_derivative: float,
     dtype=jnp.float32,
+    boundary_slopes: str = "linear_tails",
 ) -> Array:
     """
     Conditioner-output bias that yields an identity spline per scalar.
 
     With a zero-kernel final layer in the conditioner MLP, this bias makes
-    the spline parameters evaluate to: widths=0 (uniform bins after softmax),
-    heights=0 (uniform bins), and derivatives=1 (via stable_logit of
-    (1 - min_d) / (max_d - min_d)). The result is an identity spline on
-    [-tail_bound, tail_bound] and identity tails outside.
+    the spline parameters evaluate to:
+      - widths=0 (uniform bins after softmax)
+      - heights=0 (uniform bins)
+      - all derivatives=1 (via stable_logit of (1 - min_d) / (max_d - min_d))
+    giving an identity spline on [-tail_bound, tail_bound].
+
+    Per-scalar param count:
+      - 'linear_tails': 3K - 1 (K widths + K heights + K-1 interior derivs).
+      - 'circular':     3K     (K widths + K heights + K-1 interior + 1
+                                shared boundary derivative).
 
     If 1.0 is not strictly inside (min_derivative, max_derivative) the
-    derivative bias cannot reach 1 and we emit zeros (midpoint); the caller
-    is responsible for warning.
-
-    Arguments:
-        num_scalars: number of scalar outputs the spline layer produces
-            (e.g. the number of transformed dimensions for SplineCoupling,
-            or the flattened size of the transformed slice for SplitCoupling).
-        num_bins: spline bin count K; per-scalar params count is 3K - 1.
-        min_derivative, max_derivative: range for the sigmoid-bounded
-            internal derivatives.
+    derivative bias cannot reach 1 and we emit zeros; caller should warn.
 
     Returns:
-        bias vector of shape (num_scalars * (3*num_bins - 1),).
+        bias vector of shape `(num_scalars * params_per_scalar,)`.
     """
     K = num_bins
-    params_per_scalar = 3 * K - 1
+    params_per_scalar = _params_per_scalar(K, boundary_slopes)
     bias = jnp.zeros((num_scalars, params_per_scalar), dtype=dtype)
     lo, hi = float(min_derivative), float(max_derivative)
     if lo < 1.0 < hi:
         alpha = (1.0 - lo) / (hi - lo)
         u0 = stable_logit(jnp.asarray(alpha, dtype=bias.dtype))
+        # All derivative slots (interior + any boundary entry) get the same
+        # logit, so they all evaluate to 1 after the sigmoid bound. The
+        # widths/heights stay zero.
         bias = bias.at[:, 2 * K :].set(u0)
     return bias.reshape((-1,))
 
@@ -1144,6 +1177,7 @@ class SplineCoupling:
     min_bin_height: float = 1e-2
     min_derivative: float = 1e-2
     max_derivative: float = 10.0
+    boundary_slopes: str = "linear_tails"
 
     def __post_init__(self):
         self.mask = jnp.asarray(self.mask, dtype=jnp.float32)
@@ -1151,6 +1185,7 @@ class SplineCoupling:
             raise ValueError(
                 f"SplineCoupling: mask must be 1D, got shape {self.mask.shape}."
             )
+        _validate_boundary_slopes(self.boundary_slopes, where="SplineCoupling")
         # Validate conditioner interface.
         validate_conditioner(self.conditioner, name="SplineCoupling.conditioner")
 
@@ -1174,21 +1209,16 @@ class SplineCoupling:
             self._identity_deriv_logit = jnp.array(0.0)
 
     @staticmethod
-    def required_out_dim(dim: int, num_bins: int) -> int:
+    def required_out_dim(
+        dim: int, num_bins: int, boundary_slopes: str = "linear_tails"
+    ) -> int:
         """
         Return required conditioner output dimension for SplineCoupling.
 
-        The conditioner must output widths (K), heights (K), and derivatives (K-1)
-        for each dimension, so out_dim = dim * (3K - 1).
-
-        Arguments:
-            dim: Input/output dimensionality.
-            num_bins: Number of spline bins (K).
-
-        Returns:
-            Required output dimension for conditioner: dim * (3 * num_bins - 1).
+        - 'linear_tails': `dim * (3K - 1)` (K widths + K heights + K-1 interior).
+        - 'circular':     `dim * 3K`       (K widths + K heights + K derivs).
         """
-        return dim * (3 * num_bins - 1)
+        return dim * _params_per_scalar(num_bins, boundary_slopes)
 
     @classmethod
     def create(
@@ -1208,6 +1238,7 @@ class SplineCoupling:
         max_derivative: float = 10.0,
         activation: Callable[[Array], Array] = nn.elu,
         res_scale: float = 0.1,
+        boundary_slopes: str = "linear_tails",
     ) -> Tuple["SplineCoupling", dict]:
         """
         Factory method to create SplineCoupling with properly configured MLP.
@@ -1259,7 +1290,7 @@ class SplineCoupling:
             )
 
         # Create MLP with correct output dimension
-        out_dim = cls.required_out_dim(dim, num_bins)
+        out_dim = cls.required_out_dim(dim, num_bins, boundary_slopes=boundary_slopes)
         mlp = MLP(
             x_dim=dim,
             context_dim=context_dim,
@@ -1280,6 +1311,7 @@ class SplineCoupling:
             min_bin_height=min_bin_height,
             min_derivative=min_derivative,
             max_derivative=max_derivative,
+            boundary_slopes=boundary_slopes,
         )
 
         # Initialize params
@@ -1332,7 +1364,7 @@ class SplineCoupling:
         """
         dim = x.shape[-1]
         K = self.num_bins
-        params_per_dim = 3 * K - 1
+        params_per_dim = _params_per_scalar(K, self.boundary_slopes)
         expected_out_dim = dim * params_per_dim
 
         # Conditioner sees only the masked (conditioning) part.
@@ -1345,11 +1377,11 @@ class SplineCoupling:
                 f"Expected last dim {expected_out_dim}, got {theta.shape[-1]}."
             )
 
-        theta = theta.reshape(theta.shape[:-1] + (dim, params_per_dim))  # (..., dim, 3K-1)
+        theta = theta.reshape(theta.shape[:-1] + (dim, params_per_dim))
 
         widths = theta[..., :K]                 # (..., dim, K)
         heights = theta[..., K : 2 * K]         # (..., dim, K)
-        derivatives = theta[..., 2 * K :]       # (..., dim, K-1)
+        derivatives = theta[..., 2 * K :]       # (..., dim, K-1) or (..., dim, K)
 
         # Apply identity gate: when g_value=0, interpolate to identity spline params.
         # Identity spline: widths=heights=0 (uniform bins after softmax), derivatives → 1.
@@ -1389,6 +1421,7 @@ class SplineCoupling:
                 min_derivative=self.min_derivative,
                 max_derivative=self.max_derivative,
                 inverse=inverse,
+                boundary_slopes=self.boundary_slopes,
             )
 
         # vmap over the feature dimension:
@@ -1500,6 +1533,7 @@ class SplineCoupling:
             num_bins=self.num_bins,
             min_derivative=self.min_derivative,
             max_derivative=self.max_derivative,
+            boundary_slopes=self.boundary_slopes,
         )
         return self.conditioner.set_output_layer(mlp_params, new_kernel, new_bias)
 
@@ -1566,7 +1600,9 @@ class SplitCoupling:
       split_index: size of the first partition along split_axis.
       event_ndims: number of trailing event axes (>= 1).
       conditioner: Flax module mapping (*batch, frozen_flat) -> (*batch, out).
-                   `out = transformed_flat * (3*num_bins - 1)`.
+                   `out = required_out_dim(transformed_flat, num_bins, boundary_slopes)`;
+                   `transformed_flat * (3K-1)` for `linear_tails` (default),
+                   `transformed_flat * 3K` for `circular`.
       swap:        if False, the first partition is frozen; if True, the last.
       num_bins..max_derivative: same as SplineCoupling.
 
@@ -1591,6 +1627,7 @@ class SplitCoupling:
     min_bin_height: float = 1e-2
     min_derivative: float = 1e-2
     max_derivative: float = 10.0
+    boundary_slopes: str = "linear_tails"
 
     def __post_init__(self):
         self.event_shape = tuple(int(d) for d in self.event_shape)
@@ -1598,6 +1635,7 @@ class SplitCoupling:
             raise ValueError(
                 f"SplitCoupling: split_axis must be negative, got {self.split_axis}."
             )
+        _validate_boundary_slopes(self.boundary_slopes, where="SplitCoupling")
         if self.event_ndims < 1:
             raise ValueError(
                 f"SplitCoupling: event_ndims must be >= 1, got {self.event_ndims}."
@@ -1635,9 +1673,17 @@ class SplitCoupling:
             )
 
     @staticmethod
-    def required_out_dim(transformed_flat: int, num_bins: int) -> int:
-        """Conditioner output dimension: transformed_flat * (3K - 1)."""
-        return transformed_flat * (3 * num_bins - 1)
+    def required_out_dim(
+        transformed_flat: int,
+        num_bins: int,
+        boundary_slopes: str = "linear_tails",
+    ) -> int:
+        """Conditioner output dimension for the transformed slice.
+
+        - 'linear_tails': `transformed_flat * (3K - 1)`.
+        - 'circular':     `transformed_flat * 3K` (one extra shared boundary slope per scalar).
+        """
+        return transformed_flat * _params_per_scalar(num_bins, boundary_slopes)
 
     # ------------------------------------------------------------------
     # Partition sizing. Both `create()` (pre-instance, for MLP sizing) and
@@ -1686,6 +1732,7 @@ class SplitCoupling:
         swap: bool = False,
         activation: Callable[[Array], Array] = nn.elu,
         res_scale: float = 0.1,
+        boundary_slopes: str = "linear_tails",
     ) -> Tuple["SplitCoupling", dict]:
         """
         Factory. Sizes the conditioner MLP for the given event_shape partition,
@@ -1701,7 +1748,9 @@ class SplitCoupling:
             context_dim=context_dim,
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
-            out_dim=cls.required_out_dim(transformed_flat, num_bins),
+            out_dim=cls.required_out_dim(
+                transformed_flat, num_bins, boundary_slopes=boundary_slopes
+            ),
             activation=activation,
             res_scale=res_scale,
         )
@@ -1719,6 +1768,7 @@ class SplitCoupling:
             min_bin_height=min_bin_height,
             min_derivative=min_derivative,
             max_derivative=max_derivative,
+            boundary_slopes=boundary_slopes,
         )
         params = coupling.init_params(key, context_dim=context_dim)
         return coupling, params
@@ -1760,7 +1810,7 @@ class SplitCoupling:
         frozen, transformed = self._split(x)
 
         K = self.num_bins
-        params_per_scalar = 3 * K - 1
+        params_per_scalar = _params_per_scalar(K, self.boundary_slopes)
         transformed_event_shape = transformed.shape[-self.event_ndims:]
         batch_shape = frozen.shape[: -self.event_ndims]
 
@@ -1784,6 +1834,7 @@ class SplitCoupling:
             min_derivative=self.min_derivative,
             max_derivative=self.max_derivative,
             inverse=inverse,
+            boundary_slopes=self.boundary_slopes,
         )
         y = self._combine(frozen, transformed_new)
         # Sum per-scalar log-det over all event axes => shape == batch_shape.
@@ -1823,6 +1874,7 @@ class SplitCoupling:
             num_bins=self.num_bins,
             min_derivative=self.min_derivative,
             max_derivative=self.max_derivative,
+            boundary_slopes=self.boundary_slopes,
         )
         return self.conditioner.set_output_layer(mlp_params, new_kernel, new_bias)
 
@@ -1968,6 +2020,98 @@ class Permutation:
         del key  # Unused for Permutation.
         transform = cls(perm=perm)
         params = transform.init_params(None)  # type: ignore
+        return transform, params
+
+
+# ===================================================================
+# Circular Shift: rigid torus rotation
+# ===================================================================
+# Per-coordinate learnable shift with modular wrap:
+#   y = (x - lower + shift) mod (upper - lower) + lower.
+# Log-det is identically zero (rigid translation).
+#
+# This is the "rotation" half of a torus diffeomorphism. Compose with a
+# circular-mode spline coupling to get full torus-bijection expressivity:
+# the shift moves the seam freely around the circle, and the spline
+# deforms locally (matched slopes at the seam → C^1 on the torus).
+@dataclass
+class CircularShift:
+    """Rigid shift modulo the box length, per-coordinate learnable.
+
+    Input shape: `(*batch, ..., coord_dim)`. Only the last axis is
+    "coord-like"; the shift vector has shape `(coord_dim,)` and broadcasts
+    across all preceding axes (particles, batch, etc.). This lets a single
+    CircularShift layer rotate a whole rank-N particle configuration by
+    the same per-coord displacement, as a rigid-body operation on the
+    torus.
+
+    Log-det: scalar zero. Rigid shift has unit Jacobian.
+
+    Compose with a `SplineCoupling` (or `SplitCoupling`) whose inner
+    spline uses `boundary_slopes='circular'` to model general torus
+    diffeomorphisms.
+    """
+    coord_dim: int
+    lower: Any          # float or array broadcastable to (coord_dim,)
+    upper: Any          # same
+
+    def __post_init__(self):
+        # Validate lower < upper so box length is positive.
+        lo = jnp.asarray(self.lower)
+        hi = jnp.asarray(self.upper)
+        if lo.ndim == 0 and hi.ndim == 0 and float(lo) >= float(hi):
+            raise ValueError(
+                f"CircularShift: lower must be < upper; got "
+                f"lower={float(lo)}, upper={float(hi)}."
+            )
+        if self.coord_dim <= 0:
+            raise ValueError(
+                f"CircularShift: coord_dim must be positive, got {self.coord_dim}."
+            )
+
+    def _L(self) -> Array:
+        return jnp.asarray(self.upper) - jnp.asarray(self.lower)
+
+    def _wrap_shift(
+        self, params: Any, x: Array, sign: float
+    ) -> Tuple[Array, Array]:
+        shift = params["shift"]
+        if shift.shape != (self.coord_dim,):
+            raise ValueError(
+                f"CircularShift: expected shift of shape ({self.coord_dim},), "
+                f"got {shift.shape}."
+            )
+        L = self._L()
+        y = jnp.mod(x - jnp.asarray(self.lower) + sign * shift, L) + jnp.asarray(self.lower)
+        # Scalar zero: composes safely in CompositeTransform whose accumulator
+        # is scalar zero + block log-dets broadcast up.
+        log_det = jnp.zeros((), dtype=x.dtype)
+        return y, log_det
+
+    def forward(
+        self, params: Any, x: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        del context  # Unused.
+        return self._wrap_shift(params, x, sign=+1.0)
+
+    def inverse(
+        self, params: Any, y: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        del context  # Unused.
+        return self._wrap_shift(params, y, sign=-1.0)
+
+    def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
+        """Zero shift → layer is identity at init."""
+        del key, context_dim
+        return {"shift": jnp.zeros((self.coord_dim,), dtype=jnp.float32)}
+
+    @classmethod
+    def create(
+        cls, key: PRNGKey, coord_dim: int, lower: Any, upper: Any
+    ) -> Tuple["CircularShift", dict]:
+        """Factory. Returns (transform, zero-initialized params)."""
+        transform = cls(coord_dim=coord_dim, lower=lower, upper=upper)
+        params = transform.init_params(key)
         return transform, params
 
 
