@@ -38,8 +38,9 @@ nflojax/
   nets.py              MLP conditioner, ResNet init
   splines.py           Rational-quadratic spline primitives
   scalar_function.py   LOFT forward/inverse scalar functions
+  geometry.py          Geometry value object (box bounds + per-axis periodicity)
 tests/
-  conftest.py          Shared fixtures + check_logdet_vs_autodiff
+  conftest.py          Shared fixtures + check_logdet_vs_autodiff + requires_x64
   test_builders.py
   test_transforms.py
   test_identity_gate.py
@@ -52,10 +53,11 @@ tests/
 ## Module Dependency Graph
 
 ```
-builders -> flows, transforms, distributions, nets
-flows    -> transforms (gate), nets (types)
-transforms -> nets (MLP), splines, scalar_function
-nets     -> flax.linen
+builders   -> flows, transforms, distributions, nets
+flows      -> transforms (gate), nets (types)
+transforms -> nets (MLP), splines, scalar_function, geometry
+geometry   -> numpy (no JAX / Flax — configuration values only)
+nets       -> flax.linen
 ```
 
 ## Entry Points
@@ -112,8 +114,11 @@ Previously fixed:
 
 | Need | Read |
 |------|------|
+| Vision, scope, what to build / refuse to build | [DESIGN.md](DESIGN.md) |
 | Quick start, install | [README.md](README.md) |
 | How to do X (examples) | [USAGE.md](USAGE.md) |
 | API signatures, options tables | [REFERENCE.md](REFERENCE.md) |
 | Math, design decisions | [INTERNALS.md](INTERNALS.md) |
 | Adding transforms/distributions | [EXTENDING.md](EXTENDING.md) |
+
+Before adding any new code, read `DESIGN.md` §§1–4 (vision, philosophy, scope) and run the §9 heuristics.

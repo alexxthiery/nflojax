@@ -325,6 +325,53 @@ only works when the conditioner is size-agnostic by construction (e.g. a
 GNN over particle neighborhoods). The default MLP conditioner has its
 `x_dim` / `out_dim` baked to the original `N` and will not transfer.
 
+## Periodic boxes and the torus
+
+For flows on a periodic box, two pieces cooperate:
+
+- `nflojax.geometry.Geometry` — an axis-aligned rectangular box + per-axis
+  periodicity flags. Configuration object, not a PyTree.
+  See [REFERENCE.md#geometry](REFERENCE.md#geometry).
+- `nflojax.transforms.CircularShift` — rigid per-coord shift mod the box
+  length (the "rotation" half of a torus diffeomorphism).
+  See [REFERENCE.md#circularshift](REFERENCE.md#circularshift).
+
+```python
+from nflojax.geometry import Geometry
+from nflojax.transforms import CircularShift
+
+# Cubic box [-1, 1]^3.
+geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+shift, params = CircularShift.create(key, geometry=geom)
+
+# Legacy-ergonomic alternative for the same cubic box:
+shift = CircularShift.from_scalar_box(coord_dim=3, lower=-1.0, upper=1.0)
+params = shift.init_params(key)
+
+# Forward = rigid shift mod box length, log_det = 0.
+y, log_det = shift.forward(params, x)
+```
+
+For full torus-bijection expressivity, stack `CircularShift` with a
+`SplineCoupling` (or `SplitCoupling`) using `boundary_slopes='circular'`:
+
+```python
+from nflojax.transforms import CompositeTransform, SplineCoupling
+
+coupling, c_params = SplineCoupling.create(
+    key, dim=3, mask=jnp.array([1, 0, 1]),
+    hidden_dim=64, n_hidden_layers=2,
+    num_bins=16, tail_bound=1.0, boundary_slopes='circular',
+)
+blocks = [shift, coupling]
+block_params = [params, c_params]
+torus_flow = CompositeTransform(blocks=blocks)
+```
+
+The learnable shift discovers the optimal torus gauge; the circular-mode
+spline does the local deformation with matched boundary slopes (C¹ on the
+circle).
+
 ## Training
 
 The library provides density evaluation; training loops are up to you.
