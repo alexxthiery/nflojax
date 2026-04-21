@@ -15,9 +15,11 @@ from nflojax.transforms import (
     CompositeTransform,
     LoftTransform,
     CircularShift,
+    Rescale,
     identity_spline_bias,
     stable_logit,
 )
+from nflojax.geometry import Geometry
 from nflojax.nets import init_mlp
 from conftest import check_logdet_vs_autodiff, requires_x64
 
@@ -2013,3 +2015,163 @@ class TestPeriodicComposition:
         x_back, _ = inv(params, y)
         assert y.shape == x.shape
         assert jnp.allclose(x_back, x, atol=1e-3)
+
+
+# ============================================================================
+# Rescale (fixed per-axis affine from geometry.box to canonical range)
+# ============================================================================
+class TestRescale:
+    """Fixed per-axis affine from Geometry to a target range."""
+
+    def test_round_trip_rank1(self, key):
+        """Rank-1 event (B, d): inverse(forward(x)) == x."""
+        geom = Geometry(lower=[-2.0, -2.0, -2.0], upper=[3.0, 3.0, 3.0])
+        rescale = Rescale(geometry=geom)
+        x = jax.random.uniform(key, (8, 3), minval=-2.0, maxval=3.0)
+        y, _ = rescale.forward({}, x)
+        x_back, _ = rescale.inverse({}, y)
+        assert jnp.allclose(x, x_back, atol=1e-6)
+
+    def test_round_trip_rank2_particle_event(self, key):
+        """Rank-2 event (B, N, d): inverse(forward(x)) == x."""
+        N, d = 5, 3
+        geom = Geometry(lower=[-2.0, -2.0, -2.0], upper=[3.0, 3.0, 3.0])
+        rescale = Rescale(geometry=geom, event_shape=(N, d))
+        x = jax.random.uniform(key, (4, N, d), minval=-2.0, maxval=3.0)
+        y, _ = rescale.forward({}, x)
+        x_back, _ = rescale.inverse({}, y)
+        assert jnp.allclose(x, x_back, atol=1e-6)
+
+    def test_forward_output_in_target_range(self, key):
+        """Forward maps geometry.box onto [-1, 1] by default."""
+        geom = Geometry(lower=[-2.0, -4.0, 0.0], upper=[3.0, 4.0, 10.0])
+        rescale = Rescale(geometry=geom)
+        x = jnp.stack(
+            [
+                jnp.array([-2.0, -4.0, 0.0]),  # box lower corner
+                jnp.array([3.0, 4.0, 10.0]),   # box upper corner
+                jnp.array([0.5, 0.0, 5.0]),    # midpoint
+            ]
+        )
+        y, _ = rescale.forward({}, x)
+        assert jnp.allclose(y[0], jnp.array([-1.0, -1.0, -1.0]), atol=1e-6)
+        assert jnp.allclose(y[1], jnp.array([1.0, 1.0, 1.0]), atol=1e-6)
+        assert jnp.allclose(y[2], jnp.array([0.0, 0.0, 0.0]), atol=1e-6)
+
+    def test_log_det_closed_form_rank1(self, key):
+        """log_det == sum(log(scale)) on rank-1 event."""
+        geom = Geometry(lower=[-2.0, -4.0, 0.0], upper=[3.0, 4.0, 10.0])
+        rescale = Rescale(geometry=geom)
+        box = jnp.asarray(geom.box)
+        scale = 2.0 / box  # target span (2) / box span
+        expected = jnp.sum(jnp.log(scale))
+        x = jax.random.uniform(key, (8, 3), minval=-2.0, maxval=3.0)
+        _, log_det_f = rescale.forward({}, x)
+        _, log_det_i = rescale.inverse({}, x)
+        assert jnp.allclose(log_det_f, expected, atol=1e-6)
+        assert jnp.allclose(log_det_i, -expected, atol=1e-6)
+
+    def test_log_det_autodiff_rank1(self, key):
+        """log_det agrees with autodiff Jacobian on rank-1 event."""
+        geom = Geometry(lower=[-2.0, -4.0, 0.0], upper=[3.0, 4.0, 10.0])
+        rescale = Rescale(geometry=geom)
+        x = jax.random.uniform(key, (3,), minval=-2.0, maxval=3.0)
+        result = check_logdet_vs_autodiff(
+            lambda z: rescale.forward({}, z), x, atol=1e-5
+        )
+        assert result["error"] < 1e-5, result
+
+    def test_log_det_rank2_scales_with_N(self, key):
+        """log_det on (N, d) event equals N * sum(log(scale))."""
+        N, d = 6, 3
+        geom = Geometry(lower=[-2.0, -4.0, 0.0], upper=[3.0, 4.0, 10.0])
+        rescale = Rescale(geometry=geom, event_shape=(N, d))
+        scale = 2.0 / jnp.asarray(geom.box)
+        expected = N * jnp.sum(jnp.log(scale))
+        x = jax.random.uniform(key, (4, N, d), minval=-2.0, maxval=3.0)
+        _, log_det_f = rescale.forward({}, x)
+        assert jnp.allclose(log_det_f, expected, atol=1e-5)
+
+        # Cross-check via autodiff on a single flattened sample.
+        def flat_forward(x_flat):
+            x_shape = x_flat.reshape(N, d)
+            y, ld = rescale.forward({}, x_shape)
+            return y.reshape(-1), ld
+
+        x_single = x[0].reshape(-1)
+        result = check_logdet_vs_autodiff(flat_forward, x_single, atol=1e-5)
+        assert result["error"] < 1e-4, result
+
+    def test_identity_when_box_matches_target(self, key):
+        """Geometry.cubic([-1, 1]^d) + target=(-1, 1) -> identity."""
+        d = 3
+        geom = Geometry.cubic(d=d, side=2.0, lower=-1.0)
+        rescale = Rescale(geometry=geom, target=(-1.0, 1.0))
+        x = jax.random.uniform(key, (10, d), minval=-0.9, maxval=0.9)
+        y, log_det = rescale.forward({}, x)
+        assert jnp.allclose(y, x, atol=1e-6)
+        assert jnp.allclose(log_det, 0.0, atol=1e-6)
+
+    def test_per_axis_target(self, key):
+        """Per-axis target arrays map each axis to its own range."""
+        geom = Geometry(lower=[-2.0, -2.0, -2.0], upper=[2.0, 2.0, 2.0])
+        tl = jnp.array([-1.0, -2.0, -3.0])
+        tu = jnp.array([1.0, 2.0, 3.0])
+        rescale = Rescale(geometry=geom, target=(tl, tu))
+        x = jax.random.uniform(key, (8, 3), minval=-2.0, maxval=2.0)
+        y, _ = rescale.forward({}, x)
+        # Per-axis expected scale: (tu-tl)/box = (2, 4, 6)/4 = (0.5, 1.0, 1.5)
+        scale = (tu - tl) / 4.0
+        expected_y = tl + (x - jnp.array([-2.0, -2.0, -2.0])) * scale
+        assert jnp.allclose(y, expected_y, atol=1e-6)
+
+        x_back, _ = rescale.inverse({}, y)
+        assert jnp.allclose(x_back, x, atol=1e-6)
+
+    def test_jit(self, key):
+        """forward and inverse compile under jit."""
+        geom = Geometry(lower=[-2.0, -2.0, -2.0], upper=[3.0, 3.0, 3.0])
+        rescale = Rescale(geometry=geom)
+        x = jax.random.uniform(key, (4, 3), minval=-2.0, maxval=3.0)
+        fwd = jax.jit(rescale.forward)
+        inv = jax.jit(rescale.inverse)
+        y, _ = fwd({}, x)
+        x_back, _ = inv({}, y)
+        assert jnp.allclose(x_back, x, atol=1e-6)
+
+    def test_create_factory(self, key):
+        """create returns (transform, empty-params)."""
+        geom = Geometry.cubic(d=3, side=5.0, lower=-1.0)
+        transform, params = Rescale.create(key, geometry=geom)
+        assert params == {}
+        x = jax.random.uniform(key, (4, 3), minval=-1.0, maxval=4.0)
+        y_direct, _ = Rescale(geometry=geom).forward({}, x)
+        y_factory, _ = transform.forward(params, x)
+        assert jnp.allclose(y_direct, y_factory, atol=1e-6)
+
+    def test_invalid_target_raises(self):
+        """target_upper <= target_lower raises ValueError."""
+        geom = Geometry.cubic(d=3)
+        with pytest.raises(ValueError, match="target lower must be strictly"):
+            Rescale(geometry=geom, target=(1.0, -1.0))
+        with pytest.raises(ValueError, match="target lower must be strictly"):
+            Rescale(geometry=geom, target=(0.0, 0.0))
+
+    def test_mismatched_target_shape_raises(self):
+        """Per-axis target with wrong shape raises ValueError."""
+        geom = Geometry.cubic(d=3)
+        with pytest.raises(ValueError, match="target bounds must be scalar"):
+            Rescale(geometry=geom, target=(jnp.array([-1.0, -1.0]), jnp.array([1.0, 1.0])))
+
+    def test_invalid_event_shape_raises(self):
+        """event_shape whose last axis != geometry.d raises."""
+        geom = Geometry.cubic(d=3)
+        with pytest.raises(ValueError, match="event_shape must end in the coord dim"):
+            Rescale(geometry=geom, event_shape=(4, 2))
+        with pytest.raises(ValueError, match="event_shape must end in the coord dim"):
+            Rescale(geometry=geom, event_shape=())
+
+    def test_invalid_geometry_raises(self):
+        """Non-Geometry argument raises TypeError."""
+        with pytest.raises(TypeError, match="geometry must be a Geometry instance"):
+            Rescale(geometry="cube")  # type: ignore[arg-type]

@@ -9,6 +9,7 @@ from typing import Any, Callable, List, Sequence, Tuple
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp
+import numpy as np
 from flax import linen as nn
 
 from .nets import MLP, Array, PRNGKey, validate_conditioner
@@ -2133,6 +2134,129 @@ class CircularShift:
             d=coord_dim, side=float(upper) - float(lower), lower=float(lower)
         )
         return cls(geometry=geom)
+
+
+# ===================================================================
+# Rescale: fixed per-axis affine from geometry.box to a canonical range.
+#
+#   y_i = target_lower_i + (x_i - lower_i) * scale_i,
+#       scale_i = (target_upper_i - target_lower_i) / (upper_i - lower_i).
+#
+# Non-learnable, non-conditional; carries no parameters. Typical use is
+# the first layer of a particle flow, mapping a physical Geometry.box
+# onto the canonical spline range [-1, 1] so every downstream spline /
+# coupling can assume a fixed domain. For a learnable affine, use
+# LinearTransform.
+# ===================================================================
+@dataclass
+class Rescale:
+    """Fixed per-axis affine from `geometry.box` to a canonical range.
+
+    Input shape: `(*batch, *event_shape)`, with the last axis of
+    `event_shape` being the coord axis of length `geometry.d`. Each
+    coord scalar is rescaled independently; any leading event axes
+    (particles, species, ...) are replicated identically.
+
+    Log-det: scalar
+        `event_factor * sum_i log(scale_i)`,
+    where `event_factor = prod(event_shape[:-1])` counts the non-coord
+    event axes. For a rank-1 event `(d,)` this is 1; for a rank-2 event
+    `(N, d)` this is `N`. Scalar log-dets broadcast through
+    `CompositeTransform`'s accumulator.
+    """
+
+    geometry: Geometry
+    target: Tuple[Any, Any] = (-1.0, 1.0)
+    event_shape: Tuple[int, ...] | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.geometry, Geometry):
+            raise TypeError(
+                f"Rescale: geometry must be a Geometry instance, "
+                f"got {type(self.geometry).__name__}."
+            )
+        d = self.geometry.d
+
+        tl_raw, tu_raw = self.target
+        tl = np.asarray(tl_raw, dtype=np.float32)
+        tu = np.asarray(tu_raw, dtype=np.float32)
+        if tl.ndim == 0:
+            tl = np.full((d,), float(tl), dtype=np.float32)
+        if tu.ndim == 0:
+            tu = np.full((d,), float(tu), dtype=np.float32)
+        if tl.shape != (d,) or tu.shape != (d,):
+            raise ValueError(
+                f"Rescale: target bounds must be scalar or shape ({d},); "
+                f"got lower.shape={tl.shape}, upper.shape={tu.shape}."
+            )
+        if np.any(tl >= tu):
+            raise ValueError(
+                f"Rescale: target lower must be strictly < target upper "
+                f"element-wise; got lower={tl}, upper={tu}."
+            )
+        object.__setattr__(self, "target", (tl, tu))
+
+        if self.event_shape is None:
+            event_shape: Tuple[int, ...] = (d,)
+        else:
+            event_shape = tuple(int(s) for s in self.event_shape)
+        if len(event_shape) == 0 or event_shape[-1] != d:
+            raise ValueError(
+                f"Rescale: event_shape must end in the coord dim {d}; "
+                f"got event_shape={event_shape}."
+            )
+        object.__setattr__(self, "event_shape", event_shape)
+
+        # Precomputed constants (numpy -> jnp). Cheap and not traced.
+        scale = (tu - tl) / self.geometry.box  # (d,) numpy
+        object.__setattr__(
+            self, "_lower_j", jnp.asarray(self.geometry.lower, dtype=jnp.float32)
+        )
+        object.__setattr__(
+            self, "_target_lower_j", jnp.asarray(tl, dtype=jnp.float32)
+        )
+        object.__setattr__(
+            self, "_scale_j", jnp.asarray(scale, dtype=jnp.float32)
+        )
+        event_factor = 1
+        for s in event_shape[:-1]:
+            event_factor *= int(s)
+        object.__setattr__(
+            self, "_log_det_fwd", float(event_factor) * float(np.sum(np.log(scale)))
+        )
+
+    def forward(
+        self, params: Any, x: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        del params, context  # Unused; Rescale is non-learnable, non-conditional.
+        y = self._target_lower_j + (x - self._lower_j) * self._scale_j
+        log_det = jnp.asarray(self._log_det_fwd, dtype=x.dtype)
+        return y, log_det
+
+    def inverse(
+        self, params: Any, y: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        del params, context  # Unused.
+        x = self._lower_j + (y - self._target_lower_j) / self._scale_j
+        log_det = jnp.asarray(-self._log_det_fwd, dtype=y.dtype)
+        return x, log_det
+
+    def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
+        """No learnable parameters."""
+        del key, context_dim
+        return {}
+
+    @classmethod
+    def create(
+        cls,
+        key: PRNGKey,
+        geometry: Geometry,
+        target: Tuple[Any, Any] = (-1.0, 1.0),
+        event_shape: Tuple[int, ...] | None = None,
+    ) -> Tuple["Rescale", dict]:
+        """Factory. Returns `(transform, empty-params)`."""
+        transform = cls(geometry=geometry, target=target, event_shape=event_shape)
+        return transform, transform.init_params(key)
 
 
 # ===================================================================

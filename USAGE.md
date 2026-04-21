@@ -332,6 +332,10 @@ For flows on a periodic box, two pieces cooperate:
 - `nflojax.geometry.Geometry` — an axis-aligned rectangular box + per-axis
   periodicity flags. Configuration object, not a PyTree.
   See [REFERENCE.md#geometry](REFERENCE.md#geometry).
+- `nflojax.transforms.Rescale` — fixed per-axis affine from `geometry.box`
+  to a canonical range (default `[-1, 1]`); use as the first layer so
+  downstream splines / couplings see a fixed domain.
+  See [REFERENCE.md#rescale](REFERENCE.md#rescale).
 - `nflojax.transforms.CircularShift` — rigid per-coord shift mod the box
   length (the "rotation" half of a torus diffeomorphism).
   See [REFERENCE.md#circularshift](REFERENCE.md#circularshift).
