@@ -20,7 +20,10 @@ Homepage = "https://github.com/alexxthiery/nflojax"
 Repository = "https://github.com/alexxthiery/nflojax"
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "pytest-xdist"]
+
+[tool.pytest.ini_options]
+addopts = "-n auto -q"
 
 [tool.setuptools.packages.find]
 include = ["nflojax*"]
