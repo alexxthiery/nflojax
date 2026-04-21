@@ -78,21 +78,34 @@ nets       -> flax.linen
 - **Gate contract**: `identity_gate` callable must be written for single sample `(context_dim,)`; batching via `jax.vmap`.
 - **Feature extractor split**: gate sees raw context, couplings see extracted features.
 
-## Dev Commands
+## Testing Strategy
+
+**One rule: after any code edit, run `pytest tests/`.** The full suite is
+parallel by default (via `pytest-xdist`, configured in `pyproject.toml`) and
+runs in ~85s under float32, ~95s under x64 on a multicore machine. Do not
+pick a subset — the cost of a missed regression is larger than the minute
+you save.
 
 ```bash
-# Run all tests
-python -m pytest tests/ -v
+# Default: run everything in parallel (~85s)
+pytest tests/
 
-# Run specific test file
-python -m pytest tests/test_builders.py -v
+# At stage close (closing a PLAN.md task): also check float64 (~95s)
+JAX_ENABLE_X64=1 pytest tests/
 
-# Run tests matching pattern
-python -m pytest tests/ -k "identity_gate" -v
-
-# Run with float64 enabled
-JAX_ENABLE_X64=1 python -m pytest tests/ -v
+# Iterating on ONE failure you're debugging — narrow with -k, then re-run full
+pytest tests/ -k "Rescale and round_trip"
 ```
+
+Two commands total for the full float32+x64 check (~3 min combined). If you
+find yourself wanting "just this file", you're probably over-triaging; run
+the full suite unless you have a specific reason.
+
+### Known pre-existing flakes
+
+- `TestLinearTransformConditionalShiftGate::test_conditional_invertibility`
+  (in `test_identity_gate.py`) fails under float32 at `0.010172 > 0.01`.
+  Passes under x64. Not blocking; unrelated to any in-flight work.
 
 ## Known Issues
 
