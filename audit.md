@@ -1,5 +1,17 @@
 # nflojax — Design & Plan Audit
 
+## How to read this document
+
+This file is a **working audit**. It is **advisory, not canonical**. Canon lives in `DESIGN.md` (scope, philosophy, module charter) and `PLAN.md` (what is landing next and in what order).
+
+- **Tags** — items are marked `[BLOCK]` (must fix before starting dependent code), `[STRONG]` (fix soon), `[NIT]` (polish). These tags describe *proposed* priorities, not execution status.
+- **Execution status** — amendments that have been *acted on* are listed under "Stage-0 pre-work" in `PLAN.md` as `[x]`. Anything else in this audit is still advisory; treat it as "the case for" not "the verdict".
+- **External references** — some sections reference `bgmat/`, `flows_for_atomic_solids/`, or absolute paths like `/home/statah/research/bgmat/`. These are example downstream applications that motivated nflojax's design; a fresh agent working inside nflojax alone can read the audit by treating them as "what downstream apps look like", not as prerequisites.
+- **Two passes** — §§0–11 were the first pass (scope, abstractions, symmetries, physics pitfalls). §§12–13 are a later "five steps ahead" pass (paradigm risk, ecosystem risk, maintenance debt). Recommendations in the second pass can supersede the first (noted in §13).
+- **When in doubt** — if DESIGN.md and audit.md disagree, DESIGN.md wins. If you think the audit is right and DESIGN.md needs updating, propose the DESIGN.md edit; do not act on the audit directly.
+
+---
+
 **Audience.** The person (human or agent) deciding whether `DESIGN.md` and `PLAN.md` are ready to act on.
 
 **Frame.** Reviewer comes from the intersection of normalizing-flow library work (nflows / Distrax / TFP-bijectors / Zuko / FlowJax) and physics-grade Boltzmann sampling of solids, liquids, supercooled / glassy systems. The critique is opinionated and concrete. Items are flagged as:

@@ -115,10 +115,12 @@ Previously fixed:
 | Need | Read |
 |------|------|
 | Vision, scope, what to build / refuse to build | [DESIGN.md](DESIGN.md) |
+| Implementation plan, stage status | [PLAN.md](PLAN.md) |
+| Design-rationale audit (advisory; not canonical) | [audit.md](audit.md) |
 | Quick start, install | [README.md](README.md) |
 | How to do X (examples) | [USAGE.md](USAGE.md) |
 | API signatures, options tables | [REFERENCE.md](REFERENCE.md) |
 | Math, design decisions | [INTERNALS.md](INTERNALS.md) |
 | Adding transforms/distributions | [EXTENDING.md](EXTENDING.md) |
 
-Before adding any new code, read `DESIGN.md` §§1–4 (vision, philosophy, scope) and run the §9 heuristics.
+Before adding any new code, read `DESIGN.md` §§1–4 (vision, philosophy, scope) and run the §9 heuristics. `PLAN.md` tells you what stage is in flight. `audit.md` is working opinion — see its "How to read this" preamble before treating anything there as canonical.
