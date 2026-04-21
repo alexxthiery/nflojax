@@ -59,17 +59,17 @@ nflojax is the toolkit for building, sampling, and scoring a normalizing flow on
 
 ### 3.1 Core flow machinery
 
-- **Bijections** covering the Cartesian, torus, and simplex regimes: affine couplings, spline couplings, split couplings for rank-N events, permutations, rescales, circular shifts, centre-of-mass shifts, LOFT stabilisation, linear transforms.
-- **Base distributions** general enough to seed any particle flow: `StandardNormal`, `DiagNormal`, `UniformBox`, `LatticeBase` with a small family of lattice generators (FCC, diamond, hexagonal ice, BCC, HCP).
-- **Composition** primitives: `CompositeTransform`, the assembly API, builders for common topologies.
+- **Bijections** covering the Cartesian and torus regimes. Today: `AffineCoupling`, `SplineCoupling`, `SplitCoupling` (rank-N), `LinearTransform`, `Permutation` (axis-aware), `CircularShift`, `LoftTransform`, `CompositeTransform`. Planned in Stage A: `Rescale`, `CoMProjection`.
+- **Base distributions.** Today: `StandardNormal`, `DiagNormal`. Planned in Stage B: `UniformBox`, `LatticeBase` with factories for FCC, diamond, hexagonal ice, BCC, HCP.
+- **Composition** primitives: `CompositeTransform`, the assembly API (`assemble_flow` / `assemble_bijection`), builders for common topologies (`build_realnvp`, `build_spline_realnvp` today; `build_particle_flow` in Stage E).
 
 ### 3.2 Conditioner infrastructure
 
 A *conditioner* is the neural module that turns the frozen half of a coupling into per-scalar spline (or affine) parameters. nflojax provides:
 
-- A **conditioner contract** (`validate_conditioner` in `transforms.py`) that describes the expected signature, output shape, and identity-at-init requirement.
-- **Reference conditioners** implementing the contract at several equivariance levels: `MLP` (no equivariance), `DeepSets` (permutation-invariant), `Transformer` (permutation-equivariant attention), `GNN` (permutation-equivariant message passing).
-- **Feature helpers** used by every conditioner: circular Fourier embeddings, positional (sinusoidal) embeddings for scalar context.
+- A **conditioner contract** (`validate_conditioner` in `nets.py`) that describes the expected signature, output shape, and identity-at-init requirement.
+- **Reference conditioners** today: `MLP` (no equivariance), `ResNet` (building block for MLP). Planned in Stage D at increasing equivariance levels: `DeepSets` (permutation-invariant), `Transformer` (permutation-equivariant attention), `GNN` (permutation-equivariant message passing). Users can always bring their own conditioner that satisfies the contract; the scheduled reference implementations serve as starting points, not as the only option.
+- **Feature helpers** (planned in Stage C): circular Fourier embeddings, positional (sinusoidal) embeddings for scalar context, in a new `embeddings.py`.
 
 Reference conditioners are genuinely usable, but nothing in the library prevents a user from writing their own. The contract is the product; the implementations are examples.
 
@@ -126,6 +126,8 @@ A `Flow` couples a bijection with a base distribution and exposes `sample`, `log
 ### 5.2 Context is a PyTree
 
 Context is any JAX PyTree or `None`. A conditioner reads whatever structure it wants. nflojax flow layers pass `context` through to every block that accepts it; they do not inspect it. This is how temperature / density / lattice / box / species are threaded to conditioners without the flow layer caring.
+
+**Current implementation.** As of this writing, the built-in `MLP` conditioner concatenates `context` into its input tensor, and `_compute_gate_value` indexes `context.ndim` — both assume `context` is a single `Array` (or `None`). A user-supplied conditioner that takes a structured PyTree context works fine at the flow level, but the built-in path does not yet. Widening `MLP` (e.g. via `jax.flatten_util.ravel_pytree`) and loosening `_compute_gate_value` is tracked in `PLAN.md` Stage A4. Until that lands, treat the "Context is a PyTree" rule as aspirational for the library core, and as true today only when a user brings their own conditioner.
 
 ### 5.3 Event shape and event axes
 
@@ -223,6 +225,8 @@ Every non-trivial feature (temperature, pressure, density, lattice bounds, speci
 
 For every file in `nflojax/`, here is what it is for and what it is not for. An agent adding code to nflojax should locate its work in the correct file by reading this charter; if none fits, that is a signal to ask whether the code belongs in nflojax at all.
 
+*Legend:* entries tagged **(planned, Stage X)** are modules that do not yet exist; their charter is reserved so that when the stage lands the code has a predetermined home. See `PLAN.md` for stage definitions.
+
 - `flows.py` — `Flow` and `Bijection`. Wrappers that compose a base with a transform and expose sample / log-prob. *Not for* new bijections, new bases, new losses.
 - `transforms.py` — all bijections. *Not for* conditioner code, base-distribution code, or anything that reads energy.
 - `splines.py` — rational-quadratic spline math. *Not for* coupling / distribution / flow logic; this file is a numerical kernel.
@@ -232,8 +236,8 @@ For every file in `nflojax/`, here is what it is for and what it is not for. An 
 - `builders.py` — assembly helpers: `build_realnvp`, `build_spline_realnvp`, `build_particle_flow`. *Not for* primitive construction logic; each builder is a thin composition.
 - `scalar_function.py` — LOFT numerical kernel, parallel role to `splines.py`.
 - `geometry.py` — `Geometry` value object: per-axis box bounds + per-axis periodicity flags. Numpy-backed configuration (not a PyTree, not traced). Consumed by `CircularShift` today and by upcoming geometry-aware primitives (`Rescale`, `UniformBox`, `LatticeBase`, `utils/pbc`). *Not for* metrics, cell matrices for triclinic cells, curved manifolds — those need sibling types.
-- `utils/pbc.py` (new) — periodic-box geometry: nearest image, pairwise distances. *Not for* forces, energies, or neighbour lists with cutoffs that are used by energies (those are application code).
-- `utils/lattice.py` (new) — lattice-position generators used by `LatticeBase`. *Not for* lattice-specific physics (Madelung constants, defect structures, etc.).
+- `utils/pbc.py` **(planned, Stage B)** — periodic-box geometry: nearest image, pairwise distances. *Not for* forces, energies, or neighbour lists with cutoffs that are used by energies (those are application code).
+- `utils/lattice.py` **(planned, Stage B)** — lattice-position generators used by `LatticeBase`. *Not for* lattice-specific physics (Madelung constants, defect structures, etc.).
 
 If a proposed piece of code does not have a home in the list above, that is the first test. Do not create a new module to justify the code; reconsider whether the code belongs.
 
