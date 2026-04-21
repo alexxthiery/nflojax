@@ -2260,6 +2260,174 @@ class Rescale:
 
 
 # ===================================================================
+# CoMProjection: (N, d) <-> (N-1, d) translation-gauge projection.
+#
+# Forward  : x -> y where y_i = x_i - mean(x),  i in [0, N-1)  (drop last)
+# Inverse  : y -> x where x_i = y_i for i < N-1, x_{N-1} = -sum(y)
+#
+# Domains differ in intrinsic dimension: (N, d) ambient vs (N-1, d) reduced.
+# This is therefore NOT a bijection on R^(Nd); it is a bijection between
+# R^((N-1)d) and the zero-CoM subspace of R^(Nd). The log-det stored on this
+# class is **zero in both directions** — see the class docstring for the
+# convention, and `CoMProjection.ambient_correction(N, d)` for the constant
+# a caller must add when they need an ambient-space log-density.
+# ===================================================================
+@dataclass
+class CoMProjection:
+    """Translation-gauge projection: (N, d) <-> (N-1, d).
+
+    Drops the centre-of-mass degree of freedom from a particle
+    configuration. Useful when training a flow on a `T(d)`-invariant
+    target (most materials Boltzmann generators): the base distribution
+    lives on the reduced `(N-1, d)` space and a final `CoMProjection`
+    inverse embeds samples back into the ambient zero-CoM subspace.
+
+    Shapes
+    ------
+    - Forward takes `(..., N, d_axis)` with the particle axis at
+      `event_axis` (default `-2`) and returns `(..., N-1, d_axis)`.
+    - Inverse takes `(..., N-1, d_axis)` and returns `(..., N, d_axis)`
+      whose sum along the particle axis is identically zero.
+
+    Forward behaviour
+    -----------------
+    Forward **subtracts the per-axis mean along the particle axis
+    before dropping the last particle.** An input with non-zero CoM is
+    therefore centred; the original CoM is discarded (lossy). For a
+    flow round-trip, inputs arriving at `forward` will already be
+    zero-CoM if they came from `inverse`.
+
+    ---------------------------------------------------------------
+    WARNING — LOG-DET CONVENTION (READ THIS)
+    ---------------------------------------------------------------
+    The log-det returned by `forward` and `inverse` is **identically
+    zero**. This class uses *Convention (1)*: the bijection is treated
+    as a relabelling of two `(N-1)d`-dimensional Euclidean spaces. The
+    flow produced by composing a `(N-1, d)` base with this bijection's
+    inverse yields a density **on the reduced `(N-1, d)` space**.
+
+    If you need a density on the **ambient zero-CoM subspace of
+    `R^(Nd)`** (the usual case for reverse-KL training against an
+    ambient energy `E(x)`), you must add a constant volume-element
+    correction:
+
+        log q_ambient(x) = log q_reduced(y) + (d / 2) * log(N)
+
+    where `y = forward(x)`. The helper is
+
+        CoMProjection.ambient_correction(N, d)  # returns (d/2) * log(N)
+
+    See `REFERENCE.md#comprojection`, `INTERNALS.md` (math derivation),
+    and `EXTENDING.md` (when to apply the correction vs. use augmented
+    coupling instead) for full guidance.
+
+    When the constant matters
+    -------------------------
+    - Yes — importance weights / SNIS / ESS / logZ / direct density
+      comparisons against an ambient reference measure.
+    - No — gradient-based training loss (it is a constant, so it has
+      zero gradient). Drop or keep; the optimisation is invariant.
+
+    ---------------------------------------------------------------
+    Math (short)
+    ---------------------------------------------------------------
+    Parameterise the zero-CoM subspace by `y = (x_1, ..., x_{N-1})`,
+    `x_N = -sum(y)`. The embedding's per-axis Jacobian matrix `J` has
+    `J^T J = I + 1 1^T` whose determinant is `1 + (N-1) = N`. The
+    volume scaling is therefore `sqrt(N)` per coordinate axis, and
+    `sqrt(N)^d = N^(d/2)` across `d` axes. `(d/2) * log(N)` is the
+    constant relating reduced-space and ambient-subspace densities.
+
+    Parameters
+    ----------
+    event_axis : int, default -2
+        Negative axis along which particles are stacked. Must be
+        negative and not -1 (the coord axis). For a `(B, N, d)` event
+        use the default; for a `(B, species, N, d)` event use `-2` as
+        well (still the second-to-last).
+    """
+
+    event_axis: int = -2
+
+    def __post_init__(self):
+        if self.event_axis >= 0:
+            raise ValueError(
+                f"CoMProjection: event_axis must be negative (standard trailing-"
+                f"axes convention); got {self.event_axis}."
+            )
+        if self.event_axis == -1:
+            raise ValueError(
+                f"CoMProjection: event_axis=-1 is the coord axis. "
+                f"Use -2 (default) for the particle axis."
+            )
+
+    def forward(
+        self, params: Any, x: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        del params, context  # Unused; CoMProjection is non-learnable.
+        mean = jnp.mean(x, axis=self.event_axis, keepdims=True)
+        x_centered = x - mean
+        # Drop the last particle along event_axis. Using slice_in_dim
+        # because event_axis is negative.
+        n = x.shape[self.event_axis]
+        y = jax.lax.slice_in_dim(x_centered, 0, n - 1, axis=self.event_axis)
+        # Convention (1): log-det on the (N-1)d subspace is zero. See
+        # class docstring WARNING block for when the caller must add
+        # `ambient_correction(N, d) = (d/2) * log(N)`.
+        log_det = jnp.zeros((), dtype=x.dtype)
+        return y, log_det
+
+    def inverse(
+        self, params: Any, y: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        del params, context
+        last = -jnp.sum(y, axis=self.event_axis, keepdims=True)
+        x = jnp.concatenate([y, last], axis=self.event_axis)
+        # Same convention; see WARNING in the class docstring.
+        log_det = jnp.zeros((), dtype=y.dtype)
+        return x, log_det
+
+    def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
+        """No learnable parameters."""
+        del key, context_dim
+        return {}
+
+    @classmethod
+    def create(
+        cls, key: PRNGKey, event_axis: int = -2
+    ) -> Tuple["CoMProjection", dict]:
+        """Factory. Returns `(transform, empty-params)`."""
+        transform = cls(event_axis=event_axis)
+        return transform, transform.init_params(key)
+
+    @staticmethod
+    def ambient_correction(N: int, d: int) -> float:
+        """Constant log-density correction between reduced and ambient measures.
+
+        Returns `(d / 2) * log(N)`, the log of the volume scaling between a
+        density on the `(N-1, d)` reduced space and the same density expressed
+        on the zero-CoM subspace of `R^(Nd)`. Apply when you need an ambient
+        log-density (e.g. reverse-KL training against ambient `E(x)` and
+        you care about the absolute value, not just the gradient):
+
+            log_q_ambient = log_q_reduced + CoMProjection.ambient_correction(N, d)
+
+        For gradient-only training, the constant is irrelevant.
+
+        See the class docstring WARNING block for the convention rationale.
+        """
+        if N <= 1:
+            raise ValueError(
+                f"CoMProjection.ambient_correction: N must be >= 2, got {N}."
+            )
+        if d <= 0:
+            raise ValueError(
+                f"CoMProjection.ambient_correction: d must be >= 1, got {d}."
+            )
+        return 0.5 * int(d) * math.log(int(N))
+
+
+# ===================================================================
 # Composite Transform: Sequential composition of multiple transforms
 # ===================================================================
 def _block_supports_gvalue(block: Any) -> bool:

@@ -11,7 +11,10 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+import flax.linen as nn
+
 from nflojax.builders import build_realnvp, build_spline_realnvp
+from nflojax.transforms import AffineCoupling
 
 
 # ---------------------------------------------------------------------------
@@ -540,4 +543,85 @@ class TestContextFeatureExtractor:
         """Flows without extractor have no feature_extractor field in params."""
         flow, params = realnvp_flow
         assert flow.feature_extractor is None
+
+
+# ===========================================================================
+# Custom conditioner with PyTree context (DESIGN.md §5.2 contract)
+# ===========================================================================
+class _DictContextConditioner(nn.Module):
+    """Minimal custom conditioner reading a dict-shaped PyTree context.
+
+    Proves that the flow threads an arbitrary PyTree context through to a
+    user-brought conditioner. The built-in MLP requires a single Array;
+    this fixture is the companion path for structured contexts (see
+    DESIGN.md §5.2).
+    """
+    context_dim: int  # kept for validate_conditioner; not used internally
+    out_dim: int
+
+    @nn.compact
+    def __call__(self, x, context=None):
+        if context is not None:
+            leaves = [context["a"], context["b"]]
+            broadcast = [
+                jnp.broadcast_to(leaf, x.shape[:-1] + leaf.shape[-1:])
+                for leaf in leaves
+            ]
+            inp = jnp.concatenate([x] + broadcast, axis=-1)
+        else:
+            inp = x
+        return nn.Dense(
+            self.out_dim,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+        )(inp)
+
+
+class TestCustomConditionerPyTreeContext:
+    """DESIGN.md §5.2: custom conditioners can take any PyTree context."""
+
+    def test_dict_context_round_trips_through_affine_coupling(self, key, dim):
+        """AffineCoupling with a dict-context conditioner: forward then inverse recovers x."""
+        conditioner = _DictContextConditioner(
+            context_dim=3, out_dim=2 * dim
+        )
+
+        ctx_sample = {"a": jnp.zeros((2,)), "b": jnp.zeros((1,))}
+        variables = conditioner.init(key, jnp.zeros((dim,)), ctx_sample)
+        params = {"mlp": variables["params"]}
+
+        mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
+        coupling = AffineCoupling(mask=mask, conditioner=conditioner)
+
+        x = jax.random.normal(key, (8, dim))
+        ctx = {"a": jnp.ones((2,)), "b": jnp.array([0.5])}
+
+        y, ld_fwd = coupling.forward(params, x, context=ctx)
+        x_back, ld_inv = coupling.inverse(params, y, context=ctx)
+
+        assert jnp.allclose(x, x_back, atol=1e-6)
+        assert jnp.allclose(ld_fwd + ld_inv, 0.0, atol=1e-6)
+        # Zero-initialised Dense => identity at init + zero log-det.
+        assert jnp.allclose(y, x, atol=1e-6)
+        assert jnp.allclose(ld_fwd, 0.0, atol=1e-6)
+
+    def test_dict_context_jit(self, key, dim):
+        """The dict-context path compiles under jit."""
+        conditioner = _DictContextConditioner(
+            context_dim=3, out_dim=2 * dim
+        )
+
+        ctx_sample = {"a": jnp.zeros((2,)), "b": jnp.zeros((1,))}
+        variables = conditioner.init(key, jnp.zeros((dim,)), ctx_sample)
+        params = {"mlp": variables["params"]}
+
+        mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
+        coupling = AffineCoupling(mask=mask, conditioner=conditioner)
+
+        x = jax.random.normal(key, (4, dim))
+        ctx = {"a": jnp.ones((2,)), "b": jnp.array([0.5])}
+
+        y, _ = jax.jit(coupling.forward)(params, x, ctx)
+        x_back, _ = jax.jit(coupling.inverse)(params, y, ctx)
+        assert jnp.allclose(x_back, x, atol=1e-6)
         assert "feature_extractor" not in params

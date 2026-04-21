@@ -12,6 +12,7 @@ Mathematical foundations and design decisions behind nflojax.
 - [Identity Gate](#identity-gate)
 - [Numerical Stability](#numerical-stability)
 - [Density Evaluation](#density-evaluation)
+- [CoM Projection and the Volume Correction](#com-projection-and-the-volume-correction)
 - [References](#references)
 
 ## Change of Variables
@@ -384,6 +385,137 @@ Note the sign difference: `log_prob` uses `+ log_det_inv` while `sample_and_log_
 Both are correct because `log|det dz/dx| = -log|det dx/dz|`.
 
 See [REFERENCE.md](REFERENCE.md#forwardinverse-convention) for the full sign convention table.
+
+## CoM Projection and the Volume Correction
+
+`CoMProjection` is a bijection between spaces of different intrinsic embedding
+dimension: `(N, d)` ambient (as a subspace of `R^(Nd)`) and `(N−1, d)` reduced
+Euclidean space. Because the domains differ, "log-det of the Jacobian" is not
+a square-matrix determinant — it is a volume-form ratio that depends on how
+the embedding is parameterised. This section derives the `(d/2) · log(N)`
+factor and explains why nflojax stores a zero log-det on `CoMProjection` and
+leaves the factor to a caller-applied correction.
+
+### Setup
+
+Let `x = (x_1, ..., x_N) ∈ R^(Nd)` with each `x_i ∈ R^d`. Total ambient
+dimension is `Nd`. The zero-CoM subspace
+
+```
+S = { x ∈ R^(Nd) : Σ_i x_i = 0 }
+```
+
+is cut out by `d` linear constraints (one per coord axis), so `dim(S) = (N−1)d`.
+
+Parameterise `S` by dropping the last particle and reconstructing it from the
+constraint:
+
+```
+y ∈ R^((N−1)d),   y = (x_1, ..., x_{N−1})
+x_N = −Σ_{i<N} y_i
+```
+
+This `ψ: R^((N−1)d) → S ⊂ R^(Nd)` is a linear bijection between two
+`(N−1)d`-dimensional spaces.
+
+### The Jacobian
+
+Consider one coord axis at a time (the `d` axes decouple: `ψ` acts as the
+same map independently on each axis). Fix a coord axis; the per-axis
+embedding `ψ_1: R^(N−1) → R^N` is
+
+```
+ψ_1(y_1, ..., y_{N−1}) = (y_1, ..., y_{N−1}, −Σ y_i).
+```
+
+Its Jacobian matrix `J ∈ R^(N × (N−1))` is
+
+```
+J_{ij} = δ_{ij}    for i < N,
+J_{Nj} = −1        for all j.
+```
+
+Since `J` is rectangular (`N > N−1`), the "Jacobian determinant" is replaced
+by the volume-scaling factor `sqrt(det(J^T J))` (the Gram determinant). We
+compute `J^T J ∈ R^((N−1) × (N−1))`:
+
+```
+(J^T J)_{jk} = Σ_i J_{ij} J_{ik}
+             = δ_{jk} · (contributions from rows i < N, which equal δ_{jk})
+             + 1 · 1  (contribution from row N: (−1)(−1) = 1)
+             = δ_{jk} + 1.
+```
+
+So `J^T J = I_{N−1} + 11^T`, where `1 ∈ R^(N−1)` is the all-ones column
+vector.
+
+### Determinant via the matrix determinant lemma
+
+For a rank-1 update, `det(A + uv^T) = det(A) · (1 + v^T A^{−1} u)`. With
+`A = I_{N−1}`, `u = v = 1`:
+
+```
+det(I + 11^T) = 1 · (1 + 1^T I^{−1} 1) = 1 + (N−1) = N.
+```
+
+Therefore the per-axis volume scaling is `sqrt(det(J^T J)) = sqrt(N)`, and
+across the `d` independent coord axes the total volume scaling is
+
+```
+sqrt(N)^d = N^(d/2).
+```
+
+Taking the log gives the **constant correction** between a density on the
+reduced `R^((N−1)d)` space and the same density expressed on the zero-CoM
+subspace `S`:
+
+```
+log q_ambient(x) = log q_reduced(y) + (d/2) · log(N).
+```
+
+### Why `CoMProjection.forward` / `.inverse` both return `log_det = 0`
+
+`CoMProjection` is implemented as a pure relabelling between two
+`(N−1)d`-dimensional spaces (the reduced space and the zero-CoM subspace, both
+viewed as abstract Euclidean spaces of the same dimension). The Jacobian
+determinant of this relabelling, **measured in the intrinsic metric of each
+space**, is `1` — hence `log_det = 0`.
+
+The `(d/2) · log(N)` factor appears only when one *re-embeds* the zero-CoM
+subspace into its ambient `R^(Nd)` and evaluates the density using the
+Euclidean volume form of the larger space. nflojax exposes this as a
+separate static helper
+
+```python
+CoMProjection.ambient_correction(N, d)  # returns (d/2) * log(N)
+```
+
+so that callers can apply it explicitly when (and only when) they need the
+ambient density.
+
+### Why not bake the factor into `log_det`
+
+Baking `±(d/2) · log(N)` into `CoMProjection` would double-count in the
+augmented-coupling composition (bgmat-style), where translation invariance is
+handled by a doubled-DoF construction that already yields ambient-valid
+densities. Users of the augmented pattern would have to *subtract* the
+correction back out — a fragile, implicit obligation. The explicit helper
+pushes the bookkeeping to the call site where the measure convention is
+decided. See [EXTENDING.md — CoM handling](EXTENDING.md#com-handling) for
+the two composition patterns side-by-side and the "do not stack them"
+warning.
+
+### When the correction matters
+
+- **Gradient-based training loss** (reverse-KL, forward-KL): the correction
+  is a constant, so its gradient is zero. The loss is unchanged whether
+  you add it or not.
+- **Importance weights / SNIS / ESS / `logZ` estimates**: the correction
+  affects absolute log-density values. Must be applied.
+- **Absolute density comparisons across models or reference measures**:
+  must be applied, with consistent conventions across all compared models.
+- **Relative density within one flow** (ratios, conditional quantities):
+  cancels; no correction needed.
 
 ## References
 

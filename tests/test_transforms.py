@@ -16,6 +16,7 @@ from nflojax.transforms import (
     LoftTransform,
     CircularShift,
     Rescale,
+    CoMProjection,
     identity_spline_bias,
     stable_logit,
 )
@@ -2175,3 +2176,136 @@ class TestRescale:
         """Non-Geometry argument raises TypeError."""
         with pytest.raises(TypeError, match="geometry must be a Geometry instance"):
             Rescale(geometry="cube")  # type: ignore[arg-type]
+
+
+# ============================================================================
+# CoMProjection: (N, d) <-> (N-1, d) translation-gauge projection.
+# Convention (1): log-det is zero on the (N-1)d subspace.
+# See class docstring WARNING block; the constant (d/2)*log(N) lives on
+# `CoMProjection.ambient_correction(N, d)` and is the caller's to apply.
+# ============================================================================
+class TestCoMProjection:
+    """Translation-gauge bijection with zero log-det convention."""
+
+    def test_round_trip_zero_com(self, key):
+        """inverse(forward(x)) == x for zero-CoM input (the bijection's domain)."""
+        N, d = 6, 3
+        proj = CoMProjection()
+        x = jax.random.normal(key, (4, N, d))
+        x_zero_com = x - jnp.mean(x, axis=-2, keepdims=True)
+        y, _ = proj.forward({}, x_zero_com)
+        x_back, _ = proj.inverse({}, y)
+        assert y.shape == (4, N - 1, d)
+        assert x_back.shape == (4, N, d)
+        assert jnp.allclose(x_back, x_zero_com, atol=1e-6)
+
+    def test_inverse_forward_on_zero_com(self, key):
+        """forward(inverse(y)) == y for any y (the canonical round-trip)."""
+        N, d = 5, 3
+        proj = CoMProjection()
+        y = jax.random.normal(key, (4, N - 1, d))
+        x = proj.inverse({}, y)[0]
+        assert jnp.allclose(jnp.sum(x, axis=-2), 0.0, atol=1e-6)  # zero-CoM by construction
+        y_back, _ = proj.forward({}, x)
+        assert jnp.allclose(y_back, y, atol=1e-6)
+
+    def test_forward_centers_nonzero_com_input(self, key):
+        """forward on non-zero-CoM input centres it; the original CoM is discarded (lossy)."""
+        N, d = 4, 2
+        proj = CoMProjection()
+        x = jax.random.normal(key, (3, N, d)) + 10.0  # shifted; non-zero CoM
+        y, _ = proj.forward({}, x)
+        # Reconstruct: the ambient x that inverse(y) gives must be zero-CoM.
+        x_rec = proj.inverse({}, y)[0]
+        assert jnp.allclose(jnp.sum(x_rec, axis=-2), 0.0, atol=1e-5)
+        # The reconstruction matches the centred version of the original.
+        x_centered = x - jnp.mean(x, axis=-2, keepdims=True)
+        assert jnp.allclose(x_rec, x_centered, atol=1e-5)
+
+    def test_inverse_output_is_zero_com(self, key):
+        """Every output of inverse has sum-along-particle-axis == 0."""
+        N, d = 7, 3
+        proj = CoMProjection()
+        y = jax.random.normal(key, (2, N - 1, d)) * 3.0  # arbitrary scale
+        x = proj.inverse({}, y)[0]
+        assert jnp.allclose(jnp.sum(x, axis=-2), 0.0, atol=1e-5)
+
+    def test_log_det_is_zero(self, key):
+        """Convention (1): log-det is exactly zero both directions."""
+        N, d = 5, 3
+        proj = CoMProjection()
+        x = jax.random.normal(key, (4, N, d))
+        x_zero_com = x - jnp.mean(x, axis=-2, keepdims=True)
+        _, ld_fwd = proj.forward({}, x_zero_com)
+        _, ld_inv = proj.inverse({}, proj.forward({}, x_zero_com)[0])
+        assert jnp.all(ld_fwd == 0.0)
+        assert jnp.all(ld_inv == 0.0)
+
+    def test_ambient_correction_value(self):
+        """ambient_correction(N, d) == (d/2) * log(N)."""
+        import math as _math
+        assert jnp.isclose(
+            CoMProjection.ambient_correction(4, 3), 1.5 * _math.log(4)
+        )
+        assert jnp.isclose(
+            CoMProjection.ambient_correction(10, 1), 0.5 * _math.log(10)
+        )
+        assert jnp.isclose(
+            CoMProjection.ambient_correction(2, 3), 1.5 * _math.log(2)
+        )
+
+    def test_ambient_correction_validation(self):
+        """N >= 2, d >= 1 required."""
+        with pytest.raises(ValueError, match="N must be >= 2"):
+            CoMProjection.ambient_correction(1, 3)
+        with pytest.raises(ValueError, match="d must be >= 1"):
+            CoMProjection.ambient_correction(4, 0)
+
+    def test_jit(self, key):
+        """forward and inverse compile under jit."""
+        N, d = 5, 3
+        proj = CoMProjection()
+        x = jax.random.normal(key, (4, N, d))
+        x_zero_com = x - jnp.mean(x, axis=-2, keepdims=True)
+        fwd = jax.jit(proj.forward)
+        inv = jax.jit(proj.inverse)
+        y, _ = fwd({}, x_zero_com)
+        x_back, _ = inv({}, y)
+        assert jnp.allclose(x_back, x_zero_com, atol=1e-6)
+
+    def test_custom_N_d(self, key):
+        """Works with varied (N, d) combinations."""
+        for N, d in [(2, 3), (32, 3), (8, 2), (4, 1)]:
+            proj = CoMProjection()
+            y = jax.random.normal(jax.random.fold_in(key, N * d), (N - 1, d))
+            x = proj.inverse({}, y)[0]
+            assert x.shape == (N, d)
+            y_back, _ = proj.forward({}, x)
+            assert jnp.allclose(y_back, y, atol=1e-6)
+
+    def test_create_factory(self, key):
+        """create returns (transform, {})."""
+        transform, params = CoMProjection.create(key)
+        assert params == {}
+        y = jax.random.normal(key, (4, d := 3))  # placeholder; not used
+        # The returned transform is functionally equivalent to the direct
+        # construction:
+        assert transform.event_axis == CoMProjection().event_axis
+
+    def test_invalid_event_axis_raises(self):
+        """event_axis must be negative and not -1."""
+        with pytest.raises(ValueError, match="event_axis must be negative"):
+            CoMProjection(event_axis=0)
+        with pytest.raises(ValueError, match="event_axis must be negative"):
+            CoMProjection(event_axis=2)
+        with pytest.raises(ValueError, match="event_axis=-1 is the coord axis"):
+            CoMProjection(event_axis=-1)
+
+    def test_custom_event_axis(self, key):
+        """event_axis=-3 works on (B, species, N, d) events."""
+        N, d = 6, 3
+        proj = CoMProjection(event_axis=-3)
+        y = jax.random.normal(key, (4, N - 1, 2, d))  # (B, N-1, species=2, d)
+        x = proj.inverse({}, y)[0]
+        assert x.shape == (4, N, 2, d)
+        assert jnp.allclose(jnp.sum(x, axis=-3), 0.0, atol=1e-5)
