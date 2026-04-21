@@ -6,6 +6,7 @@ Mathematical foundations and design decisions behind nflojax.
 
 - [Change of Variables](#change-of-variables)
 - [Coupling Layers](#coupling-layers)
+- [Structured (Rank-N) Events](#structured-rank-n-events)
 - [Composing Transformations](#composing-transformations)
 - [Conditional Normalizing Flows](#conditional-normalizing-flows)
 - [Identity Gate](#identity-gate)
@@ -97,6 +98,94 @@ d = d_min + (d_max - d_min) * sigmoid(d_raw)
 where `d_min` and `d_max` are hyperparameters (defaults: 0.01 and 10.0).
 
 Total: `3K - 1` parameters per transformed dimension.
+
+## Structured (Rank-N) Events
+
+Many physical systems (point clouds, particles in a box, sets of tokens)
+have events with rank > 1. The natural shape is `(*batch, N, d)` rather
+than a flattened `(*batch, N*d)`.
+
+### Event shape convention
+
+The "event" is the trailing sub-tensor on which the density is defined; the
+"batch" consists of leading independent samples. We represent the event by
+a tuple `event_shape` (rank 1 is the flat special case). For `x` of shape
+`(*batch, *event_shape)`:
+
+```
+p(x) is defined on R^{prod(event_shape)}
+log_prob(x) returns shape `batch`
+```
+
+Base distributions (`StandardNormal`, `DiagNormal`) store `event_shape` as
+a tuple and sum their log-probability over the last `len(event_shape)`
+axes. For `event_shape = (N, d)`:
+
+```
+log p(x) = -0.5 * sum_{n,i} x_{n,i}^2  -  0.5 * N * d * log(2*pi)
+```
+
+Rank-1 and rank-N use the same code paths: the rank-1 case is just the
+special case `event_shape = (dim,)`.
+
+### Structured coupling (SplitCoupling)
+
+The mask-based coupling layers (`AffineCoupling`, `SplineCoupling`) split
+dimensions via a binary mask `m in {0,1}^d`. That only makes sense when
+the event is a flat vector. For a rank-N event, a natural alternative is
+to split along one of the event axes:
+
+```
+x: (*batch, N, d)
+x_frozen      = x[:, :split_index, :]    # first half of particles
+x_transformed = x[:, split_index:, :]    # second half of particles
+```
+
+The frozen slice conditions a network that produces per-scalar spline
+parameters for every element of the transformed slice, and the spline acts
+elementwise:
+
+```
+theta = MLP(flatten(x_frozen), context)                  # (*batch, M * (3K-1))
+theta = reshape(theta, (*batch, N//2, d, 3K-1))          # per-scalar params
+y_transformed = RQSpline(x_transformed; theta)           # elementwise
+y = concat(x_frozen, y_transformed, axis=-2)
+```
+
+### Log-determinant
+
+A rank-N coupling that acts elementwise on the transformed slice has a
+triangular Jacobian in the flattened representation: frozen dimensions are
+identity, transformed dimensions depend only on the frozen ones via the
+conditioner and on themselves through the elementwise spline. The overall
+log-determinant therefore reduces to the sum of per-scalar spline
+log-derivatives:
+
+```
+log|det dy/dx| = sum_{n, i} log|RQSpline'(x_{n,i}; theta_{n,i})|
+             over (n, i) in the transformed slice
+```
+
+In code this is `jnp.sum(logabsdet_per_scalar, axis=tuple(range(-event_ndims, 0)))`.
+
+### Alternating coverage
+
+A single `SplitCoupling` only transforms one half of the split axis. To
+cover every slot, alternate `swap` between layers (layer 0 freezes slots
+`[0, split_index)`, layer 1 freezes slots `[split_index, axis_size)`, etc.).
+`SplitCoupling` does not expose a `mask`, so the library's
+`analyze_mask_coverage` check does not apply — responsibility for coverage
+is on the builder.
+
+### Static shape
+
+`SplitCoupling` stores `event_shape`, `split_axis`, `split_index`, and
+`event_ndims` as dataclass fields. The conditioner MLP is sized to the
+corresponding frozen / transformed flat sizes. Changing the event shape
+requires rebuilding the coupling. For size-transferable flows (e.g. evaluating
+weights trained at N=216 on N=512), supply a size-agnostic conditioner
+(GNN over particle neighborhoods); the default MLP is specific to its
+`x_dim`.
 
 ## Composing Transformations
 

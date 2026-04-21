@@ -4,7 +4,7 @@ Project context for coding agents (Claude Code, Cursor, Copilot, etc.).
 
 ## Project Summary
 
-Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, and an assembly API for custom architectures. Not a pip package; clone and import directly.
+Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Not a pip package; clone and import directly.
 
 ## Philosophy
 
@@ -67,9 +67,12 @@ nets     -> flax.linen
 ## Key Patterns
 
 - **Explicit params**: no state in objects. All params passed as PyTree dicts.
-- **Transform interface**: `forward(params, x, context=None, g_value=None) -> (y, log_det)`
-- **Zero-init**: conditioner output layers initialized to zero so flows start as identity.
-- **Mask convention**: `mask=1` means frozen (passed through), `mask=0` means transformed. Alternating parity between layers.
+- **Transform interface**: `forward(params, x, context=None, g_value=None) -> (y, log_det)`. Some transforms (e.g. `SplitCoupling`) intentionally omit `g_value` when not needed — CompositeTransform detects this via `_block_supports_gvalue`.
+- **Zero-init**: conditioner output layers initialized to zero so flows start as identity. Shared helper `identity_spline_bias(num_scalars, num_bins, min_d, max_d)` produces the RQS bias for both `SplineCoupling` and `SplitCoupling`.
+- **Mask convention** (flat couplings): `mask=1` means frozen (passed through), `mask=0` means transformed. Alternating parity between layers.
+- **Split convention** (structured couplings): `SplitCoupling` partitions along `split_axis` at `split_index` instead of using a scalar mask. Alternate `swap` between layers to cover all slots; there is no `analyze_mask_coverage` equivalent.
+- **Event shape**: base distributions and structured couplings accept `event_shape: int | tuple[int, ...]`. Canonical internal form is a tuple. Rank-1 uses `(dim,)`; rank-N uses e.g. `(N, d)`. See REFERENCE.md "Event Shape Convention".
+- **Rank-polymorphic composition**: `CompositeTransform` initializes its log-det accumulator as a scalar zero so it works for any event rank. Don't assume `x.shape[:-1]` is the batch shape.
 - **Gate contract**: `identity_gate` callable must be written for single sample `(context_dim,)`; batching via `jax.vmap`.
 - **Feature extractor split**: gate sees raw context, couplings see extracted features.
 

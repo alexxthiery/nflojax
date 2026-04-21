@@ -13,6 +13,7 @@ For API details, see [REFERENCE.md](REFERENCE.md). For math, see [INTERNALS.md](
 - [Identity Gating](#identity-gating)
 - [Custom Architectures](#custom-architectures-assembly-api)
 - [Assembly with Context](#assembly-with-context-and-feature-extractor)
+- [Structured (rank-N) Flows](#structured-rank-n-flows)
 - [Training](#training)
 
 ## Affine Flow (RealNVP)
@@ -240,6 +241,89 @@ bijection, params = assemble_bijection(
 raw_context = jax.random.normal(key, (100, raw_context_dim))
 y, log_det = bijection.forward(params, x, context=raw_context)
 ```
+
+## Structured (rank-N) Flows
+
+When the event has structure beyond a flat vector — for example a particle
+system with `N` particles in `d` coordinates — you can work directly on
+rank-3 tensors `(*batch, N, d)` instead of flattening.
+
+Two pieces make this possible:
+
+- `StandardNormal` / `DiagNormal` accept an `event_shape` tuple. See
+  [REFERENCE.md#event-shape-convention](REFERENCE.md#event-shape-convention).
+- `SplitCoupling` is the structured analogue of `SplineCoupling`. It splits
+  along a tensor axis (e.g. `-2` for the particle axis) instead of using a
+  1-D mask. See
+  [REFERENCE.md#splitcoupling](REFERENCE.md#splitcoupling).
+
+### Example: particle flow on `(B, N, d)`
+
+```python
+import jax
+import jax.numpy as jnp
+
+from nflojax.builders import assemble_flow
+from nflojax.distributions import StandardNormal
+from nflojax.transforms import SplitCoupling
+
+key = jax.random.PRNGKey(0)
+N, d = 8, 3
+num_layers = 6
+
+# Rank-3 base distribution.
+base = StandardNormal(event_shape=(N, d))
+
+# Alternating-swap SplitCoupling layers covering both halves of particles.
+keys = jax.random.split(key, num_layers)
+blocks_and_params = []
+for i, k in enumerate(keys):
+    coupling, params = SplitCoupling.create(
+        k,
+        event_shape=(N, d),
+        split_axis=-2,       # particle axis
+        split_index=N // 2,
+        event_ndims=2,        # particle + coord axes
+        hidden_dim=64,
+        n_hidden_layers=2,
+        num_bins=8,
+        tail_bound=5.0,
+        swap=(i % 2 == 1),    # alternate which half is frozen
+    )
+    blocks_and_params.append((coupling, params))
+
+# SplitCoupling has no 1-D mask, so the coverage analysis is skipped with
+# validate=False. Alternating `swap` guarantees every particle is touched.
+flow, params = assemble_flow(blocks_and_params, base=base, validate=False)
+
+# Sampling returns a rank-3 tensor.
+samples = flow.sample(params, key, shape=(16,))         # (16, N, d)
+log_prob = flow.log_prob(params, samples)                # (16,)
+```
+
+### Training this flow
+
+Same pattern as [Training](#training). Substitute a rank-3 target, e.g. a
+`DiagNormal` with per-particle shifted means:
+
+```python
+from nflojax.distributions import DiagNormal
+
+target = DiagNormal(event_shape=(N, d))
+shifts = jnp.zeros((N, d)).at[:, 0].set(jnp.arange(N) * 0.5)
+target_params = {"loc": shifts, "log_scale": jnp.log(0.5) * jnp.ones((N, d))}
+```
+
+and train by forward KL exactly as in the rank-1 recipe.
+
+### Varying event_shape
+
+`event_shape` is static per transform. To evaluate the same conditioner
+weights at a different particle count `N'`, rebuild the flow with
+`event_shape=(N', d)` and load the old params into the new pytree. This
+only works when the conditioner is size-agnostic by construction (e.g. a
+GNN over particle neighborhoods). The default MLP conditioner has its
+`x_dim` / `out_dim` baked to the original `N` and will not transfer.
 
 ## Training
 
