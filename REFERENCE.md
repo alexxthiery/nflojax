@@ -2,14 +2,47 @@
 
 **Contents:**
 
+- [Event Shape Convention](#event-shape-convention)
 - [Core Classes](#core-classes)
 - [Builders](#builders)
 - [Assembly API](#assembly-api)
 - [Transforms](#transforms)
 - [Distributions](#distributions)
+- [Utilities](#utilities)
 - [Parameter Structure](#parameter-structure)
 - [Forward/Inverse Convention](#forwardinverse-convention)
 - [Context Feature Extractor](#context-feature-extractor)
+
+## Event Shape Convention
+
+An event may have rank 1 (flat vector) or rank > 1 (structured, e.g. a batch
+of `N` particles in `d` dimensions: `event_shape = (N, d)`).
+
+All base distributions accept either form at construction:
+
+| Form | Meaning |
+|------|---------|
+| `StandardNormal(event_shape=(N, d))` | Rank-N event of shape `(N, d)` |
+| `StandardNormal(event_shape=N)` | Rank-1 sugar for `(N,)` |
+| `StandardNormal(dim=N)` | Legacy alias, same as `event_shape=N` |
+
+Internally the canonical form is always a tuple. A read-only `dim` property
+returns `event_shape[-1]` for back-compat with the rank-1 API.
+
+**Expected tensor shapes** throughout the library:
+
+| Tensor | Shape |
+|--------|-------|
+| `x` fed to `log_prob` / `forward` / `inverse` | `(*batch, *event_shape)` |
+| `log_prob`, `log_det` returned | `batch` |
+| Samples from `base_dist.sample(params, key, (B,))` | `(B, *event_shape)` |
+
+Rank-1 and rank-N events use the same code paths. For flat events,
+`event_shape = (dim,)` and behavior is bit-identical to the original
+`dim=int` API.
+
+For transforms that can act on rank > 1 events, see
+[`SplitCoupling`](#splitcoupling).
 
 ## Core Classes
 
@@ -277,6 +310,77 @@ The `3K - 1` per dimension breaks down as: K widths + K heights + (K-1) interior
 
 **Context:** Same as AffineCoupling: MLP receives `concat(x_masked, context)`. When `g_value` is provided, spline params interpolate toward identity: widths and heights are scaled by `g` (uniform bins at g=0), and derivatives are interpolated in logit space toward derivative=1.
 
+### SplitCoupling
+
+**What:** Structured analogue of `SplineCoupling` for rank >= 2 events. Instead of a flat 1-D mask, it splits the input along a chosen tensor axis at a chosen index. The frozen slice is flattened and fed to the conditioner; monotone rational-quadratic splines act elementwise on the transformed slice; log-det is summed over all `event_ndims` trailing axes.
+
+**Target use case:** particle systems with `event_shape = (N, d)`, where `split_axis = -2` splits particles into two halves and `event_ndims = 2` tells the log-det to sum over both the particle axis and the coordinate axis.
+
+**Shapes** (for `event_shape = (N, d)`, `split_axis = -2`, `split_index = N // 2`, `event_ndims = 2`):
+
+| Tensor | Shape |
+|--------|-------|
+| `x` in | `(*batch, N, d)` |
+| Frozen slice (passed to conditioner, flattened) | `(*batch, (N//2) * d)` |
+| Conditioner output | `(*batch, (N//2) * d * (3K - 1))` |
+| Transformed slice | `(*batch, N//2, d)` |
+| `y` out | `(*batch, N, d)` |
+| `log_det` | `batch` |
+
+**Forward:** `x -> split -> conditioner(frozen_flat, context) -> spline(transformed) -> concat`. Inverse reverses the spline; split/concat are symmetric.
+
+**Mask semantics:** none. The partition is geometric (axis + index), not a per-scalar mask. Alternate `swap` between layers to cover all particles (e.g. layer 0 freezes first half, layer 1 freezes second half).
+
+**Create:**
+
+```python
+coupling, params = SplitCoupling.create(
+    key,
+    event_shape=(N, d),
+    split_axis=-2,
+    split_index=N // 2,
+    event_ndims=2,
+    hidden_dim=64,
+    n_hidden_layers=2,
+    **kwargs,
+)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `event_shape` | tuple of int | required | Trailing event shape, e.g. `(N, d)`. Rank must equal `event_ndims` |
+| `split_axis` | int | required | Negative axis index (e.g. `-2`); must lie inside the event axes |
+| `split_index` | int | required | Size of the first partition along `split_axis`; must be `< axis_size` |
+| `event_ndims` | int | required | Number of trailing axes that are part of the event (>= 1) |
+| `hidden_dim` | int | required | Conditioner MLP hidden width |
+| `n_hidden_layers` | int | required | Residual blocks in conditioner MLP |
+| `context_dim` | int | `0` | Context dimension; 0 = unconditional |
+| `swap` | bool | `False` | If `True`, the last `axis_size - split_index` slots are frozen instead |
+| `num_bins` | int | `8` | Spline bins `K` |
+| `tail_bound` | float | `5.0` | Spline domain `[-B, B]`; identity outside |
+| `min_bin_width` | float | `1e-2` | Floor for bin widths |
+| `min_bin_height` | float | `1e-2` | Floor for bin heights |
+| `min_derivative` | float | `1e-2` | Lower bound for knot derivatives |
+| `max_derivative` | float | `10.0` | Upper bound for knot derivatives |
+| `activation` | callable | `nn.elu` | MLP activation function |
+| `res_scale` | float | `0.1` | Residual connection scale |
+
+**Params dict:**
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `"mlp"` | PyTree | Flax params for conditioner MLP (output dim = `transformed_flat * (3K - 1)`) |
+
+Where `transformed_flat = prod(event_shape) * (axis_size - split_index) / axis_size` (or the swapped complement).
+
+**Static methods:**
+
+- `SplitCoupling.required_out_dim(transformed_flat, num_bins) -> int`: computes conditioner output size as `transformed_flat * (3K - 1)`.
+
+**Covering all slots:** `SplitCoupling` has no `mask` attribute, so `analyze_mask_coverage` cannot verify that every slot gets transformed. The recommended pattern is alternating `swap` between successive layers. A minimum of 2 layers is required.
+
+**Validation:** `__post_init__` checks rank consistency, axis bounds, and `split_index` range. `forward`/`inverse` additionally check that `x.shape[-event_ndims:] == event_shape`.
+
 ### LinearTransform
 
 **What:** LU-parameterized invertible matrix. Mixes all dimensions via a learned linear map `W = L * T` where `L` is unit-diagonal lower triangular and `T = U + diag(s)` is upper triangular with `s = softplus(raw_diag)`.
@@ -381,18 +485,83 @@ params = [params1, params2, params3]  # list matching block order
 
 **Params:** A list of per-block param dicts, one per block in the same order as `blocks`.
 
+**Rank-polymorphic:** `CompositeTransform` works with any event rank. It initializes the log-det accumulator as a scalar zero and lets each block's log-det broadcast up to its own batch shape. This means a `CompositeTransform([SplitCoupling(...), SplitCoupling(...)])` on a rank-3 event returns `log_det` of shape `batch`, same as rank-1.
+
 ## Distributions
 
 ```python
 from nflojax.distributions import StandardNormal, DiagNormal
 ```
 
-| Distribution | Constructor | Params | Description |
-|-------------|-------------|--------|-------------|
-| `StandardNormal` | `StandardNormal(dim)` | `None` | Isotropic N(0, I) |
-| `DiagNormal` | `DiagNormal(dim)` | `{"loc": (dim,), "log_scale": (dim,)}` | Diagonal covariance |
+Both distributions accept an event of arbitrary rank. See
+[Event Shape Convention](#event-shape-convention) for the canonical form.
+
+| Distribution | Constructor forms | Params | Description |
+|-------------|-------------------|--------|-------------|
+| `StandardNormal` | `(event_shape=(N, d))`, `(event_shape=N)`, `(dim=N)`, `(N)` | `None` | Isotropic `N(0, I)` on the event |
+| `DiagNormal` | same | `{"loc": event_shape, "log_scale": event_shape}` | Diagonal-covariance Gaussian on the event |
+
+Both provide: `log_prob(params, x)`, `sample(params, key, shape)`, `init_params()`. For `DiagNormal`, `init_params()` returns zero `loc` and `log_scale`, i.e. a standard Gaussian over the event.
+
+**Attributes:**
+
+- `dist.event_shape`: canonical tuple form.
+- `dist.dim`: read-only property equal to `event_shape[-1]` (for back-compat with rank-1 error messages and error paths).
+
+**Examples:**
+
+```python
+StandardNormal(dim=4).event_shape               # (4,)
+StandardNormal(event_shape=4).event_shape       # (4,)
+StandardNormal(event_shape=(8, 3)).event_shape  # (8, 3)
+
+dist = DiagNormal(event_shape=(8, 3))
+params = dist.init_params()
+params["loc"].shape, params["log_scale"].shape  # (8, 3), (8, 3)
+samples = dist.sample(params, key, (16,))       # (16, 8, 3)
+dist.log_prob(params, samples).shape            # (16,)
+```
 
 Both provide: `log_prob(params, x)`, `sample(params, key, shape)`, `init_params()`.
+
+## Utilities
+
+### identity_spline_bias
+
+```python
+from nflojax.transforms import identity_spline_bias
+
+bias = identity_spline_bias(
+    num_scalars=N_transformed,
+    num_bins=K,
+    min_derivative=1e-2,
+    max_derivative=10.0,
+    dtype=jnp.float32,  # default
+)
+# bias.shape == (num_scalars * (3*K - 1),)
+```
+
+**Purpose:** Conditioner-output bias that, together with a zero-kernel final
+layer, produces an identity spline per scalar. Used by both `SplineCoupling`
+and `SplitCoupling` for near-identity initialization. Re-use this helper if
+you write a custom coupling that consumes RQ-spline params and want to
+start at identity like the library couplings do.
+
+**Math:** Widths and heights set to zero (uniform bins after softmax).
+Derivatives set to `stable_logit((1 - min_d) / (max_d - min_d))`, which
+evaluates to derivative = 1 after the bounded-sigmoid. If `1.0` is not
+strictly inside `(min_derivative, max_derivative)`, the helper falls back
+to an all-zero bias (identity unreachable; caller should warn).
+
+### stable_logit
+
+```python
+from nflojax.transforms import stable_logit
+
+u = stable_logit(p)  # logit with input clipped into [1e-6, 1 - 1e-6]
+```
+
+Numerically stable logit used internally for bounding knot derivatives.
 
 ## Parameter Structure
 
@@ -482,6 +651,10 @@ For the math behind conditioning, see [INTERNALS.md](INTERNALS.md#conditional-no
 **Residual scaling defaults to 0.1.** Both MLP and ResNet conditioners use `res_scale=0.1`, scaling residual branch outputs. Most implementations default to 1.0. This improves stability but can make convergence appear slower. Adjustable via the `res_scale` parameter.
 
 **LOFT tau=1000 barely activates.** The default `loft_tau=1000.0` only compresses values beyond magnitude 1000, acting as a gentle safety net. For active tail compression, lower tau significantly.
+
+**SplitCoupling has no mask, so `analyze_mask_coverage` skips it.** The library's coverage check works only on couplings with a 1-D `mask` attribute. A flow built entirely from `SplitCoupling` layers passes `analyze_mask_coverage` trivially (zero coupling-like blocks found), so it's your responsibility to alternate `swap` between layers to make sure every slot along `split_axis` is transformed.
+
+**SplitCoupling `event_shape` is static.** The `event_shape` is a field on the dataclass and baked into the MLP conditioner's `x_dim` / `out_dim`. To evaluate the same weights at a larger event shape (e.g. more particles), rebuild the coupling with the new `event_shape` and transfer params into the new pytree. This only works if the conditioner is size-agnostic by construction (e.g. a GNN); the default MLP is not.
 
 **MLP context validation is symmetric.** Passing `context` when `context_dim=0` raises `ValueError`. Omitting `context` when `context_dim > 0` also raises `ValueError`. Both cases produce clear error messages.
 

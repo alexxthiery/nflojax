@@ -8,6 +8,7 @@ A minimal, hackable normalizing flows library in JAX.
 - **Spline flows** with rational-quadratic splines [durkan2019]
 - **Conditional flows** with context concatenation and optional feature extraction
 - **Identity gating** for smooth boundary conditions on context-dependent flows
+- **Structured (rank-N) flows** via `SplitCoupling` for events with axis structure, e.g. `(B, N, d)` particle systems
 
 ## Installation
 
@@ -50,6 +51,7 @@ samples, log_prob = flow.sample_and_log_prob(params, key, shape=(1000,))
 - [Transform-only mode](USAGE.md#transform-only-mode-bijection) (bijection without base distribution)
 - [Identity gating](USAGE.md#identity-gating) for boundary conditions
 - [Custom architectures](USAGE.md#custom-architectures-assembly-api) via assembly API
+- [Structured (rank-N) flows](USAGE.md#structured-rank-n-flows) for particle-system events
 - [Training recipes](USAGE.md#training) for forward KL (MLE) and reverse KL (VI)
 
 ## Design

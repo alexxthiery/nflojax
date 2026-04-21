@@ -235,9 +235,41 @@ class MyConditioner(nn.Module):
 Conditioner output size depends on the coupling type:
 
 ```python
-AffineCoupling.required_out_dim(dim)           # Returns 2 * dim
-SplineCoupling.required_out_dim(dim, num_bins) # Returns dim * (3 * num_bins - 1)
+AffineCoupling.required_out_dim(dim)                        # 2 * dim
+SplineCoupling.required_out_dim(dim, num_bins)              # dim * (3 * num_bins - 1)
+SplitCoupling.required_out_dim(transformed_flat, num_bins)  # transformed_flat * (3 * num_bins - 1)
 ```
+
+### Input Shape Contract (Flat vs. Structured)
+
+`AffineCoupling` and `SplineCoupling` pass `x * mask` to the conditioner,
+shape `(..., dim)` — the flat mask contract. `SplitCoupling` instead
+flattens the structured frozen slice before calling the conditioner:
+
+```python
+# Inside SplitCoupling._forward_or_inverse
+batch_shape = frozen.shape[: -self.event_ndims]
+frozen_flat = frozen.reshape(batch_shape + (-1,))
+theta = self.conditioner.apply({"params": mlp_params}, frozen_flat, context)
+```
+
+So by default the conditioner receives a **flat** vector even when the
+coupling's event is structured. The default `MLP` works unchanged.
+
+If you want a conditioner that exploits the structure (e.g. a GNN over
+particle neighborhoods), write a custom Flax module that accepts the
+structured shape and handles the reshape itself. Two options:
+
+1. **Reshape inside the conditioner.** Accept `x` of shape `(..., N*d)`,
+   reshape to `(..., N, d)` inside `__call__`, and produce output of shape
+   `(..., transformed_flat * (3K - 1))` to match `SplitCoupling`'s
+   expectation. No changes to `SplitCoupling` needed.
+2. **Bypass the default flattening.** Subclass `SplitCoupling` and override
+   `_forward_or_inverse` to pass the structured slice directly. This is a
+   deeper customization and should be a last resort.
+
+Option 1 is the library default path; most GNN integrations fit it with a
+single `x.reshape(*x.shape[:-1], N, d)` at the top of the conditioner.
 
 ### Template
 
