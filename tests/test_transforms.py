@@ -384,7 +384,7 @@ class TestPermutation:
         transform = Permutation(perm=reverse_perm)
         x_wrong = jnp.zeros((5, dim + 1))
 
-        with pytest.raises(ValueError, match="expected input with last dimension"):
+        with pytest.raises(ValueError, match="axis -1 of size"):
             transform.forward({}, x_wrong)
 
     def test_non_1d_perm_raises(self):
@@ -407,6 +407,47 @@ class TestPermutation:
 
         expected = jnp.array([[2, 0, 3, 1]], dtype=jnp.float32)
         assert jnp.allclose(y, expected)
+
+    # --- event_axis generalisation --------------------------------------
+
+    def test_event_axis_particle(self, key):
+        """event_axis=-2 permutes particles on (B, N, d), not coordinates."""
+        N, d = 4, 3
+        perm = jnp.array([3, 0, 1, 2])  # non-trivial rotation of particles
+        transform = Permutation(perm=perm, event_axis=-2)
+        x = jax.random.normal(key, (5, N, d))
+
+        y, log_det = transform.forward({}, x)
+
+        assert y.shape == x.shape
+        # Particles are re-ordered; coordinates within each particle unchanged.
+        for i in range(N):
+            assert jnp.allclose(y[:, i, :], x[:, int(perm[i]), :])
+        assert log_det.shape == (5, d)
+        assert jnp.all(log_det == 0.0)
+
+    def test_event_axis_roundtrip(self, key):
+        """Round-trip under particle-axis permutation."""
+        N, d = 6, 3
+        perm = jax.random.permutation(key, N)
+        transform = Permutation(perm=perm, event_axis=-2)
+        x = jax.random.normal(jax.random.fold_in(key, 1), (4, N, d))
+
+        y, _ = transform.forward({}, x)
+        x_back, _ = transform.inverse({}, y)
+        assert jnp.allclose(x_back, x, atol=1e-6)
+
+    def test_event_axis_positive_raises(self):
+        """Non-negative event_axis is rejected."""
+        with pytest.raises(ValueError, match="event_axis"):
+            Permutation(perm=jnp.array([0, 1]), event_axis=0)
+
+    def test_event_axis_shape_mismatch_raises(self):
+        """Axis size mismatch is caught at forward time."""
+        transform = Permutation(perm=jnp.array([2, 0, 1]), event_axis=-2)
+        x = jnp.zeros((4, 5, 3))  # axis -2 is 5, but perm is length 3
+        with pytest.raises(ValueError, match="axis -2"):
+            transform.forward({}, x)
 
 
 # ============================================================================
@@ -1656,7 +1697,7 @@ class TestCircularShift:
     def test_forward_preserves_shape(self, key):
         """Rank-3 input (B, N, d) yields output of identical shape."""
         N, d = 6, 3
-        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=-1.0, upper=1.0)
         params = {"shift": jnp.array([0.3, -0.2, 0.5])}
         x = jax.random.uniform(key, (8, N, d), minval=-1.0, maxval=1.0)
         y, log_det = shift.forward(params, x)
@@ -1665,7 +1706,7 @@ class TestCircularShift:
     def test_round_trip(self, key):
         """inverse(forward(x)) == x to numerical tolerance."""
         N, d = 6, 3
-        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=-1.0, upper=1.0)
         params = {"shift": jnp.array([0.3, -0.2, 0.5])}
         x = jax.random.uniform(key, (8, N, d), minval=-1.0, maxval=1.0)
         y, _ = shift.forward(params, x)
@@ -1675,7 +1716,7 @@ class TestCircularShift:
     def test_zero_shift_is_identity(self, key):
         """With shift=0, forward is identity on in-box inputs."""
         d = 3
-        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=-1.0, upper=1.0)
         params = shift.init_params(key)  # init_params returns zero shift
         x = jax.random.uniform(key, (4, 5, d), minval=-0.9, maxval=0.9)
         y, _ = shift.forward(params, x)
@@ -1685,7 +1726,7 @@ class TestCircularShift:
         """Shift by the box length equals identity (modular wrap)."""
         d = 3
         # lower=-1, upper=1 so L = 2.
-        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=-1.0, upper=1.0)
         params = {"shift": jnp.full((d,), 2.0)}
         x = jax.random.uniform(key, (4, 5, d), minval=-0.9, maxval=0.9)
         y, _ = shift.forward(params, x)
@@ -1694,7 +1735,7 @@ class TestCircularShift:
     def test_log_det_is_zero(self, key):
         """Log-det is exactly zero (scalar or broadcast-compatible)."""
         d = 3
-        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=-1.0, upper=1.0)
         params = {"shift": jnp.array([0.3, -0.2, 0.5])}
         x = jax.random.uniform(key, (8, 4, d), minval=-0.9, maxval=0.9)
         _, log_det = shift.forward(params, x)
@@ -1705,7 +1746,7 @@ class TestCircularShift:
     def test_jit(self, key):
         """forward/inverse JIT-compatible."""
         d = 3
-        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=-1.0, upper=1.0)
         params = {"shift": jnp.array([0.3, -0.2, 0.5])}
         x = jax.random.uniform(key, (4, 5, d), minval=-0.9, maxval=0.9)
         fwd = jax.jit(shift.forward)
@@ -1717,17 +1758,17 @@ class TestCircularShift:
     def test_out_of_range_input_is_wrapped(self):
         """Input slightly outside the box wraps back in."""
         d = 1
-        shift = CircularShift(coord_dim=d, lower=0.0, upper=1.0)
+        shift = CircularShift.from_scalar_box(coord_dim=d, lower=0.0, upper=1.0)
         params = {"shift": jnp.array([0.0])}  # no shift
         # 1.1 is 0.1 above upper; mod wrap brings it to 0.1 above lower.
         x = jnp.array([[1.1]])
         y, _ = shift.forward(params, x)
         assert jnp.allclose(y, jnp.array([[0.1]]), atol=1e-6)
 
-    def test_coord_dim_mismatch_raises(self):
-        """Shift vector with wrong coord_dim raises at construction."""
-        with pytest.raises(ValueError, match="lower"):
-            CircularShift(coord_dim=3, lower=1.0, upper=0.0)  # lower >= upper
+    def test_inverted_box_raises(self):
+        """Constructing with upper <= lower raises at geometry-construction time."""
+        with pytest.raises(ValueError, match="side must be positive"):
+            CircularShift.from_scalar_box(coord_dim=3, lower=1.0, upper=0.0)
 
 
 # ============================================================================
@@ -1886,7 +1927,7 @@ class TestPeriodicComposition:
         blocks = []
         params_list = []
         for i, k in enumerate(keys):
-            shift = CircularShift(coord_dim=d, lower=-B, upper=B)
+            shift = CircularShift.from_scalar_box(coord_dim=d, lower=-B, upper=B)
             s_params = shift.init_params(k)
             # Break identity by injecting a non-zero shift.
             s_params = {"shift": s_params["shift"] + 0.3}

@@ -218,8 +218,10 @@ Shapes: `x`, `y` are `(..., dim)`. `log_det` is `(...,)` (one scalar per sample)
 |-----------|---------|
 | `AffineCoupling` | RealNVP affine coupling layer |
 | `SplineCoupling` | Rational-quadratic spline coupling layer |
+| `SplitCoupling` | Spline coupling for rank-N (particle-system) events |
 | `LinearTransform` | LU-parameterized invertible linear map |
-| `Permutation` | Fixed dimension shuffle |
+| `Permutation` | Fixed shuffle along any negative event axis |
+| `CircularShift` | Rigid per-coord shift mod box (torus rotation) |
 | `LoftTransform` | Log-soft tail compression |
 | `CompositeTransform` | Sequential composition of transforms |
 
@@ -421,23 +423,70 @@ transform, params = LinearTransform.create(key, dim, **kwargs)
 
 ### Permutation
 
-**What:** Fixed dimension reordering. No learnable parameters.
+**What:** Fixed shuffle along any negative event axis. No learnable parameters.
 
-**Forward:** `y[..., i] = x[..., perm[i]]`, log_det = 0.
+**Forward:** `y = jnp.take(x, perm, axis=event_axis)`, log_det = 0 with shape equal to `x.shape` minus the permuted axis.
 
-**Inverse:** applies the inverse permutation.
+**Inverse:** `x = jnp.take(y, inv_perm, axis=event_axis)` where `inv_perm` is precomputed at construction.
 
 **Create:**
 
 ```python
-transform, params = Permutation.create(key, perm)
+# Last-axis shuffle (coordinates), the historic default:
+transform, params = Permutation.create(key, perm=jnp.arange(dim)[::-1])
+
+# Particle-axis shuffle on (B, N, d) events:
+transform, params = Permutation.create(key, perm=perm_N, event_axis=-2)
 ```
 
 | Param | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `perm` | Array | required | Integer index array of shape `(dim,)` |
+| `perm` | Array | required | 1-D integer index array of shape `(k,)` where `k` is the size of the permuted axis |
+| `event_axis` | int | `-1` | Negative axis along which to permute. Must be negative. `-1` for coordinate-axis permutation (flat couplings). `-2` for particle-axis permutation on `(B, N, d)` events. |
 
 **Params dict:** `{}` (empty, no learnable parameters).
+
+**Log-det shape:** `x.shape` with the permuted axis removed. For `x.shape = (B, N, d)` and `event_axis=-2`, log-det is `(B, d)`.
+
+### CircularShift
+
+**What:** Rigid per-coordinate shift modulo the box length. The "rotation" half of a torus diffeomorphism — compose with a `boundary_slopes='circular'` spline coupling for full torus-bijection expressivity.
+
+**Forward:**
+
+```
+y = (x - lower + shift) mod (upper - lower) + lower
+log_det = 0  (scalar)
+```
+
+`shift` is a learnable per-coord vector of shape `(d,)` where `d = geometry.d`; it broadcasts across every preceding axis (particles, batch, etc.).
+
+**Inverse:** Same wrap with `-shift`. Log-det is again scalar zero.
+
+**Create:**
+
+```python
+from nflojax.geometry import Geometry
+from nflojax.transforms import CircularShift
+
+# Preferred: pass a Geometry.
+geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)  # [-1, 1]^3
+transform, params = CircularShift.create(key, geometry=geom)
+
+# Ergonomic fallback for a simple cubic box:
+transform = CircularShift.from_scalar_box(coord_dim=3, lower=-1.0, upper=1.0)
+params = transform.init_params(key)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `geometry` | `Geometry` | required | Axis-aligned box that defines the torus |
+
+**Params dict:** `{"shift": (d,) float32}` — zero at init (identity at init).
+
+**Log-det:** scalar zero. Composes cleanly inside `CompositeTransform` (whose accumulator starts as scalar zero and broadcasts up).
+
+**Pairing:** For full torus-diffeomorphism expressivity, stack `CircularShift` with a `SplineCoupling` (or `SplitCoupling`) whose inner spline uses `boundary_slopes='circular'`. The shift discovers the optimal gauge; the spline does the local deformation with matched boundary slopes (C¹ on the circle).
 
 ### LoftTransform
 
@@ -486,6 +535,54 @@ params = [params1, params2, params3]  # list matching block order
 **Params:** A list of per-block param dicts, one per block in the same order as `blocks`.
 
 **Rank-polymorphic:** `CompositeTransform` works with any event rank. It initializes the log-det accumulator as a scalar zero and lets each block's log-det broadcast up to its own batch shape. This means a `CompositeTransform([SplitCoupling(...), SplitCoupling(...)])` on a rank-3 event returns `log_det` of shape `batch`, same as rank-1.
+
+## Geometry
+
+```python
+from nflojax.geometry import Geometry
+```
+
+**What:** Value object for an axis-aligned rectangular box in `R^d` plus per-axis periodicity flags. Consumed by any geometry-aware primitive (`CircularShift` today; `Rescale`, `UniformBox`, `LatticeBase`, `utils/pbc.nearest_image` in future stages). Numpy-backed, frozen, not a PyTree.
+
+**Scope:**
+
+- IS: axis-aligned rectangular domain + per-axis periodicity. Covers cubic, rectangular, fully-periodic torus, slab, fully-open.
+- IS NOT: triclinic cells, curved manifolds, metric spaces, time-dependent / deforming boxes, internal-coordinate spaces.
+
+**Construct:**
+
+```python
+# Cubic box (most common case):
+geom = Geometry.cubic(d=3)                    # [-0.5, 0.5]^3
+geom = Geometry.cubic(d=3, side=2.0)          # [-1, 1]^3
+geom = Geometry.cubic(d=3, side=L, lower=0)   # [0, L]^3
+
+# Rectangular / slab: use the bare constructor.
+geom = Geometry(lower=[0, 0, 0], upper=[Lx, Ly, Lz])
+geom = Geometry(lower=[0, 0, 0], upper=[Lx, Ly, Lz],
+                periodic=[True, True, False])  # periodic in xy, open in z
+```
+
+There is intentionally no `Geometry.box(...)` factory — it would shadow the `@property box`.
+
+**Fields:**
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `lower` | `np.ndarray` shape `(d,)` | required | Per-axis lower bounds |
+| `upper` | `np.ndarray` shape `(d,)` | required | Per-axis upper bounds |
+| `periodic` | `np.ndarray` shape `(d,)` bool or `None` | `None` | Per-axis PBC flags; `None` means all-periodic |
+
+**Derived:**
+
+| Property | Type | Meaning |
+|----------|------|---------|
+| `d` | `int` | Spatial dimensionality `len(lower)` |
+| `box` | `np.ndarray` shape `(d,)` | Per-axis side lengths `upper - lower` |
+| `volume` | `float` | `prod(box)` |
+| `is_periodic(axis=None)` | `bool` | True if `axis` (or every axis) is periodic |
+
+**Validation:** `__post_init__` enforces `lower.shape == upper.shape`, both 1-D, `lower < upper` element-wise, and (if `periodic` is given) matching shape.
 
 ## Distributions
 

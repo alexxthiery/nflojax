@@ -1,0 +1,296 @@
+# nflojax — Implementation Plan
+
+**Purpose.** A living, actionable plan for evolving nflojax into the flow-side framework described in [DESIGN.md](DESIGN.md). Scope, philosophy, and boundaries are fixed in DESIGN.md; this file tracks *what we do next, in what order, and how we know it's done*.
+
+**Update discipline.**
+- Edit freely when plans change. Record significant shifts in the decision log at the bottom.
+- A task is `[ ]` pending, `[~]` in-progress, `[x]` done, `[-]` dropped (with a one-line reason).
+- Mark a stage complete only when every task passes its acceptance criteria *and* DESIGN.md §11 checks still hold.
+- When a stage reveals a new need, add it as a follow-up task or open a parking-lot entry. Never let undocumented work float.
+
+**Relationship to DESIGN.md.** DESIGN.md is *why*. PLAN.md is *what and when*. If a task in PLAN.md requires relaxing a rule in DESIGN.md, update DESIGN.md first, then cite the change here.
+
+---
+
+## 0. Current status
+
+- Branch: `feature/particle-events` — merged work `86be470` landed:
+  - `boundary_slopes='circular'` on rational-quadratic splines.
+  - `CircularShift` rigid-rotation bijector.
+  - `_params_per_scalar` / `_validate_boundary_slopes` helpers de-duplicating 6 sites.
+  - Gate + context tests on `SplineCoupling` in circular mode.
+  - `@requires_x64` skip marker covering 5 pre-existing float32-only round-trip failures.
+- Full test suite: 402 passed / 5 skipped under float32; 402 passed under `JAX_ENABLE_X64=1`.
+- DESIGN.md checked in; `AGENTS.md` updated to point at it.
+
+Known pending: DESIGN.md and this file need to be committed; no branch strategy chosen yet (see §6).
+
+### Stage-0 pre-work (landed in the same session, before Stage A)
+
+After the first + second-pass audits in `audit.md`, three "tensions" were lifted directly into the work:
+
+- [x] **Amend DESIGN.md §2.1 "500 LOC" rule** to distinguish single-concept files from catalogue files (`transforms.py`, `nets.py`). Each entry still ≤ 500 LOC; catalogue total can grow.
+- [x] **Introduce `nflojax/geometry.py`** with the `Geometry(lower, upper, periodic=None)` value object — numpy-backed configuration, not a PyTree. Factory `Geometry.cubic(d, side, lower)`. Derived `box`, `d`, `volume`, `is_periodic()`. Landed *before* Stage A so every upcoming geometry-consuming primitive (`Rescale`, `UniformBox`, `LatticeBase`, `utils/pbc`) targets a single type from day one.
+- [x] **Retrofit `CircularShift`** to carry a single `geometry: Geometry` field. `create(key, geometry)` factory; `from_scalar_box(coord_dim, lower, upper)` classmethod for legacy-ergonomic construction.
+- [x] **Generalise `Permutation`** with `event_axis: int = -1`. Default preserves historic last-axis behaviour; `event_axis=-2` unlocks particle-axis shuffles on `(B, N, d)`. This satisfies Stage A3 early (see §1 below).
+
+Verification: 401 passed / 5 skipped (float32); 406 passed (x64). Four new `event_axis` tests added.
+
+Deferred from the proposed Stage 0 (still open):
+- Split `transforms.py` into a `transforms/` subdir, *or* accept the amended rule and leave it as a catalogue file.
+- Context-type story (Array vs PyTree): §5.2 of DESIGN.md currently says PyTree; code still assumes Array (`_compute_gate_value.ndim`; `MLP` concat). Decide which wins and reconcile.
+- `LinearTransform` (515 LOC) — audit whether it earns its place in `transforms.py` for particle workloads or should extract.
+
+---
+
+## 1. Stage A — bijection extensions
+
+Small, high-leverage bijections that every particle-system flow needs. All live in `nflojax/transforms.py`.
+
+### Tasks
+
+- [ ] **A1. `Rescale(geometry, target=(-1, 1))`** per-axis affine that maps `geometry.box` to the canonical spline range.
+  - Dataclass takes a `Geometry` (per Stage-0 retrofit pattern) plus a scalar or per-axis `target` pair.
+  - Closed-form log-det (sum of `log(scale_i)` over event axes).
+  - Supports arbitrary trailing-axis rescaling; default last axis.
+  - Tests: round-trip, log-det-vs-autodiff, jit, `target` default vs explicit.
+- [ ] **A2. `CoMProjection(event_axis=-2)`** (replaces the earlier `ShiftCenterOfMass` proposal per audit §9.3).
+  - `(N, d)` ↔ `(N-1, d)` bijection: subtract the mean along `event_axis`, drop the last slot, reconstruct from the invariance.
+  - Log-det: constant correction `-½ · d · log(N)` (or whichever sign the convention demands; derive explicitly and document on the class).
+  - Blocked on picking one CoM strategy; DM / bgmat use different mechanisms. Audit §9.3 recommends B (CoM projection) as the ship-today primitive.
+  - Tests: round-trip via the full `(N, d)` ambient space, autodiff-Jacobian determinant sanity on the subspace, jit.
+- [x] **A3. `Permutation` generalised to non-last axes.** Landed in Stage-0. `event_axis: int = -1` default preserves last-axis behaviour; `event_axis=-2` shuffles particles on `(B, N, d)`. 4 new tests.
+- [ ] **A4. Context-type story.** First-pass audit flagged DESIGN.md §5.2 ("context is PyTree") is not matched by `_compute_gate_value` (indexes `.ndim`) or `MLP` (concatenates). Decide: (a) narrow the doc claim to "Array for built-in conditioners, PyTree for custom"; (b) accept PyTree in the built-in path (flatten via `ravel_pytree` in MLP). Update docstrings + `validate_conditioner.validate=False` opt-out accordingly.
+  - Tests: if (b), pytree context (dict with two arrays) traces through an MLP conditioner without error; opt-out path covered by a custom-conditioner test.
+
+### Acceptance
+
+- All tasks complete, `pytest tests/` green under both dtype modes.
+- Each new bijection mentioned in `REFERENCE.md` and has a one-liner in `USAGE.md`.
+- DESIGN.md §11 checks still pass.
+
+### Commit plan
+
+One commit per bijection (A1, A2, A3); one smaller commit for A4.
+
+---
+
+## 2. Stage B — particle-aware base distributions & utils
+
+Bases and geometry helpers that unlock both solids and liquids. Files touched: `nflojax/distributions.py`, new `nflojax/utils/pbc.py`, new `nflojax/utils/lattice.py`.
+
+### Tasks
+
+- [ ] **B1. `UniformBox(lower, upper, event_shape)`** per-axis uniform base.
+  - Scalar log-density `-log(prod(upper - lower))` broadcast over batch.
+  - `sample(key, shape)` returns `shape + event_shape`.
+  - Tests: sample lies in box, `log_prob` matches closed form, `sample_and_log_prob` consistency, jit.
+- [ ] **B2. Lattice generators** in `utils/lattice.py`.
+  - Pure functions returning `(N, 3)` lattice positions: `fcc`, `diamond`, `hex_ice`, `bcc`, `hcp`.
+  - Each takes `n_cells` (int or tuple) and lattice constant(s).
+  - Cross-reference `flows_for_atomic_solids/utils/lattice_utils.py` for shape + position agreement.
+  - Tests: particle count matches expected, positions inside the claimed box, total volume correct.
+- [ ] **B3. `LatticeBase`** base distribution on top of the generators.
+  - One class + five factory methods (`.fcc`, `.diamond`, `.hex_ice`, `.bcc`, `.hcp`).
+  - Fields: positions, box, noise scale, optional spherical truncation, optional random permutation.
+  - `log_prob` includes `-log N!` when `permute=True`.
+  - Tests: `sample_and_log_prob` round-trip, permutation invariance of `log_prob` under `permute=True`, jit.
+- [ ] **B4. `utils/pbc.py`** orthogonal-box geometry.
+  - `nearest_image(dx, box)` — `dx - box * round(dx / box)`; box scalar or per-axis.
+  - `pairwise_distance(x, box=None)` and `pairwise_distance_sq(x, box=None)` for `(..., N, d) → (..., N, N)`.
+  - Tests: known configurations (two particles on diagonal, ring, lattice), box=None falls back to ordinary distance, jit.
+
+### Acceptance
+
+- `pytest tests/` green both dtype modes.
+- Lattice cell counts and positions match the reference `flows_for_atomic_solids` values bitwise (or within `1e-6` after rescale).
+- `USAGE.md` gains a "Particle systems" section showing how to pick a base.
+- DESIGN.md §11 checks still pass; no `physics-ish` constants leaked into nflojax.
+
+### Commit plan
+
+One commit per task. B4 before B3 if the lattice factories reuse any PBC helpers.
+
+---
+
+## 3. Stage C — embeddings
+
+Stateless feature transforms used by all non-MLP conditioners. New file `nflojax/embeddings.py`.
+
+### Tasks
+
+- [ ] **C1. `circular_embed(x, n_freq, lower, upper)`** stack of `cos / sin(2πk (x - lower) / (upper - lower))`.
+  - Shape-preserving except last axis grows `× 2*n_freq`.
+  - Vectorised; jit-friendly.
+  - Tests: correct shape, periodic output, `n_freq=0` is a degenerate pass-through (or explicit error), jit.
+- [ ] **C2. `positional_embed(t, n_freq, base=10_000)`** sinusoidal scalar embedding.
+  - Output shape `(..., 2*n_freq)`; used for temperature / density / step context.
+  - Tests: shape, consistent with the standard sinusoidal positional-encoding formula, jit.
+
+### Acceptance
+
+- Tests green under both dtype modes.
+- `REFERENCE.md` mentions both functions; `USAGE.md` shows a one-liner consuming them inside an MLP conditioner.
+
+### Commit plan
+
+One commit.
+
+---
+
+## 4. Stage D — reference conditioners
+
+Permutation-{invariant, equivariant} conditioners in `nflojax/nets.py`. All satisfy the conditioner contract described in DESIGN.md §5.4.
+
+### Tasks
+
+- [ ] **D1. `DeepSets(phi_hidden, rho_hidden, out_per_particle)`** permutation-invariant.
+  - `phi` per-particle MLP → sum-pool → `rho` MLP → reshape.
+  - Zero-init final layer for identity-at-init.
+  - Tests: permutation invariance under input shuffle, required output shape for `SplitCoupling`, identity at init, jit.
+- [ ] **D2. `Transformer(num_layers, num_heads, embed_dim)`** minimal self-attention stack.
+  - Budget: ≤ 150 LOC. Pure Flax `linen`.
+  - Post-norm or pre-norm explicit in code; no masked attention (particles are fully connected).
+  - Zero-init final layer.
+  - Tests: permutation equivariance (output indices track input permutation), required output shape, identity at init, jit.
+- [ ] **D3. `GNN(num_layers, hidden, num_neighbours, cutoff=None)`** reference MPNN.
+  - Edge index built per-forward by top-`num_neighbours` under PBC (or fixed cutoff if provided).
+  - Message = MLP over `[node_i, node_j, edge_feature]`; aggregate with `segment_sum`; node update = residual MLP.
+  - Permutation-equivariant, **not** SE(3).
+  - Budget: ≤ 250 LOC.
+  - Tests: permutation equivariance, neighbour-list stability under small perturbation, required output shape, jit.
+- [ ] **D4. Shared conditioner contract test fixture** `tests/test_conditioner_protocol.py`.
+  - Parametrised over `DeepSets`, `Transformer`, `GNN` (and `MLP` for the non-equivariant baseline).
+  - Asserts each conditioner: produces correct `out_dim` for both `SplineCoupling` and `SplitCoupling`, init produces identity at init via the same `identity_spline_bias` helper, jits.
+
+### Acceptance
+
+- Tests green both dtype modes.
+- `REFERENCE.md` documents constructor signatures and equivariance properties.
+- DESIGN.md §11 line 4 still holds (no new heavy dependencies).
+
+### Commit plan
+
+One commit per conditioner (D1, D2, D3); D4 in its own commit so the shared fixture lands as a reusable asset.
+
+---
+
+## 5. Stage E — particle-flow builder
+
+A single entry-point that assembles the canonical DM / bgmat topology. File: `nflojax/builders.py`.
+
+### Tasks
+
+- [ ] **E1. `build_particle_flow(...)`** topology:
+  ```
+  Rescale(box -> [-tail_bound, tail_bound])
+  for i in range(num_layers):
+      SplitCoupling(swap=False, boundary_slopes='circular', conditioner=...)
+      SplitCoupling(swap=True,  boundary_slopes='circular', conditioner=...)
+      CircularShift(coord_dim=d)
+      Permutation(event_axis=-2)
+  if use_com_shift:
+      prepend ShiftCenterOfMass(event_axis=-2)
+  ```
+  - Signature: `event_shape=(N, d), box, num_layers, num_bins, conditioner (factory / Module class), boundary_slopes='circular', use_com_shift=False, trainable_base=False`.
+  - `conditioner` is a factory (`functools.partial` of a conditioner class or a custom callable returning a conditioner instance).
+  - Tests: identity at init on `(B, N, d)`, round-trip, jit.
+- [ ] **E2. Integration smoke test** `tests/test_particle_smoke.py`.
+  - `(N=8, d=3)` flow built with each of `DeepSets` / `Transformer` / `GNN`.
+  - Asserts identity at init (tolerant threshold), jit-invertible round-trip, non-zero gradient from a trivial `jnp.sum(x**2)` scalar loss.
+  - Purpose: prove all three conditioners compose cleanly with the builder.
+
+### Acceptance
+
+- Smoke test passes both dtype modes.
+- `USAGE.md` gains a "Build a particle flow" walkthrough.
+- DESIGN.md §11 LOC budget still green.
+
+### Commit plan
+
+One commit for E1 (builder + its own tests), one commit for E2 (cross-conditioner integration test).
+
+---
+
+## 6. Stage F — docs refresh
+
+Post-landing housekeeping.
+
+### Tasks
+
+- [ ] **F1.** `USAGE.md` — add "Particle flows" section tying the new primitives together.
+- [ ] **F2.** `REFERENCE.md` — add entries for every new public name.
+- [ ] **F3.** `EXTENDING.md` — document the augmented-coupling composition pattern (bases of size `(2N, d)` + `SplitCoupling` across the physical/auxiliary boundary); document the "bring your own conditioner" recipe with a minimal example.
+- [ ] **F4.** `AGENTS.md` — update module dependency graph with `embeddings.py`, `utils/pbc.py`, `utils/lattice.py`.
+- [ ] **F5.** `INTERNALS.md` — add a short section on the conditioner-protocol abstraction and why reference conditioners are examples, not authoritative.
+
+### Acceptance
+
+- Every new public symbol has an entry in `REFERENCE.md`.
+- `USAGE.md` examples actually run (doctest-grade preferred; at minimum spot-executed from the repo).
+
+---
+
+## 7. Stage G — bgmat prototype (validation)
+
+A small off-nflojax deliverable in `bgmat/`. Not part of nflojax; a proof the abstraction holds.
+
+### Tasks
+
+- [ ] **G1.** `bgmat/flow_on_nflojax.py` (location tentative) that reassembles bgmat's mW flow using:
+  - nflojax's `LatticeBase.hex_ice(...)` (or bgmat's lattice if factoring differs),
+  - nflojax's `build_particle_flow` with `conditioner=bgmat.models.gnn_conditioner.GNNConditioner`,
+  - bgmat's own augmented-coupling wrapper, energy, and training loop — untouched.
+- [ ] **G2.** Parity test: random input seed compared against bgmat's current flow output within `1e-5` under x64.
+
+### Acceptance
+
+- Parity test passes; if it fails, the gap is a pinpointable missing primitive that goes into the parking lot.
+- Nothing new required in nflojax (else we go back and add it, then rerun).
+
+### Commit plan
+
+Lives in `bgmat/`, not nflojax. Track it here so it isn't forgotten.
+
+---
+
+## 8. Cross-cutting checklist (run after every stage)
+
+- [ ] `pytest tests/ -q` green under default float32.
+- [ ] `JAX_ENABLE_X64=1 pytest tests/ -q` green.
+- [ ] Every new primitive satisfies identity-at-init where applicable.
+- [ ] No new energy / training / observable term (DESIGN.md §11 greps).
+- [ ] No new heavy dependency (DESIGN.md §4 item 10).
+- [ ] Total nflojax LOC (excluding tests) ≤ 5000.
+- [ ] Every public name in `REFERENCE.md`.
+
+---
+
+## 9. Parking lot
+
+Things explicitly deferred. Each entry has a one-line reason.
+
+- **Triclinic / non-orthogonal boxes.** Lands only once orthogonal + triclinic share a clean API and bgmat's WIP settles. See DESIGN.md §4 item 8.
+- **SE(3) / E(3) equivariant conditioner.** Out by design; user brings EGNN / NequIP / MACE when needed. DESIGN.md §4 item 7.
+- **Block permutation (multi-species).** Waits for a concrete multi-species application. DESIGN.md §7.5.
+- **Heteronuclear lattices.** Same. DESIGN.md §7.5.
+- **Augmented-coupling primitive.** Stays a pattern in `EXTENDING.md`, not a class. DESIGN.md §4 item 9.
+- **Long-range energy support (Ewald / PPPM).** Energy-side; not flow-side. DESIGN.md §7.6.
+
+---
+
+## 10. Open questions
+
+Items that need a decision before the relevant stage can close.
+
+- [ ] Branch strategy for Stages A–F. One branch `feature/particle-flow-framework`, or stage-per-branch? (Default: one long-lived branch, stage-per-commit.)
+- [ ] `ShiftCenterOfMass` log-det convention: document as "zero on the (N−1)d subspace; caller is responsible for the embedding-space correction" vs. "constant $-d \log(N)/2$ correction baked in"? Pick when writing A2.
+- [ ] `LatticeBase.hex_ice` unit-cell parameters: follow DM's convention (8 atoms per cell) or bgmat's (re-derive)? Likely DM.
+- [ ] `Transformer` attention norm placement: pre-norm (more stable for deeper stacks) vs. post-norm (closer to DM's original). Default: pre-norm; record the choice in INTERNALS.md.
+- [ ] GNN default `num_neighbours`: 12 (common) vs. 18 (bgmat). Ship 12; let apps override.
+
+---
+
+## 11. Decision log
+
+- *2026-04-21* — Plan drafted alongside DESIGN.md. Adopted: thick-on-flows / thin-on-physics scope; reference conditioner family is MLP + DeepSets + Transformer + MPNN; no energy or training helpers in nflojax.

@@ -14,6 +14,7 @@ from flax import linen as nn
 from .nets import MLP, Array, PRNGKey, validate_conditioner
 from . import scalar_function
 from .splines import rational_quadratic_spline
+from .geometry import Geometry
 
 
 def validate_identity_gate(identity_gate, context_dim: int) -> None:
@@ -1904,20 +1905,27 @@ class SplitCoupling:
 @dataclass
 class Permutation:
     """
-    Permutation of feature dimensions.
+    Permutation along a chosen event axis.
 
-    Forward transform y = T(x):
-    y[..., i] = x[..., perm[i]]
-    Inverse transform x = T⁻¹(y):
-    x[..., perm[i]] = y[..., i]
+    Forward:  y = jnp.take(x, perm,     axis=event_axis)
+    Inverse:  x = jnp.take(y, inv_perm, axis=event_axis)
 
-    Both the forward and inverse Jacobians are permutation matrices with unit
-    determinant. The returned log_det is therefore always zero.
+    Both Jacobians are permutation matrices with unit determinant, so
+    `log_det` is exactly zero. Log-det shape is the input's shape minus
+    the permuted axis (i.e., full batch + remaining event axes), kept
+    consistent with other rank-N-aware transforms.
 
-    perm must be a one-dimensional integer array of shape (dim,). An inverse
-    permutation is precomputed at construction.
+    `event_axis` must be negative (an offset from the end). Default `-1`
+    preserves the historic "last-axis only" behaviour: with input shape
+    `(..., dim)`, `perm.shape == (dim,)` permutes coordinates. Setting
+    `event_axis=-2` on `(B, N, d)` input permutes particles instead —
+    the standard pattern for rank-N particle flows.
+
+    `perm` must be a 1-D integer array whose length matches the target
+    axis; an inverse permutation is precomputed at construction.
     """
-    perm: Array  # integer indices, shape (dim,)
+    perm: Array
+    event_axis: int = -1
 
     def __post_init__(self):
         self.perm = jnp.asarray(self.perm)
@@ -1929,96 +1937,89 @@ class Permutation:
             raise TypeError(
                 f"Permutation perm must be integer dtype, got {self.perm.dtype}."
             )
+        if self.event_axis >= 0:
+            raise ValueError(
+                f"Permutation event_axis must be negative (offset from end), "
+                f"got {self.event_axis}."
+            )
 
-        dim = self.perm.shape[0]
-        # Precompute inverse permutation: inv_perm[perm[i]] = i
+        n = self.perm.shape[0]
         inv_perm = jnp.empty_like(self.perm)
-        inv_perm = inv_perm.at[self.perm].set(jnp.arange(dim))
+        inv_perm = inv_perm.at[self.perm].set(jnp.arange(n))
         self._inv_perm = inv_perm
 
     @property
     def dim(self) -> int:
+        """Length of the permuted axis (the size of `perm`)."""
         return int(self.perm.shape[0])
 
-    def forward(self, params: Any, x: Array, context: Array | None = None) -> Tuple[Array, Array]:
-        """
-        Forward permutation: x -> y.
-
-        params:
-          ignored (kept for interface compatibility).
-        x:
-          input tensor of shape (..., dim).
-        context:
-          ignored (accepted for interface compatibility).
-        """
-        del context  # Unused in Permutation.
-        if x.shape[-1] != self.dim:
+    def _check_axis_size(self, x: Array) -> None:
+        axis = self.event_axis
+        if -axis > x.ndim:
             raise ValueError(
-                f"Permutation expected input with last dimension {self.dim}, "
-                f"got {x.shape[-1]}."
+                f"Permutation: event_axis={axis} lies outside input rank {x.ndim}."
+            )
+        if x.shape[axis] != self.dim:
+            raise ValueError(
+                f"Permutation expected input with axis {axis} of size {self.dim}, "
+                f"got shape {x.shape}."
             )
 
-        y = x[..., self.perm]
-        log_det = jnp.zeros(x.shape[:-1], dtype=x.dtype)
-        return y, log_det
+    def _zero_logdet(self, x: Array) -> Array:
+        """Return a zero log-det matching the shape of `x` minus the permuted axis."""
+        remaining = list(x.shape)
+        remaining.pop(self.event_axis)
+        return jnp.zeros(tuple(remaining), dtype=x.dtype)
 
-    def inverse(self, params: Any, y: Array, context: Array | None = None) -> Tuple[Array, Array]:
-        """
-        Inverse permutation: y -> x.
+    def forward(
+        self, params: Any, x: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        """Forward permutation along `event_axis`."""
+        del context
+        self._check_axis_size(x)
+        y = jnp.take(x, self.perm, axis=self.event_axis)
+        return y, self._zero_logdet(x)
 
-        params:
-          ignored.
-        y:
-          input tensor of shape (..., dim).
-        context:
-          ignored (accepted for interface compatibility).
-        """
-        del context  # Unused in Permutation.
-        if y.shape[-1] != self.dim:
-            raise ValueError(
-                f"Permutation expected input with last dimension {self.dim}, "
-                f"got {y.shape[-1]}."
-            )
-
-        x = y[..., self._inv_perm]
-        log_det = jnp.zeros(y.shape[:-1], dtype=y.dtype)
-        return x, log_det
+    def inverse(
+        self, params: Any, y: Array, context: Array | None = None
+    ) -> Tuple[Array, Array]:
+        """Inverse permutation along `event_axis`."""
+        del context
+        self._check_axis_size(y)
+        x = jnp.take(y, self._inv_perm, axis=self.event_axis)
+        return x, self._zero_logdet(y)
 
     def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
-        """
-        Initialize parameters for this transform.
-
-        Permutation has no learnable parameters.
-
-        Arguments:
-            key: JAX PRNGKey (unused).
-            context_dim: Context dimension (unused, included for interface consistency).
-
-        Returns:
-            Empty dict.
-        """
-        del key, context_dim  # Unused.
+        """Permutation has no learnable parameters."""
+        del key, context_dim
         return {}
 
     @classmethod
-    def create(cls, key: PRNGKey, perm: Array) -> Tuple["Permutation", dict]:
+    def create(
+        cls,
+        key: PRNGKey,
+        perm: Array,
+        event_axis: int = -1,
+    ) -> Tuple["Permutation", dict]:
         """
         Factory method to create Permutation and initialize params.
 
         Arguments:
-            key: JAX PRNGKey for parameter initialization (unused, for consistency).
-            perm: Permutation indices of shape (dim,).
-
-        Returns:
-            Tuple of (transform, params) ready to use.
+            key: JAX PRNGKey (unused; included for interface consistency).
+            perm: Permutation indices, shape `(k,)` where `k` is the size of
+                the permuted axis.
+            event_axis: Negative integer selecting which axis is permuted.
+                Default `-1` (historic coordinate-axis behaviour). Use
+                `event_axis=-2` for particle-axis permutation on `(B, N, d)`.
 
         Example:
-            >>> perm = jnp.array([3, 2, 1, 0])  # reverse permutation
-            >>> transform, params = Permutation.create(key, perm=perm)
-            >>> y, log_det = transform.forward(params, x)
+            >>> # Reverse particle order on (B, N, d):
+            >>> transform, params = Permutation.create(
+            ...     key, perm=jnp.arange(N)[::-1], event_axis=-2,
+            ... )
         """
-        del key  # Unused for Permutation.
-        transform = cls(perm=perm)
+        del key
+        transform = cls(perm=perm, event_axis=event_axis)
         params = transform.init_params(None)  # type: ignore
         return transform, params
 
@@ -2038,12 +2039,12 @@ class Permutation:
 class CircularShift:
     """Rigid shift modulo the box length, per-coordinate learnable.
 
-    Input shape: `(*batch, ..., coord_dim)`. Only the last axis is
-    "coord-like"; the shift vector has shape `(coord_dim,)` and broadcasts
-    across all preceding axes (particles, batch, etc.). This lets a single
-    CircularShift layer rotate a whole rank-N particle configuration by
-    the same per-coord displacement, as a rigid-body operation on the
-    torus.
+    Input shape: `(*batch, ..., coord_dim)`, where `coord_dim == geometry.d`.
+    Only the last axis is "coord-like"; the shift vector has shape `(d,)`
+    and broadcasts across all preceding axes (particles, batch, etc.).
+    This lets a single CircularShift layer rotate a whole rank-N particle
+    configuration by the same per-coord displacement, as a rigid-body
+    operation on the torus.
 
     Log-det: scalar zero. Rigid shift has unit Jacobian.
 
@@ -2051,38 +2052,39 @@ class CircularShift:
     spline uses `boundary_slopes='circular'` to model general torus
     diffeomorphisms.
     """
-    coord_dim: int
-    lower: Any          # float or array broadcastable to (coord_dim,)
-    upper: Any          # same
+    geometry: Geometry
 
     def __post_init__(self):
-        # Validate lower < upper so box length is positive.
-        lo = jnp.asarray(self.lower)
-        hi = jnp.asarray(self.upper)
-        if lo.ndim == 0 and hi.ndim == 0 and float(lo) >= float(hi):
-            raise ValueError(
-                f"CircularShift: lower must be < upper; got "
-                f"lower={float(lo)}, upper={float(hi)}."
+        if not isinstance(self.geometry, Geometry):
+            raise TypeError(
+                f"CircularShift: geometry must be a Geometry instance, "
+                f"got {type(self.geometry).__name__}. "
+                f"Use CircularShift.from_scalar_box(...) for the legacy construction."
             )
-        if self.coord_dim <= 0:
-            raise ValueError(
-                f"CircularShift: coord_dim must be positive, got {self.coord_dim}."
-            )
+        # Precompute jnp arrays for the hot path. These are constants (not
+        # traced) so materialising once is fine.
+        object.__setattr__(
+            self, "_lower_j", jnp.asarray(self.geometry.lower, dtype=jnp.float32)
+        )
+        object.__setattr__(
+            self, "_box_j", jnp.asarray(self.geometry.box, dtype=jnp.float32)
+        )
 
-    def _L(self) -> Array:
-        return jnp.asarray(self.upper) - jnp.asarray(self.lower)
+    @property
+    def coord_dim(self) -> int:
+        """Number of coordinate axes — equals `geometry.d`."""
+        return self.geometry.d
 
     def _wrap_shift(
         self, params: Any, x: Array, sign: float
     ) -> Tuple[Array, Array]:
         shift = params["shift"]
-        if shift.shape != (self.coord_dim,):
+        d = self.geometry.d
+        if shift.shape != (d,):
             raise ValueError(
-                f"CircularShift: expected shift of shape ({self.coord_dim},), "
-                f"got {shift.shape}."
+                f"CircularShift: expected shift of shape ({d},), got {shift.shape}."
             )
-        L = self._L()
-        y = jnp.mod(x - jnp.asarray(self.lower) + sign * shift, L) + jnp.asarray(self.lower)
+        y = jnp.mod(x - self._lower_j + sign * shift, self._box_j) + self._lower_j
         # Scalar zero: composes safely in CompositeTransform whose accumulator
         # is scalar zero + block log-dets broadcast up.
         log_det = jnp.zeros((), dtype=x.dtype)
@@ -2103,16 +2105,34 @@ class CircularShift:
     def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
         """Zero shift → layer is identity at init."""
         del key, context_dim
-        return {"shift": jnp.zeros((self.coord_dim,), dtype=jnp.float32)}
+        return {"shift": jnp.zeros((self.geometry.d,), dtype=jnp.float32)}
 
     @classmethod
     def create(
-        cls, key: PRNGKey, coord_dim: int, lower: Any, upper: Any
+        cls,
+        key: PRNGKey,
+        geometry: Geometry,
     ) -> Tuple["CircularShift", dict]:
         """Factory. Returns (transform, zero-initialized params)."""
-        transform = cls(coord_dim=coord_dim, lower=lower, upper=upper)
+        transform = cls(geometry=geometry)
         params = transform.init_params(key)
         return transform, params
+
+    @classmethod
+    def from_scalar_box(
+        cls, coord_dim: int, lower: float, upper: float
+    ) -> "CircularShift":
+        """Convenience factory for a cubic box with scalar bounds.
+
+        Equivalent to `CircularShift(geometry=Geometry.cubic(d=coord_dim,
+        side=upper-lower, lower=lower))`. Provided so callers migrating from
+        the pre-Geometry API don't need to import `Geometry` just to
+        construct a cube.
+        """
+        geom = Geometry.cubic(
+            d=coord_dim, side=float(upper) - float(lower), lower=float(lower)
+        )
+        return cls(geometry=geom)
 
 
 # ===================================================================
