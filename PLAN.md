@@ -266,6 +266,60 @@ Lives in `bgmat/`, not nflojax. Track it here so it isn't forgotten.
 
 ---
 
+## 8b. Long-term trajectory
+
+Stages A–G get nflojax to the point where a user can reassemble the DeepMind *Flows for Atomic Solids* paper and bgmat's mW flow with no code in the library that is specific to either. That is the bar for **v1.0**.
+
+### v1.0 — "particle-flow framework"
+
+Definition:
+
+- Stages A–G all pass their acceptance criteria.
+- A user can build the DM paper's topology with nflojax primitives + a user-side Transformer conditioner + user-side energy / training / observables, in ≲ 500 lines of app-side code.
+- A user can build bgmat's flow using nflojax primitives + bgmat's GNN conditioner + bgmat's augmented-coupling composition + bgmat's energy / training / marginal-inference, without modifying nflojax.
+- Doc set (DESIGN / PLAN / BACKGROUND / REFERENCE / USAGE / AGENTS / EXTENDING / audit) is self-contained for a fresh agent. `DESIGN.md` §11 checks still pass.
+- No energy, no loss, no training loop, no observable, no physics constant inside `nflojax/`.
+
+Scope signature at v1.0:
+- Coupling flows (not autoregressive, not CNF, not flow matching).
+- Event shape `(N, d)` with trailing event axes; rank-polymorphic composition.
+- Bases: Gaussian, diagonal Gaussian, uniform-on-box, Gaussian-perturbed lattice (FCC / diamond / hex-ice / BCC / HCP).
+- Equivariance: permutation (Sn) via base + conditioner cooperation; translation (T(d)) via `CoMProjection` or augmented-coupling pattern; gauge via `CircularShift`. No O(d) / SO(d) / point group.
+- Conditioners: `MLP` + at least `DeepSets` reference shipped (audit §12.3 may defer Transformer / GNN to v2).
+- Orthogonal boxes only (triclinic parking lot).
+
+### Post-v1 — conditional roadmap
+
+Each post-v1 item lands only if a named trigger fires. No speculative extensions.
+
+- **Transformer / GNN reference conditioners** — if a third-party application other than DM / bgmat asks for one of them, ship it. Otherwise stay at `DeepSets`. Audit §12.3.
+- **Triclinic boxes** — if bgmat stabilises its triclinic path and a downstream app asks, generalise `Geometry` to carry an optional `cell: Array | None` field and retrofit every consumer. Audit §4 item 8.
+- **E(3) / SE(3) bijections** — if a molecular downstream application lands, introduce `transforms/equivariant.py` with EGNN-style couplings. Audit §7.3 documents why this is non-trivial.
+- **Block permutation / heteronuclear lattices** — if a multi-species materials application lands, generalise `Permutation` and `LatticeBase`. Audit §7.5.
+- **Flow matching / diffusion** — **not** shipped in nflojax; a sibling library. Audit §12.17.
+
+### Stopping / sunsetting criteria
+
+nflojax is a niche tool. It is acceptable to archive / sunset it if any of the following happen:
+
+- **Paradigm shift.** Flow matching or diffusion replaces coupling flows for materials Boltzmann sampling and no downstream application is still training reverse-KL coupling flows. Audit §12.1.
+- **Ecosystem absorption.** Distrax, `tfp.bijectors`, or a successor adopts first-class PBC / torus support + rank-N event handling. At that point, nflojax becomes vestigial.
+- **No usage.** Six months with no active downstream user and no planned user. Keep the branch, stop maintaining.
+- **Scope drift.** If one maintainer can no longer read the library end-to-end in an afternoon, the scope has drifted — revisit `DESIGN.md` §4 as a family (per the "revisit as family" clause).
+
+### Review cadence
+
+- **After each stage.** Write a one-paragraph retrospective in `DESIGN.md` §14 review log. What landed, what was deferred, what was learnt.
+- **After Stage E.** Design review against the audit's amendment list. Are the primitives carrying the weight we thought they would? Any that should be merged, deprecated, renamed?
+- **After Stage G.** v1.0 release decision. If bgmat prototype passes parity, tag v1.0 and freeze the API for at least one minor-version cycle. If it fails, add the missing primitive to Stage A' and repeat.
+- **Every 6 months.** Cross-check against the stopping criteria above.
+
+### North-star test
+
+A concrete, falsifiable success criterion: **a graduate student who has never used nflojax can read the docs in half a day and reproduce a known Boltzmann-generator result** (e.g. DeepMind's 32-particle LJ run) using nflojax primitives + ≲ 500 lines of their own code. If that test fails, the library has a discoverability or abstraction problem.
+
+---
+
 ## 9. Parking lot
 
 Things explicitly deferred. Each entry has a one-line reason.
