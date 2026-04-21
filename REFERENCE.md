@@ -221,6 +221,7 @@ Shapes: `x`, `y` are `(..., dim)`. `log_det` is `(...,)` (one scalar per sample)
 | `SplitCoupling` | Spline coupling for rank-N (particle-system) events |
 | `LinearTransform` | LU-parameterized invertible linear map |
 | `Permutation` | Fixed shuffle along any negative event axis |
+| `Rescale` | Fixed per-axis affine from `geometry.box` to a canonical target range |
 | `CircularShift` | Rigid per-coord shift mod box (torus rotation) |
 | `LoftTransform` | Log-soft tail compression |
 | `CompositeTransform` | Sequential composition of transforms |
@@ -448,6 +449,54 @@ transform, params = Permutation.create(key, perm=perm_N, event_axis=-2)
 
 **Log-det shape:** `x.shape` with the permuted axis removed. For `x.shape = (B, N, d)` and `event_axis=-2`, log-det is `(B, d)`.
 
+### Rescale
+
+**What:** Fixed, non-learnable per-axis affine that maps a physical `Geometry` box onto a canonical target range (default `[-1, 1]`). Typically the first layer of a particle flow, so every downstream spline / coupling can assume a fixed domain. For a learnable affine, use `LinearTransform`.
+
+**Forward:**
+
+```
+scale_i = (target_upper_i - target_lower_i) / (upper_i - lower_i)
+y_i    = target_lower_i + (x_i - lower_i) * scale_i
+log_det = event_factor * sum_i log(scale_i)   (scalar)
+```
+
+`event_factor = prod(event_shape[:-1])` accounts for any non-coord event axes: `1` for a rank-1 event `(d,)`, `N` for a rank-2 particle event `(N, d)`.
+
+**Inverse:** `x_i = lower_i + (y_i - target_lower_i) / scale_i`; log-det negated.
+
+**Create:**
+
+```python
+from nflojax.geometry import Geometry
+from nflojax.transforms import Rescale
+
+geom = Geometry(lower=[-L/2, -L/2, -L/2], upper=[L/2, L/2, L/2])
+
+# Default: map geometry.box to [-1, 1] per axis.
+rescale, params = Rescale.create(key, geometry=geom)
+
+# Particle event (N, d): pass event_shape so log-det accumulates correctly.
+rescale, params = Rescale.create(key, geometry=geom, event_shape=(N, 3))
+
+# Per-axis target bounds.
+import jax.numpy as jnp
+rescale = Rescale(
+    geometry=geom,
+    target=(jnp.array([-1, -2, -3]), jnp.array([1, 2, 3])),
+)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `geometry` | `Geometry` | required | Source box to map from |
+| `target` | scalar pair or `(Array, Array)` | `(-1.0, 1.0)` | Destination bounds, uniform or per-axis |
+| `event_shape` | `tuple[int, ...]` or `None` | `(geometry.d,)` | Event shape whose last axis is the coord axis |
+
+**Params dict:** `{}` (empty, no learnable parameters).
+
+**Log-det:** scalar (broadcasts over batch). Constant across all samples.
+
 ### CircularShift
 
 **What:** Rigid per-coordinate shift modulo the box length. The "rotation" half of a torus diffeomorphism — compose with a `boundary_slopes='circular'` spline coupling for full torus-bijection expressivity.
@@ -542,7 +591,7 @@ params = [params1, params2, params3]  # list matching block order
 from nflojax.geometry import Geometry
 ```
 
-**What:** Value object for an axis-aligned rectangular box in `R^d` plus per-axis periodicity flags. Consumed by any geometry-aware primitive (`CircularShift` today; `Rescale`, `UniformBox`, `LatticeBase`, `utils/pbc.nearest_image` in future stages). Numpy-backed, frozen, not a PyTree.
+**What:** Value object for an axis-aligned rectangular box in `R^d` plus per-axis periodicity flags. Consumed by any geometry-aware primitive (`CircularShift`, `Rescale` today; `UniformBox`, `LatticeBase`, `utils/pbc.nearest_image` in future stages). Numpy-backed, frozen, not a PyTree.
 
 **Scope:**
 
