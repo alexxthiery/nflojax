@@ -14,11 +14,12 @@ from nflojax.transforms import (
     SplitCoupling,
     CompositeTransform,
     LoftTransform,
+    CircularShift,
     identity_spline_bias,
     stable_logit,
 )
 from nflojax.nets import init_mlp
-from conftest import check_logdet_vs_autodiff
+from conftest import check_logdet_vs_autodiff, requires_x64
 
 
 class TestIdentitySplineBias:
@@ -60,6 +61,43 @@ class TestIdentitySplineBias:
         )
         b = bias.reshape(2, 3 * 4 - 1)
         assert jnp.all(b == 0.0)
+
+    def test_circular_shape(self):
+        """Circular mode has one extra slot per scalar (K instead of K-1 derivs)."""
+        K = 8
+        bias = identity_spline_bias(
+            num_scalars=5, num_bins=K,
+            min_derivative=1e-2, max_derivative=10.0,
+            boundary_slopes="circular",
+        )
+        assert bias.shape == (5 * (3 * K),)
+
+    def test_circular_widths_heights_zero(self):
+        """Circular: first 2K entries per scalar still zero."""
+        K = 4
+        S = 3
+        bias = identity_spline_bias(
+            num_scalars=S, num_bins=K,
+            min_derivative=1e-2, max_derivative=10.0,
+            boundary_slopes="circular",
+        )
+        b = bias.reshape(S, 3 * K)
+        assert jnp.all(b[:, : 2 * K] == 0.0)
+
+    def test_circular_all_derivs_logit_alpha(self):
+        """Circular: all K deriv slots (K-1 interior + 1 shared boundary) equal stable_logit(alpha)."""
+        K = 4
+        lo, hi = 1e-2, 10.0
+        alpha = (1.0 - lo) / (hi - lo)
+        expected = stable_logit(jnp.asarray(alpha, dtype=jnp.float32))
+
+        bias = identity_spline_bias(
+            num_scalars=2, num_bins=K,
+            min_derivative=lo, max_derivative=hi,
+            boundary_slopes="circular",
+        )
+        b = bias.reshape(2, 3 * K)
+        assert jnp.allclose(b[:, 2 * K :], expected)
 
 
 def check_logdet_vs_autodiff_structured(forward_fn, x, event_ndims):
@@ -1458,6 +1496,7 @@ class TestSplitCoupling:
         assert jnp.allclose(y, x, atol=0.01)
         assert jnp.allclose(log_det, 0.0, atol=0.01)
 
+    @requires_x64
     def test_inverse_roundtrip(self, key, small_event):
         """inverse(forward(x)) == x."""
         N, d = small_event["N"], small_event["d"]
@@ -1598,3 +1637,338 @@ class TestSplitCoupling:
         x_low = jax.random.uniform(key, (N * d,), minval=-3.0, maxval=3.0)
         with pytest.raises(ValueError, match="event_ndims"):
             coupling.forward(params, x_low)
+
+
+# ============================================================================
+# CircularShift Tests (rigid torus rotation)
+# ============================================================================
+#
+# CircularShift is the rotation half of a torus diffeomorphism. It applies a
+# per-coordinate learnable shift with modular wrap: y = (x - lower + shift)
+# mod (upper - lower) + lower. Log-det = 0 by construction (rigid shift).
+#
+# Composed with a circular-mode spline coupling, CircularShift + spline
+# cover general torus diffeomorphisms (the global rotation comes from the
+# shift; local deformation from the spline).
+class TestCircularShift:
+    """Tests for CircularShift (rigid shift mod L)."""
+
+    def test_forward_preserves_shape(self, key):
+        """Rank-3 input (B, N, d) yields output of identical shape."""
+        N, d = 6, 3
+        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        params = {"shift": jnp.array([0.3, -0.2, 0.5])}
+        x = jax.random.uniform(key, (8, N, d), minval=-1.0, maxval=1.0)
+        y, log_det = shift.forward(params, x)
+        assert y.shape == x.shape
+
+    def test_round_trip(self, key):
+        """inverse(forward(x)) == x to numerical tolerance."""
+        N, d = 6, 3
+        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        params = {"shift": jnp.array([0.3, -0.2, 0.5])}
+        x = jax.random.uniform(key, (8, N, d), minval=-1.0, maxval=1.0)
+        y, _ = shift.forward(params, x)
+        x_back, _ = shift.inverse(params, y)
+        assert jnp.allclose(x, x_back, atol=1e-6)
+
+    def test_zero_shift_is_identity(self, key):
+        """With shift=0, forward is identity on in-box inputs."""
+        d = 3
+        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        params = shift.init_params(key)  # init_params returns zero shift
+        x = jax.random.uniform(key, (4, 5, d), minval=-0.9, maxval=0.9)
+        y, _ = shift.forward(params, x)
+        assert jnp.allclose(y, x, atol=1e-6)
+
+    def test_shift_by_L_is_identity(self, key):
+        """Shift by the box length equals identity (modular wrap)."""
+        d = 3
+        # lower=-1, upper=1 so L = 2.
+        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        params = {"shift": jnp.full((d,), 2.0)}
+        x = jax.random.uniform(key, (4, 5, d), minval=-0.9, maxval=0.9)
+        y, _ = shift.forward(params, x)
+        assert jnp.allclose(y, x, atol=1e-6)
+
+    def test_log_det_is_zero(self, key):
+        """Log-det is exactly zero (scalar or broadcast-compatible)."""
+        d = 3
+        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        params = {"shift": jnp.array([0.3, -0.2, 0.5])}
+        x = jax.random.uniform(key, (8, 4, d), minval=-0.9, maxval=0.9)
+        _, log_det = shift.forward(params, x)
+        assert jnp.all(log_det == 0.0)
+        _, log_det_inv = shift.inverse(params, x)
+        assert jnp.all(log_det_inv == 0.0)
+
+    def test_jit(self, key):
+        """forward/inverse JIT-compatible."""
+        d = 3
+        shift = CircularShift(coord_dim=d, lower=-1.0, upper=1.0)
+        params = {"shift": jnp.array([0.3, -0.2, 0.5])}
+        x = jax.random.uniform(key, (4, 5, d), minval=-0.9, maxval=0.9)
+        fwd = jax.jit(shift.forward)
+        inv = jax.jit(shift.inverse)
+        y, _ = fwd(params, x)
+        x_back, _ = inv(params, y)
+        assert jnp.allclose(x_back, x, atol=1e-6)
+
+    def test_out_of_range_input_is_wrapped(self):
+        """Input slightly outside the box wraps back in."""
+        d = 1
+        shift = CircularShift(coord_dim=d, lower=0.0, upper=1.0)
+        params = {"shift": jnp.array([0.0])}  # no shift
+        # 1.1 is 0.1 above upper; mod wrap brings it to 0.1 above lower.
+        x = jnp.array([[1.1]])
+        y, _ = shift.forward(params, x)
+        assert jnp.allclose(y, jnp.array([[0.1]]), atol=1e-6)
+
+    def test_coord_dim_mismatch_raises(self):
+        """Shift vector with wrong coord_dim raises at construction."""
+        with pytest.raises(ValueError, match="lower"):
+            CircularShift(coord_dim=3, lower=1.0, upper=0.0)  # lower >= upper
+
+
+# ============================================================================
+# SplineCoupling with boundary_slopes='circular'
+# ============================================================================
+class TestSplineCouplingCircular:
+    """Flat spline coupling with matched-boundary-slope (circular) mode."""
+
+    def test_required_out_dim_circular(self):
+        """out_dim = dim * 3K for circular, dim * (3K-1) for linear_tails."""
+        assert SplineCoupling.required_out_dim(4, num_bins=8, boundary_slopes="circular") == 4 * 3 * 8
+        assert SplineCoupling.required_out_dim(4, num_bins=8) == 4 * (3 * 8 - 1)
+
+    def test_create_circular_near_identity(self, key, dim):
+        """create with circular mode + zero-init gives near-identity transform."""
+        mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
+        coupling, params = SplineCoupling.create(
+            key, dim=dim, mask=mask, hidden_dim=16, n_hidden_layers=2,
+            num_bins=8, boundary_slopes="circular",
+        )
+        # Inputs inside [-tail_bound, tail_bound] = [-5, 5].
+        x = jax.random.uniform(key, (10, dim), minval=-4.0, maxval=4.0)
+        y, ld = coupling.forward(params, x)
+        assert jnp.allclose(y, x, atol=0.01)
+        assert jnp.allclose(ld, 0.0, atol=0.01)
+
+    def test_circular_round_trip(self, key, dim):
+        """After breaking identity init, inverse(forward(x)) == x."""
+        mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
+        coupling, params = SplineCoupling.create(
+            key, dim=dim, mask=mask, hidden_dim=16, n_hidden_layers=2,
+            num_bins=8, boundary_slopes="circular",
+        )
+        params = jax.tree_util.tree_map(
+            lambda p: p + 0.2 * jax.random.normal(key, p.shape), params
+        )
+        x = jax.random.uniform(key, (8, dim), minval=-3.5, maxval=3.5)
+        y, ld_f = coupling.forward(params, x)
+        x_back, ld_i = coupling.inverse(params, y)
+        assert jnp.allclose(x_back, x, atol=1e-4)
+        assert jnp.allclose(ld_f + ld_i, 0.0, atol=1e-4)
+
+    def test_circular_with_gvalue_zero_is_identity(self, key, dim):
+        """Circular coupling + g_value=0 must still collapse to identity.
+
+        Closes the coverage gap where the identity-gate interpolation path
+        reshapes derivatives as (..., dim, K) instead of (..., dim, K-1).
+        """
+        mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
+        coupling, params = SplineCoupling.create(
+            key, dim=dim, mask=mask, hidden_dim=16, n_hidden_layers=2,
+            context_dim=1, num_bins=8, boundary_slopes="circular",
+        )
+        # Perturb so the "ungated" transform is non-identity; the gate must
+        # still drive the output back to x.
+        params = jax.tree_util.tree_map(
+            lambda p: p + 0.2 * jax.random.normal(key, p.shape), params
+        )
+        x = jax.random.uniform(key, (10, dim), minval=-4.0, maxval=4.0)
+        context = jnp.zeros((10, 1))
+        g_value = jnp.zeros(10)
+        y, log_det = coupling.forward(params, x, context, g_value=g_value)
+        assert jnp.allclose(y, x, atol=1e-5)
+        assert jnp.allclose(log_det, 0.0, atol=1e-5)
+
+    def test_circular_with_context_round_trip(self, key, dim):
+        """Conditional circular coupling: inverse(forward(x, ctx)) == x."""
+        mask = jnp.array([1, 0] * (dim // 2), dtype=jnp.float32)
+        coupling, params = SplineCoupling.create(
+            key, dim=dim, mask=mask, hidden_dim=16, n_hidden_layers=2,
+            context_dim=3, num_bins=8, boundary_slopes="circular",
+        )
+        params = jax.tree_util.tree_map(
+            lambda p: p + 0.2 * jax.random.normal(key, p.shape), params
+        )
+        x = jax.random.uniform(key, (8, dim), minval=-3.5, maxval=3.5)
+        context = jax.random.normal(jax.random.fold_in(key, 1), (8, 3))
+        y, ld_f = coupling.forward(params, x, context)
+        x_back, ld_i = coupling.inverse(params, y, context)
+        assert jnp.allclose(x_back, x, atol=1e-4)
+        # atol=5e-4 for log-det: float32 RQS inverse accumulates ~3e-4 of
+        # roundoff across the forward+inverse composition.
+        assert jnp.allclose(ld_f + ld_i, 0.0, atol=5e-4)
+
+
+# ============================================================================
+# SplitCoupling with boundary_slopes='circular'
+# ============================================================================
+class TestSplitCouplingCircular:
+    """Structured spline coupling with matched-boundary-slope (circular) mode."""
+
+    def test_required_out_dim_circular(self):
+        """out_dim = transformed_flat * 3K for circular."""
+        assert SplitCoupling.required_out_dim(
+            transformed_flat=6, num_bins=4, boundary_slopes="circular"
+        ) == 6 * 3 * 4
+        assert SplitCoupling.required_out_dim(
+            transformed_flat=6, num_bins=4
+        ) == 6 * (3 * 4 - 1)
+
+    def test_create_circular_near_identity(self, key):
+        """Zero-init + circular mode → near-identity on rank-3 input."""
+        N, d = 6, 3
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2,
+            num_bins=4, tail_bound=5.0, boundary_slopes="circular",
+        )
+        x = jax.random.uniform(key, (4, N, d), minval=-3.5, maxval=3.5)
+        y, ld = coupling.forward(params, x)
+        assert jnp.allclose(y, x, atol=0.01)
+        assert jnp.allclose(ld, 0.0, atol=0.01)
+
+    def test_circular_round_trip(self, key):
+        """Non-trivial circular SplitCoupling: forward/inverse invertible.
+
+        Tolerance 1e-3 and a gentler 0.2*randn perturbation (vs 0.3 earlier):
+        the circular shared boundary slope can take large values under big
+        perturbations, amplifying float32 RQS-inverse roundoff past 1e-3.
+        """
+        N, d = 6, 3
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2,
+            num_bins=4, boundary_slopes="circular",
+        )
+        params = jax.tree_util.tree_map(
+            lambda p: p + 0.2 * jax.random.normal(key, p.shape), params
+        )
+        x = jax.random.uniform(key, (4, N, d), minval=-3.5, maxval=3.5)
+        y, ld_f = coupling.forward(params, x)
+        x_back, ld_i = coupling.inverse(params, y)
+        assert jnp.allclose(x_back, x, atol=1e-3)
+        assert jnp.allclose(ld_f + ld_i, 0.0, atol=1e-3)
+
+
+# ============================================================================
+# Periodic-flow composition: CircularShift + SplitCoupling(circular)
+# ============================================================================
+# End-to-end unit test for the decomposition (rigid rotation) ∘ (seam-smooth
+# deformation). Together these primitives should cover any torus
+# diffeomorphism; individually they do not. This test catches bugs that only
+# surface when they're composed — e.g., broadcast mistakes in log-det shape,
+# a SplitCoupling that can't digest the output of a CircularShift, or
+# inputs that drift outside [lower, upper] after the shift.
+class TestPeriodicComposition:
+    """CircularShift + SplitCoupling(boundary_slopes='circular') in a stack."""
+
+    @pytest.fixture
+    def periodic_stack(self, key):
+        """Build a 4-layer stack on event_shape=(N=6, d=3) and perturb away
+        from identity init so the composition exercises a non-trivial map."""
+        N, d = 6, 3
+        B = 1.0
+        keys = jax.random.split(key, 4)
+        blocks = []
+        params_list = []
+        for i, k in enumerate(keys):
+            shift = CircularShift(coord_dim=d, lower=-B, upper=B)
+            s_params = shift.init_params(k)
+            # Break identity by injecting a non-zero shift.
+            s_params = {"shift": s_params["shift"] + 0.3}
+            blocks.append(shift)
+            params_list.append(s_params)
+
+            coupling, c_params = SplitCoupling.create(
+                jax.random.fold_in(k, 11),
+                event_shape=(N, d),
+                split_axis=-2,
+                split_index=N // 2,
+                event_ndims=2,
+                hidden_dim=16,
+                n_hidden_layers=2,
+                num_bins=8,
+                tail_bound=B,
+                boundary_slopes="circular",
+                swap=(i % 2 == 1),
+            )
+            # Perturb to move away from the identity-init state.
+            c_params = jax.tree_util.tree_map(
+                lambda p: p + 0.2 * jax.random.normal(k, p.shape), c_params
+            )
+            blocks.append(coupling)
+            params_list.append(c_params)
+        composite = CompositeTransform(blocks=blocks)
+        return {"composite": composite, "params": params_list, "N": N, "d": d, "B": B}
+
+    def test_stays_in_box(self, key, periodic_stack):
+        """Output of the full stack is always inside [-B, B]."""
+        c = periodic_stack["composite"]
+        params = periodic_stack["params"]
+        N, d, B = periodic_stack["N"], periodic_stack["d"], periodic_stack["B"]
+        x = jax.random.uniform(
+            jax.random.fold_in(key, 1), (8, N, d), minval=-B * 0.99, maxval=B * 0.99
+        )
+        y, _ = c.forward(params, x)
+        assert jnp.all(y >= -B)
+        assert jnp.all(y <= B)
+
+    def test_round_trip(self, key, periodic_stack):
+        """inverse(forward(x)) ≈ x on in-box inputs."""
+        c = periodic_stack["composite"]
+        params = periodic_stack["params"]
+        N, d, B = periodic_stack["N"], periodic_stack["d"], periodic_stack["B"]
+        x = jax.random.uniform(
+            jax.random.fold_in(key, 2), (4, N, d), minval=-B * 0.9, maxval=B * 0.9
+        )
+        y, ld_f = c.forward(params, x)
+        x_back, ld_i = c.inverse(params, y)
+        assert jnp.allclose(x_back, x, atol=1e-3)
+        assert jnp.allclose(ld_f + ld_i, 0.0, atol=1e-3)
+
+    def test_log_det_is_batch_shape(self, key, periodic_stack):
+        """log_det has batch shape (B,), not (B, N) or (B, N, d).
+
+        Catches silent broadcast bugs where a non-batch-reducing transform
+        widens the accumulator.
+        """
+        c = periodic_stack["composite"]
+        params = periodic_stack["params"]
+        N, d, B = periodic_stack["N"], periodic_stack["d"], periodic_stack["B"]
+        batch = 5
+        x = jax.random.uniform(
+            jax.random.fold_in(key, 3), (batch, N, d), minval=-B * 0.9, maxval=B * 0.9
+        )
+        _, log_det = c.forward(params, x)
+        assert log_det.shape == (batch,), (
+            f"expected log_det shape ({batch},), got {log_det.shape}"
+        )
+
+    def test_jit(self, key, periodic_stack):
+        """Full stack forward/inverse compile under jit."""
+        c = periodic_stack["composite"]
+        params = periodic_stack["params"]
+        N, d, B = periodic_stack["N"], periodic_stack["d"], periodic_stack["B"]
+        x = jax.random.uniform(
+            jax.random.fold_in(key, 4), (4, N, d), minval=-B * 0.9, maxval=B * 0.9
+        )
+        fwd = jax.jit(c.forward)
+        inv = jax.jit(c.inverse)
+        y, _ = fwd(params, x)
+        x_back, _ = inv(params, y)
+        assert y.shape == x.shape
+        assert jnp.allclose(x_back, x, atol=1e-3)

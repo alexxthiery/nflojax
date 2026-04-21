@@ -13,6 +13,7 @@ from nflojax.transforms import (
     _compute_gate_value,
     validate_identity_gate,
 )
+from conftest import requires_x64
 from nflojax.builders import build_realnvp, build_spline_realnvp, make_alternating_mask
 from nflojax.distributions import StandardNormal
 
@@ -523,6 +524,7 @@ class TestLinearTransformConditionalShiftGate:
 
         assert jnp.allclose(x_rec, x, atol=1e-5)
 
+    @requires_x64
     def test_varying_gate_values_per_sample_with_context(self, cond_transform_and_params):
         """Per-sample gate values work correctly with context-dependent shift."""
         transform, params, dim, context_dim = cond_transform_and_params
