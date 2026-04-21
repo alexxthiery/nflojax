@@ -8,6 +8,8 @@
 
 ## 1. Motivation
 
+*If you are unfamiliar with Boltzmann generators, particle-system flows, or the broader scientific context, read [BACKGROUND.md](BACKGROUND.md) first. This section states what nflojax is; `BACKGROUND.md` states why that matters.*
+
 nflojax is a normalizing-flow framework. Its original purpose was pedagogy and research: a small JAX codebase that a researcher can read in an afternoon, hack in a week, and trust under `jax.jit`.
 
 We now want the same library to be the flow-side foundation for particle-system applications: crystalline solids, liquids, disordered materials, and — eventually — molecular / chemistry workflows. The downstream apps we have in mind today:
