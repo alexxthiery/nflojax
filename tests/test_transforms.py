@@ -11,11 +11,81 @@ from nflojax.transforms import (
     Permutation,
     AffineCoupling,
     SplineCoupling,
+    SplitCoupling,
     CompositeTransform,
     LoftTransform,
+    identity_spline_bias,
+    stable_logit,
 )
 from nflojax.nets import init_mlp
 from conftest import check_logdet_vs_autodiff
+
+
+class TestIdentitySplineBias:
+    """Shared helper used by both SplineCoupling and SplitCoupling for near-identity init."""
+
+    def test_shape(self):
+        bias = identity_spline_bias(
+            num_scalars=5, num_bins=8, min_derivative=1e-2, max_derivative=10.0
+        )
+        assert bias.shape == (5 * (3 * 8 - 1),)
+
+    def test_widths_heights_are_zero(self):
+        """First 2K entries per scalar (widths + heights) must be zero."""
+        K = 4
+        S = 3
+        bias = identity_spline_bias(
+            num_scalars=S, num_bins=K, min_derivative=1e-2, max_derivative=10.0
+        )
+        b = bias.reshape(S, 3 * K - 1)
+        assert jnp.all(b[:, : 2 * K] == 0.0)
+
+    def test_derivative_logit_produces_derivative_one(self):
+        """Last K-1 entries per scalar must equal stable_logit(alpha)."""
+        K = 4
+        lo, hi = 1e-2, 10.0
+        alpha = (1.0 - lo) / (hi - lo)
+        expected = stable_logit(jnp.asarray(alpha, dtype=jnp.float32))
+
+        bias = identity_spline_bias(
+            num_scalars=2, num_bins=K, min_derivative=lo, max_derivative=hi
+        )
+        b = bias.reshape(2, 3 * K - 1)
+        assert jnp.allclose(b[:, 2 * K :], expected)
+
+    def test_out_of_range_derivative_falls_back_to_zero(self):
+        """When 1.0 is not in (min, max), derivative bias stays at zero."""
+        bias = identity_spline_bias(
+            num_scalars=2, num_bins=4, min_derivative=2.0, max_derivative=10.0
+        )
+        b = bias.reshape(2, 3 * 4 - 1)
+        assert jnp.all(b == 0.0)
+
+
+def check_logdet_vs_autodiff_structured(forward_fn, x, event_ndims):
+    """
+    Log-det check for a single-sample rank-N event.
+
+    For an event of shape event_shape (rank `event_ndims`), jax.jacfwd produces
+    a tensor of shape event_shape + event_shape. Flatten both sides to a 2D
+    matrix to take the determinant. Only works for one sample at a time.
+    """
+    y, ld = forward_fn(x)
+    event_shape = x.shape[-event_ndims:]
+    event_size = 1
+    for s in event_shape:
+        event_size *= s
+
+    J = jax.jacfwd(lambda z: forward_fn(z)[0])(x)
+    # J shape: event_shape + event_shape. Flatten to (event_size, event_size).
+    J_flat = J.reshape(event_size, event_size)
+    ld_autodiff = jnp.log(jnp.abs(jnp.linalg.det(J_flat)))
+
+    return {
+        "error": float(jnp.abs(ld - ld_autodiff)),
+        "ld": float(ld),
+        "ld_autodiff": float(ld_autodiff),
+    }
 
 
 # ============================================================================
@@ -1297,3 +1367,234 @@ class TestLogdetVsAutodiff:
         assert result["error"] < 1e-3, (
             f"CompositeTransform log-det error: {result['error']}"
         )
+
+
+# ============================================================================
+# SplitCoupling Tests (structured rank-N events)
+# ============================================================================
+#
+# SplitCoupling is the structured analogue of SplineCoupling. It splits along
+# a tensor axis (not a flat mask) and sums log-det over the trailing
+# event_ndims axes. Target use case: (B, N, d) particle systems with
+# split_axis=-2 (particle axis), event_ndims=2.
+class TestSplitCoupling:
+    """Tests for SplitCoupling on rank-2 events shaped (N, d)."""
+
+    @pytest.fixture
+    def small_event(self):
+        """Small particle system: 6 particles in 3D."""
+        return {"N": 6, "d": 3}
+
+    def test_create_returns_coupling_and_params(self, key, small_event):
+        """create returns (coupling, params) with the expected structure."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key,
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=N // 2,
+            event_ndims=2,
+            hidden_dim=16,
+            n_hidden_layers=2,
+            num_bins=4,
+            tail_bound=5.0,
+        )
+        assert isinstance(coupling, SplitCoupling)
+        assert isinstance(params, dict)
+        assert "mlp" in params
+
+    def test_forward_preserves_shape(self, key, small_event):
+        """Forward input (B, N, d) -> output (B, N, d)."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+        )
+        x = jax.random.uniform(key, (8, N, d), minval=-4.0, maxval=4.0)
+        y, log_det = coupling.forward(params, x)
+        assert y.shape == x.shape
+        assert log_det.shape == (8,)
+
+    def test_frozen_slice_is_identity(self, key, small_event):
+        """The frozen particle slice is passed through unchanged."""
+        N, d = small_event["N"], small_event["d"]
+        split_index = N // 2
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=split_index,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+        )
+        x = jax.random.uniform(key, (4, N, d), minval=-4.0, maxval=4.0)
+        y, _ = coupling.forward(params, x)
+
+        # swap=False => first `split_index` particles are frozen.
+        assert jnp.allclose(y[:, :split_index, :], x[:, :split_index, :])
+
+    def test_swap_flips_frozen_slice(self, key, small_event):
+        """swap=True freezes the second slice instead of the first."""
+        N, d = small_event["N"], small_event["d"]
+        split_index = N // 2
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=split_index,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+            swap=True,
+        )
+        x = jax.random.uniform(key, (4, N, d), minval=-4.0, maxval=4.0)
+        y, _ = coupling.forward(params, x)
+
+        # swap=True => last `N - split_index` particles are frozen.
+        assert jnp.allclose(y[:, split_index:, :], x[:, split_index:, :])
+
+    def test_near_identity_at_init(self, key, small_event):
+        """Zero-bias spline init => forward is near-identity inside [-B, B]."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+            tail_bound=5.0,
+        )
+        x = jax.random.uniform(key, (10, N, d), minval=-4.0, maxval=4.0)
+        y, log_det = coupling.forward(params, x)
+
+        assert jnp.allclose(y, x, atol=0.01)
+        assert jnp.allclose(log_det, 0.0, atol=0.01)
+
+    def test_inverse_roundtrip(self, key, small_event):
+        """inverse(forward(x)) == x."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+        )
+        # Break identity init by adding noise to params so the test exercises a
+        # non-trivial transform.
+        params = jax.tree_util.tree_map(lambda p: p + 0.3 * jax.random.normal(key, p.shape), params)
+
+        x = jax.random.uniform(key, (4, N, d), minval=-3.5, maxval=3.5)
+        y, ld_fwd = coupling.forward(params, x)
+        x_back, ld_inv = coupling.inverse(params, y)
+
+        assert jnp.allclose(x_back, x, atol=1e-4)
+        assert jnp.allclose(ld_fwd + ld_inv, 0.0, atol=1e-4)
+
+    def test_log_det_vs_autodiff(self, key, small_event):
+        """log_det matches the autodiff Jacobian determinant on a single sample."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+        )
+        params = jax.tree_util.tree_map(lambda p: p + 0.3 * jax.random.normal(key, p.shape), params)
+
+        def fwd_single(z):
+            # z: (N, d). coupling.forward expects a batch axis.
+            y, ld = coupling.forward(params, z[None])
+            return y[0], ld[0]
+
+        x = jax.random.uniform(key, (N, d), minval=-3.0, maxval=3.0)
+        result = check_logdet_vs_autodiff_structured(fwd_single, x, event_ndims=2)
+        assert result["error"] < 1e-3, f"SplitCoupling log-det error: {result['error']}"
+
+    def test_alternating_swap_covers_all(self, key, small_event):
+        """Two layers with opposite swap transform every scalar."""
+        N, d = small_event["N"], small_event["d"]
+        split_index = N // 2
+        c_a, p_a = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=split_index,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+            swap=False,
+        )
+        c_b, p_b = SplitCoupling.create(
+            jax.random.split(key)[0], event_shape=(N, d), split_axis=-2,
+            split_index=split_index, event_ndims=2, hidden_dim=16,
+            n_hidden_layers=2, num_bins=4, swap=True,
+        )
+        # Break identity init.
+        p_a = jax.tree_util.tree_map(lambda p: p + 0.3 * jax.random.normal(key, p.shape), p_a)
+        p_b = jax.tree_util.tree_map(lambda p: p + 0.3 * jax.random.normal(key, p.shape), p_b)
+
+        x = jax.random.uniform(key, (1, N, d), minval=-2.0, maxval=2.0)
+        y1, _ = c_a.forward(p_a, x)
+        y2, _ = c_b.forward(p_b, y1)
+
+        # After two layers every particle must differ from the input (no particle
+        # is left identity-mapped).
+        diff = jnp.abs(y2 - x)
+        per_particle_diff = jnp.sum(diff, axis=-1)  # (1, N)
+        assert jnp.all(per_particle_diff > 1e-6), (
+            f"Some particles untouched; per-particle diffs: {per_particle_diff}"
+        )
+
+    def test_jit_compatible(self, key, small_event):
+        """SplitCoupling forward/inverse are JIT-compatible."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+        )
+        x = jax.random.uniform(key, (4, N, d), minval=-3.0, maxval=3.0)
+        fwd = jax.jit(coupling.forward)
+        inv = jax.jit(coupling.inverse)
+        y, ld_f = fwd(params, x)
+        x_back, ld_i = inv(params, y)
+        assert y.shape == x.shape
+        assert jnp.allclose(x_back, x, atol=1e-4)
+
+    def test_direct_construction_init_params(self, key, small_event):
+        """Constructing SplitCoupling directly and calling init_params works
+        without needing frozen_flat/transformed_flat kwargs."""
+        from nflojax.nets import MLP
+        N, d = small_event["N"], small_event["d"]
+        K = 4
+        frozen_flat = (N // 2) * d
+        transformed_flat = (N // 2) * d
+        mlp = MLP(
+            x_dim=frozen_flat,
+            context_dim=0,
+            hidden_dim=16,
+            n_hidden_layers=2,
+            out_dim=transformed_flat * (3 * K - 1),
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=N // 2,
+            event_ndims=2,
+            conditioner=mlp,
+            num_bins=K,
+        )
+        params = coupling.init_params(key)
+        x = jax.random.uniform(key, (3, N, d), minval=-3.0, maxval=3.0)
+        y, ld = coupling.forward(params, x)
+        assert y.shape == x.shape
+        assert ld.shape == (3,)
+
+    def test_event_shape_rank_mismatch_raises(self, key):
+        """event_shape rank must equal event_ndims."""
+        from nflojax.nets import MLP
+        mlp = MLP(x_dim=4, context_dim=0, hidden_dim=8, n_hidden_layers=1, out_dim=1)
+        with pytest.raises(ValueError, match="event_shape"):
+            SplitCoupling(
+                event_shape=(4,),      # rank 1
+                split_axis=-2,
+                split_index=1,
+                event_ndims=2,          # but claims rank 2
+                conditioner=mlp,
+            )
+
+    def test_forward_wrong_shape_raises(self, key, small_event):
+        """forward on input with trailing shape != event_shape raises cleanly."""
+        N, d = small_event["N"], small_event["d"]
+        coupling, params = SplitCoupling.create(
+            key, event_shape=(N, d), split_axis=-2, split_index=N // 2,
+            event_ndims=2, hidden_dim=16, n_hidden_layers=2, num_bins=4,
+        )
+        # Correct rank, wrong trailing axis size.
+        x_bad = jax.random.uniform(key, (4, N, d + 1), minval=-3.0, maxval=3.0)
+        with pytest.raises(ValueError, match="event_shape"):
+            coupling.forward(params, x_bad)
+        with pytest.raises(ValueError, match="event_shape"):
+            coupling.inverse(params, x_bad)
+        # Too-low rank.
+        x_low = jax.random.uniform(key, (N * d,), minval=-3.0, maxval=3.0)
+        with pytest.raises(ValueError, match="event_ndims"):
+            coupling.forward(params, x_low)
