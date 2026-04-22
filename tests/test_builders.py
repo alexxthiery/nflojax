@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 
 from nflojax.builders import (
+    build_particle_flow,
     build_realnvp,
     build_spline_realnvp,
     analyze_mask_coverage,
@@ -23,7 +24,9 @@ from nflojax.transforms import (
     LinearTransform,
     LoftTransform,
 )
-from nflojax.distributions import DiagNormal, StandardNormal
+from nflojax.distributions import DiagNormal, StandardNormal, UniformBox
+from nflojax.geometry import Geometry
+from nflojax.nets import DeepSets
 
 
 # ============================================================================
@@ -995,3 +998,150 @@ class TestDefaultConsistency:
             f"{param} mismatch: SplineCoupling dataclass={dc_val}, "
             f"SplineCoupling.create={create_val}"
         )
+
+
+# ============================================================================
+# build_particle_flow Tests
+# ============================================================================
+def _deepsets_factory(hidden=16):
+    """Flat-output DeepSets factory using required_out_dim."""
+    def factory(*, required_out_dim, **_):
+        return DeepSets(
+            phi_hidden=(hidden, hidden),
+            rho_hidden=(hidden,),
+            out_dim=required_out_dim,
+        )
+    return factory
+
+
+class TestBuildParticleFlow:
+    """Tests for build_particle_flow."""
+
+    @pytest.fixture
+    def cfg(self):
+        return {
+            "N": 8, "d": 3, "K": 8, "num_layers": 2,
+            "tail_bound": 5.0,
+            "geometry": Geometry.cubic(d=3, side=2.0, lower=-1.0),
+        }
+
+    def _build(self, key, cfg, *, use_com_shift=False, return_transform_only=False):
+        N, d = cfg["N"], cfg["d"]
+        N_eff = N - 1 if use_com_shift else N
+        base = (
+            None if return_transform_only
+            else UniformBox(geometry=cfg["geometry"], event_shape=(N_eff, d))
+        )
+        return build_particle_flow(
+            key,
+            geometry=cfg["geometry"],
+            event_shape=(N, d),
+            num_layers=cfg["num_layers"],
+            conditioner=_deepsets_factory(),
+            base_dist=base,
+            num_bins=cfg["K"],
+            tail_bound=cfg["tail_bound"],
+            use_com_shift=use_com_shift,
+            return_transform_only=return_transform_only,
+        )
+
+    def test_flow_types(self, key, cfg):
+        flow, params = self._build(key, cfg)
+        assert isinstance(flow, Flow)
+        assert set(params.keys()) == {"base", "transform"}
+
+    def test_return_transform_only(self, key, cfg):
+        bij, params = self._build(key, cfg, return_transform_only=True)
+        assert isinstance(bij, Bijection)
+        assert set(params.keys()) == {"transform"}
+
+    def test_identity_on_couplings(self, key, cfg):
+        """At init the couplings are identity, so forward == Rescale scaling."""
+        import math
+        flow, params = self._build(key, cfg)
+        N, d = cfg["N"], cfg["d"]
+        x = jax.random.uniform(key, (3, N, d), minval=-1.0, maxval=1.0)
+        y, log_det = flow.forward(params, x)
+        # Rescale maps [-1, 1] -> [-5, 5], scale = 5 per axis. No other
+        # block changes x at init (couplings identity, CircularShift zero).
+        scale = cfg["tail_bound"] / 1.0
+        assert jnp.allclose(y, scale * x, atol=1e-5)
+        expected_ld = N * d * math.log(scale)
+        assert jnp.allclose(log_det, expected_ld, atol=1e-4)
+        assert log_det.shape == (3,)
+
+    def test_jit_round_trip(self, key, cfg):
+        flow, params = self._build(key, cfg)
+        N, d = cfg["N"], cfg["d"]
+        x = jax.random.uniform(key, (3, N, d), minval=-0.9, maxval=0.9)
+        fwd = jax.jit(lambda p, z: flow.forward(p, z))
+        inv = jax.jit(lambda p, z: flow.inverse(p, z))
+        y, _ = fwd(params, x)
+        x_back, _ = inv(params, y)
+        assert jnp.allclose(x_back, x, atol=1e-4)
+
+    def test_sample_shape(self, key, cfg):
+        flow, params = self._build(key, cfg)
+        N, d = cfg["N"], cfg["d"]
+        samples = flow.sample(params, key, (4,))
+        assert samples.shape == (4, N, d)
+        logp = flow.log_prob(params, samples)
+        assert logp.shape == (4,)
+        assert bool(jnp.all(jnp.isfinite(logp)))
+
+    def test_sample_shape_with_com_shift(self, key, cfg):
+        """Ambient shape is (N, d) but samples are zero-CoM."""
+        flow, params = self._build(key, cfg, use_com_shift=True)
+        N, d = cfg["N"], cfg["d"]
+        samples = flow.sample(params, key, (4,))
+        assert samples.shape == (4, N, d)
+        com = jnp.sum(samples, axis=-2)
+        assert jnp.allclose(com, 0.0, atol=1e-5)
+        logp = flow.log_prob(params, samples)
+        assert logp.shape == (4,)
+
+    def test_com_shift_round_trip(self, key, cfg):
+        """transform.forward: (N-1, d) -> (N, d); inverse recovers the input."""
+        flow, params = self._build(key, cfg, use_com_shift=True)
+        N, d = cfg["N"], cfg["d"]
+        z = jax.random.uniform(key, (4, N - 1, d), minval=-0.9, maxval=0.9)
+        x, ld_f = flow.transform.forward(params["transform"], z)
+        z_back, ld_i = flow.transform.inverse(params["transform"], x)
+        assert x.shape == (4, N, d)
+        assert z_back.shape == (4, N - 1, d)
+        assert jnp.allclose(z, z_back, atol=1e-4)
+        # Forward + inverse log-dets sum to zero.
+        assert jnp.allclose(ld_f + ld_i, 0.0, atol=1e-4)
+
+    def test_validation_errors(self, key, cfg):
+        g = cfg["geometry"]
+        with pytest.raises(TypeError, match="geometry must be a Geometry"):
+            build_particle_flow(
+                key, geometry="not a geometry", event_shape=(8, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(8, 3)),
+            )
+        with pytest.raises(ValueError, match="event_shape must be"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8,),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(8, 3)),
+            )
+        with pytest.raises(ValueError, match="must equal geometry.d"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8, 2),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(8, 3)),
+            )
+        with pytest.raises(ValueError, match="base_dist is required"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+            )
+        with pytest.raises(ValueError, match="use_com_shift=True requires N >= 3"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(2, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(1, 3)),
+                use_com_shift=True,
+            )

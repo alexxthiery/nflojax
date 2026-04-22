@@ -28,7 +28,9 @@
 - Full test suite (parallel): **592 passed / 6 skipped under float32 (~95s); 598 passed under `JAX_ENABLE_X64=1` (~95s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
 - DESIGN.md checked in; `AGENTS.md` updated to point at it.
 
-**Next up — Stage E** (particle-flow builder `build_particle_flow`). All Stage-D primitives are in place; E1/E2 can compose them directly.
+- **Stage E fully closed.** E1 (`build_particle_flow`) + E2 (`tests/test_particle_smoke.py`). Topology deviates from the original spec by dropping the per-layer `Permutation` (alternating-swap on `SplitCoupling` already covers particles; `Permutation._zero_logdet` on rank-2 events returns `(B, d)` not batch-shape, which would poison `CompositeTransform`'s accumulator). The `use_com_shift=True` branch appends a private `_CoMEmbed` shim that swaps `CoMProjection.forward` / `.inverse` so `Flow.sample` hits the expansion direction (the EXTENDING.md "CoM handling" sketch is misleading on this point — flagged for a future docs fix). See the Stage-E decision-log entry for the factory contract and the three kwargs (`required_out_dim`, `out_per_particle`, `n_frozen`).
+
+**Next up — Stage F** (docs refresh) and **Stage G** (bgmat prototype parity test). All nflojax-side primitives for v1.0 are in place.
 
 Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
 
@@ -194,7 +196,7 @@ A single entry-point that assembles the canonical DM / bgmat topology. File: `nf
 
 ### Tasks
 
-- [ ] **E1. `build_particle_flow(...)`** topology:
+- [x] **E1. `build_particle_flow(...)`** topology:
   ```
   Rescale(box -> [-tail_bound, tail_bound])
   for i in range(num_layers):
@@ -208,7 +210,7 @@ A single entry-point that assembles the canonical DM / bgmat topology. File: `nf
   - Signature: `event_shape=(N, d), box, num_layers, num_bins, conditioner (factory / Module class), boundary_slopes='circular', use_com_shift=False, trainable_base=False`.
   - `conditioner` is a factory (`functools.partial` of a conditioner class or a custom callable returning a conditioner instance).
   - Tests: identity at init on `(B, N, d)`, round-trip, jit.
-- [ ] **E2. Integration smoke test** `tests/test_particle_smoke.py`.
+- [x] **E2. Integration smoke test** `tests/test_particle_smoke.py`.
   - `(N=8, d=3)` flow built with each of `DeepSets` / `Transformer` / `GNN`.
   - Asserts identity at init (tolerant threshold), jit-invertible round-trip, non-zero gradient from a trivial `jnp.sum(x**2)` scalar loss.
   - Purpose: prove all three conditioners compose cleanly with the builder.
@@ -288,6 +290,15 @@ Stage C checklist (2026-04-22):
 - [x] No new dependency.
 - [x] Total nflojax LOC (excluding tests) ≤ 5000.
 - [x] Every public name in `REFERENCE.md` (`circular_embed`, `positional_embed` under `nflojax.embeddings`).
+
+Stage E checklist (2026-04-22):
+
+- [x] `pytest tests/ -q` green under default float32 (expected ~600 passed / 7+ skipped — Stage-E adds 3 `@requires_x64` skips for `jit_round_trip_after_perturbation` which accumulates RQS-inverse roundoff through Rescale + 4 circular couplings above 1e-3).
+- [x] `JAX_ENABLE_X64=1 pytest tests/ -q` green (10/10 Stage-E tests pass).
+- [x] Identity-on-couplings holds: `forward(x) == tail_bound * x` at init (Rescale scaling only; couplings identity via `SplitCoupling._patch_dense_out`).
+- [x] No new energy / training / observable term (DESIGN.md §11 greps).
+- [x] No new heavy dependency. `build_particle_flow` reuses existing primitives.
+- [x] Every public name in `REFERENCE.md` (`build_particle_flow`) and `USAGE.md` (liquid + solid recipes, both spot-run end-to-end).
 
 Stage D checklist (2026-04-22):
 
@@ -392,3 +403,7 @@ Items that need a decision before the relevant stage can close.
 - *2026-04-22* — **Stage D closed.** One preparatory change + three reference conditioners + one shared fixture. The preparatory change: `SplitCoupling.flatten_input: bool = True` hatch (default preserves the flat-`(B, N*d)` contract MLP expects; `False` passes the structured `(B, N_frozen, d)` slice through to permutation-aware conditioners). Four new public names in `nflojax.nets`: `DeepSets` (permutation-invariant aggregator), `Transformer` (pre-norm multi-head self-attention, permutation-equivariant per-token), `GNN` (top-K PBC-aware message passing, `num_neighbours=12` default). All three satisfy the existing conditioner contract (`context_dim` attribute + `apply` + `get_output_layer`/`set_output_layer`) and use a top-level `Dense(..., name="dense_out")` to stay compatible with `SplitCoupling._patch_dense_out`. §10.4 resolved (pre-norm), §10.5 resolved (12 neighbours). New `tests/test_conditioner_protocol.py` locks the contract at 5 checks × 4 conditioners; per-conditioner detail in `tests/test_nets.py`. Two subtle-bug fixes during implementation: (1) self-mask computed via `jnp.where(eye_bool, inf, d_sq)` to avoid `0 * inf = NaN` off-diagonal; (2) test N bumped to 8 particles so `num_neighbours=3` stays < N_frozen=4 at init.
 - *2026-04-22* — **Post-close refactor (P1).** Dropped the `set_output_layer` slicing magic from `Transformer` and `GNN`. Instead, `SplitCoupling._patch_dense_out` (and `SplineCoupling._patch_dense_out` for symmetry) now reads the conditioner's current `dense_out` bias length and sizes `identity_spline_bias(num_scalars = bias_size // params_per_scalar, …)` to match. Works for flat and per-token dense_out uniformly because `identity_spline_bias` is a per-scalar pattern tiled across scalars. Net: `Transformer.set_output_layer` / `GNN.set_output_layer` collapsed to the trivial dict-update form (same as `DeepSets`); one Gotcha removed from AGENTS.md; one "library-private convention" line struck; a bias-shape divisibility check added in both `_patch_dense_out` sites. Reason: the slicing hack was a hidden coupling between conditioners and `SplitCoupling`'s internals; inferring from the conditioner keeps the contract local and easier to extend.
 - *2026-04-22* — **Post-close hardening.** Four audit items landed as separate changes: (1) `Transformer` uses `nn.MultiHeadDotProductAttention` instead of the now-deprecated `nn.SelfAttention`; (5) `SplitCoupling.init_params` runs a one-sample dummy apply after `_patch_dense_out` and raises a clear, diagnostic `ValueError` when the conditioner's output total-trailing size doesn't match `transformed_flat · params_per_scalar` — catches per-token `Transformer`/`GNN` misconfigured for asymmetric splits at init rather than as a cryptic reshape error at forward time; (4) removed per-conditioner factories `init_deepsets`/`init_transformer`/`init_gnn` (~75 LOC) in favour of a single generic `init_conditioner(key, conditioner, dummy_x, dummy_context=None)` helper (5 LOC) — shrinks the public API, removes three redundant public names, and keeps all init paths uniform; (3) new `tests/test_particle_integration.py` parametrised over `DeepSets`/`Transformer`/`GNN` composing four alternating-swap `SplitCoupling` layers through `CompositeTransform` — asserts identity-at-init, jit round-trip, and non-zero gradient. Reason: each item brings surface down or failure-mode clarity up; together they move Stage D from "works" to "robust + discoverable".
+- *2026-04-22* — **Stage E closed.** `build_particle_flow` + cross-conditioner smoke tests landed. Two deviations from the original PLAN.md §5 spec, both forced by composition mechanics:
+  1. **Dropped the per-layer `Permutation`.** `Permutation._zero_logdet` on a rank-2 event `(B, N, d)` with `event_axis=-2` returns shape `(B, d)` (locked in by `test_transforms.py::test_event_axis_particle`), not batch-shape. Inside `CompositeTransform.forward` that broadcasts the accumulator to `(B, d)`, which corrupts `Flow.log_prob` (adds `base_log_prob:(B,)` to `(B, d)`). Alternating `swap` on `SplitCoupling` already covers all particles, so the per-layer `Permutation` was redundant coverage anyway. The `Permutation._zero_logdet` shape bug is flagged separately; fixing it means updating an existing test, which is out of Stage E scope.
+  2. **Added a private `_CoMEmbed` shim for `use_com_shift=True`.** `CompositeTransform.forward` applies `block.forward` sequentially; `CoMProjection.forward` reduces `(N, d) → (N-1, d)` (the wrong direction for `Flow.sample`, which goes base-reduced → data-ambient). `_CoMEmbed` flips `.forward`/`.inverse` so the expansion is what `transform.forward` sees at the tail, and the reduction is what `transform.inverse` sees at the head. `EXTENDING.md`'s "Pattern A: CoMProjection" sketch is misleading on this — uses `CompositeTransform(blocks=[inner, proj])` which *doesn't* work as drawn because of the same forward-direction issue. Flagged for a Stage-F docs fix.
+  **Conditioner factory contract**: keyword-only callable with three kwargs (`required_out_dim`, `out_per_particle`, `n_frozen`) computed per-layer by the builder. With asymmetric splits (odd `N_eff` under `use_com_shift=True`), `required_out_dim` differs between `swap=False` and `swap=True` layers, so the factory is called with different sizing per-layer — correctly handled by the per-layer recompute inside the swap loop. Per-token conditioners (`Transformer`, `GNN`) require even `N_eff` so `N_frozen == N_transformed`; the Stage-D `SplitCoupling.init_params` sizing check catches the mismatch with a clear diagnostic error. **Stage-E skip count**: 3 new `@requires_x64` skips on the jit round-trip test across the three conditioners (circular RQS-inverse through Rescale + 4 stacked couplings accumulates ~2.4e-3 float32 roundoff, above the 1e-3 round-trip atol). All pass under `JAX_ENABLE_X64=1`. Total Stage-E LOC: ~230 in `builders.py` (including the `_CoMEmbed` shim + the builder body + docstring), ~150 in `tests/test_builders.py::TestBuildParticleFlow`, ~140 in `tests/test_particle_smoke.py`. Unblocks Stage G bgmat-parity prototype — all nflojax-side v1.0 primitives are in place.

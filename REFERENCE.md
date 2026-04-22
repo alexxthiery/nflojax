@@ -103,6 +103,72 @@ flow_or_bijection, params = build_spline_realnvp(
 )
 ```
 
+### build_particle_flow
+
+The canonical DM / bgmat-style topology for particle systems on `(N, d)` events.
+
+```python
+from nflojax.builders import build_particle_flow
+from nflojax.distributions import UniformBox, LatticeBase
+from nflojax.geometry import Geometry
+from nflojax.nets import DeepSets
+
+flow_or_bijection, params = build_particle_flow(
+    key,
+    geometry=Geometry.cubic(d=3, side=2.0, lower=-1.0),
+    event_shape=(N, d),
+    num_layers=4,
+    conditioner=(lambda *, required_out_dim, **_: DeepSets(
+        phi_hidden=(64, 64), rho_hidden=(64,), out_dim=required_out_dim,
+    )),
+    base_dist=UniformBox(geometry=..., event_shape=(N, d)),
+    num_bins=8, tail_bound=5.0,
+    boundary_slopes="circular",
+    use_com_shift=False,
+)
+```
+
+**Architecture** (for `N_eff = N - 1` if `use_com_shift` else `N`):
+
+```
+Rescale(geometry -> [-tail_bound, tail_bound])
+for _ in range(num_layers):
+    SplitCoupling(swap=False, flatten_input=False)
+    SplitCoupling(swap=True,  flatten_input=False)
+    CircularShift(canonical cube)
+[optional] _CoMEmbed   # base on (N-1, d); embeds to ambient (N, d)
+```
+
+`_CoMEmbed` is a private direction-flipped view of `CoMProjection` so that `Flow.sample` (base → data) hits the expansion direction. Particle coverage comes from alternating `swap` on `SplitCoupling`; no per-layer `Permutation` is inserted.
+
+**Conditioner factory contract.** `conditioner` is a **keyword-only callable** invoked once per coupling layer with three kwargs:
+
+| kwarg | value | used by |
+|-------|-------|---------|
+| `required_out_dim` | `N_transformed * d * params_per_scalar` | flat-output conditioners (`DeepSets`) |
+| `out_per_particle` | `d * params_per_scalar` | per-token conditioners (`Transformer`, `GNN`) |
+| `n_frozen` | `N_frozen` | user conditioners that size per-particle context |
+
+The factory returns a fresh `flax.linen.Module`. Absorb unused kwargs with `**_`. With asymmetric splits (odd `N_eff` under `use_com_shift=True`), `required_out_dim` differs between `swap=False` and `swap=True` layers — the builder recomputes per-layer. Per-token conditioners require `N_frozen == N_transformed` (even `N_eff`).
+
+**Base distribution.** Mandatory. Must match the inner event shape:
+
+- `use_com_shift=False`: `(N, d)` (e.g. `UniformBox(geometry, event_shape=(N, d))`, `LatticeBase.fcc(...)`).
+- `use_com_shift=True`: `(N-1, d)` reduced-subspace base. Remember `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)` if you need an ambient log-density.
+
+**Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `num_bins` | int | 8 | Spline bins K |
+| `tail_bound` | float | 5.0 | Spline canonical half-width |
+| `boundary_slopes` | str | `'circular'` | Or `'linear_tails'` |
+| `use_com_shift` | bool | False | Append `_CoMEmbed` for zero-CoM subspace flows |
+| `base_params` | PyTree or None | None | Defaults to `base_dist.init_params()` |
+| `return_transform_only` | bool | False | Return `Bijection` instead of `Flow` |
+
+Identity-at-init holds for the learnable part: `SplitCoupling._patch_dense_out` zero-patches every conditioner's `dense_out`, so the couplings are identity on first forward. The only non-zero init log-det contribution is the constant `Rescale` term.
+
 ### Builder Options
 
 **Shared options** (both builders):
