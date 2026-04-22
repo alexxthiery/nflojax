@@ -20,10 +20,13 @@
   - `_params_per_scalar` / `_validate_boundary_slopes` helpers de-duplicating 6 sites.
   - Gate + context tests on `SplineCoupling` in circular mode.
   - `@requires_x64` skip marker covering 5 pre-existing float32-only round-trip failures.
-- **Stage A fully closed.** A1 (`Rescale`, `28b735f`), A3 (`Permutation` event_axis, Stage-0), A4 (context-type story, §5.2 contract narrowed), A2 (`CoMProjection`, Convention (1) zero log-det + `ambient_correction` helper).
+- **Stage A fully closed** (`2c94d18`). A1 (`Rescale`, `28b735f`), A3 (`Permutation` event_axis, Stage-0), A4 (context-type story, §5.2 contract narrowed), A2 (`CoMProjection`, Convention (1) zero log-det + `ambient_correction` helper).
+- **Stage B fully closed.** B1 (`UniformBox`), B4 (`utils/pbc.py`), B2 (`utils/lattice.py` — 5 generators), B3 (`LatticeBase` + 5 factories). New `nflojax/utils/` subdir.
 - Test infrastructure: `pytest-xdist` adopted as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`); AGENTS.md rewritten as a one-command "Testing Strategy". Landed `9ef1141`.
-- Full test suite (parallel): 428 passed / 6 skipped under float32 (~90s); 434 passed under `JAX_ENABLE_X64=1` (~99s). The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
+- Full test suite (parallel): **512 passed / 6 skipped under float32 (~90s); 518 passed under `JAX_ENABLE_X64=1` (~99s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
 - DESIGN.md checked in; `AGENTS.md` updated to point at it.
+
+**Next up — Stage C** (`embeddings.py`: `circular_embed`, `positional_embed`). Small, unblocked, single new file. Then Stage D (reference conditioners, with §10.4 / §10.5 to resolve in-task).
 
 Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
 
@@ -86,24 +89,28 @@ Bases and geometry helpers that unlock both solids and liquids. Files touched: `
 
 ### Tasks
 
-- [ ] **B1. `UniformBox(lower, upper, event_shape)`** per-axis uniform base.
-  - Scalar log-density `-log(prod(upper - lower))` broadcast over batch.
+- [x] **B1. `UniformBox(geometry, event_shape)`** per-axis uniform base.
+  - Scalar log-density `-event_factor * sum(log(box))` broadcast over batch; `-inf` for out-of-box `x`.
   - `sample(key, shape)` returns `shape + event_shape`.
   - Tests: sample lies in box, `log_prob` matches closed form, `sample_and_log_prob` consistency, jit.
-- [ ] **B2. Lattice generators** in `utils/lattice.py`.
+  - **Landed**: dataclass `UniformBox(geometry: Geometry, event_shape)` (consumes the Stage-0 `Geometry`); `event_factor = prod(event_shape[:-1])` accumulates the constant for rank-N events. 11 tests green under both dtypes.
+- [x] **B2. Lattice generators** in `utils/lattice.py`.
   - Pure functions returning `(N, 3)` lattice positions: `fcc`, `diamond`, `hex_ice`, `bcc`, `hcp`.
   - Each takes `n_cells` (int or tuple) and lattice constant(s).
   - Cross-reference `flows_for_atomic_solids/utils/lattice_utils.py` for shape + position agreement.
   - Tests: particle count matches expected, positions inside the claimed box, total volume correct.
-- [ ] **B3. `LatticeBase`** base distribution on top of the generators.
+  - **Landed**: numpy-backed pure functions; `cell_aspect("fcc")` etc. helper; `make_box(n_cells, a, cell_aspect)` factory for the matching `Geometry`. FCC parity check against the DM unit cell (sorted positions match `1e-12`). 32 tests green.
+- [x] **B3. `LatticeBase`** base distribution on top of the generators.
   - One class + five factory methods (`.fcc`, `.diamond`, `.hex_ice`, `.bcc`, `.hcp`).
   - Fields: positions, box, noise scale, optional spherical truncation, optional random permutation.
   - `log_prob` includes `-log N!` when `permute=True`.
   - Tests: `sample_and_log_prob` round-trip, permutation invariance of `log_prob` under `permute=True`, jit.
-- [ ] **B4. `utils/pbc.py`** orthogonal-box geometry.
+  - **Landed**: dataclass `LatticeBase(positions, geometry, noise_scale, permute=False)` + 5 `@classmethod` factories. `log_prob` is the labelled Gaussian centred at sites; with `permute=True`, sample shuffles the particle axis per-batch via `jax.vmap(jax.random.permutation)` and `log_prob` subtracts `log(N!)`. **Spherical truncation deferred** (PLAN.md follow-up). 27 tests green.
+- [x] **B4. `utils/pbc.py`** orthogonal-box geometry.
   - `nearest_image(dx, box)` — `dx - box * round(dx / box)`; box scalar or per-axis.
   - `pairwise_distance(x, box=None)` and `pairwise_distance_sq(x, box=None)` for `(..., N, d) → (..., N, N)`.
   - Tests: known configurations (two particles on diagonal, ring, lattice), box=None falls back to ordinary distance, jit.
+  - **Landed**: `nearest_image(dx, geometry)`, `pairwise_distance(x, geometry=None)`, `pairwise_distance_sq(x, geometry=None)` in `nflojax/utils/pbc.py`. Consumes `Geometry`; non-periodic axes (per `geometry.periodic`) pass through unchanged. 14 tests green.
 
 ### Acceptance
 
@@ -346,7 +353,7 @@ Items that need a decision before the relevant stage can close.
 
 - [ ] Branch strategy for Stages A–F. One branch `feature/particle-flow-framework`, or stage-per-branch? (Default: one long-lived branch, stage-per-commit.)
 - [x] `ShiftCenterOfMass` log-det convention: document as "zero on the (N−1)d subspace; caller is responsible for the embedding-space correction" vs. "constant $-d \log(N)/2$ correction baked in"? Pick when writing A2. **Resolved 2026-04-21: Convention (1) — zero log-det on the subspace; caller applies `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)` when an ambient density is needed. Rationale + full derivation in §11 decision log and `INTERNALS.md` "CoM Projection and the Volume Correction".**
-- [ ] `LatticeBase.hex_ice` unit-cell parameters: follow DM's convention (8 atoms per cell) or bgmat's (re-derive)? Likely DM.
+- [x] `LatticeBase.hex_ice` unit-cell parameters: follow DM's convention (8 atoms per cell) or bgmat's (re-derive)? Likely DM. **Resolved 2026-04-22: DM convention. 8 atoms per orthorhombic cell with `cell_aspect = (1, sqrt(3), sqrt(8/3))` and the puckering parameter `6 * 0.0625` baked in (matches `flows_for_atomic_solids/models/particle_models.py:HexagonalIceLattice`). Atom positions reproduced inline in `nflojax/utils/lattice.py` so the test suite is hermetic.**
 - [ ] `Transformer` attention norm placement: pre-norm (more stable for deeper stacks) vs. post-norm (closer to DM's original). Default: pre-norm; record the choice in INTERNALS.md.
 - [ ] GNN default `num_neighbours`: 12 (common) vs. 18 (bgmat). Ship 12; let apps override.
 
@@ -359,3 +366,4 @@ Items that need a decision before the relevant stage can close.
 - *2026-04-21* — Adopted `pytest-xdist` as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`; `pytest-xdist` added to test extras). Rewrote AGENTS.md Dev Commands as a one-command "Testing Strategy" (`pytest tests/` after edits, x64 at stage close). Full suite wall-clock: float32 6:28 → 1:25 (4.5×), x64 12:11 → 1:34 (7.8×). Rationale: cheap full suite removes the agent triage problem; a file→tests mapping would push judgement onto the agent, and agents get that wrong.
 - *2026-04-21* — Stage A4 closed via option (a): narrow the built-in contract, keep PyTree at the flow layer. DESIGN.md §5.2 now a two-tier contract (PyTree through flows, Array for built-in `MLP` and `_compute_gate_value`, any PyTree for custom conditioners). Option (b) rejected because target apps (DM, bgmat) bring their own conditioner anyway, so `ravel_pytree` + PyTree-aware batching in the common path would add complexity for no one. A new `TestCustomConditionerPyTreeContext` test in `tests/test_conditional_flow.py` exercises a dict-context conditioner end-to-end (round-trip + jit).
 - *2026-04-21* — Stage A2 closed; Stage A fully done. `CoMProjection` ships with **Convention (1)** log-det: the bijection is a relabelling between two `(N-1)d`-dim spaces (reduced Euclidean and zero-CoM subspace of `R^(Nd)`), so `log_det = 0` both directions. The volume-element constant relating the two embeddings is `(d/2)·log(N)` (derived from `det(I + 11^T) = N` for the parameterisation `x_N = -Σy_i`), exposed as `CoMProjection.ambient_correction(N, d)`. Convention (2) — baking the constant into the log-det — was rejected: it silently double-counts in the augmented-coupling composition (bgmat's pattern), where translation invariance is handled separately and densities are already ambient-valid. Explicit caller-applied correction keeps the two patterns cleanly separable. Heavy documentation placed at six contact points to prevent silent misuse: class docstring, REFERENCE.md decision box, USAGE.md recipe, EXTENDING.md "CoM handling" (with do-not-stack warning), INTERNALS.md derivation, AGENTS.md Gotcha.
+- *2026-04-22* — **Stage B closed.** Four tasks landing in one session: `UniformBox` (B1, per-axis uniform base on a `Geometry`), `utils/pbc.py` (B4, `nearest_image` + `pairwise_distance(_sq)` consuming `Geometry`), `utils/lattice.py` (B2, pure functions for `fcc / diamond / bcc / hcp / hex_ice` returning `(N, 3)` numpy positions), `LatticeBase` + 5 factories (B3). All consume the Stage-0 `Geometry` value object — no raw `lower/upper` alternatives. `LatticeBase.permute=True` shuffles particle order per-batch via `jax.vmap(jax.random.permutation)` and subtracts `log(N!)` from `log_prob`; the constant has the same caveats as `CoMProjection.ambient_correction` (no gradient effect, matters for absolute densities / ESS / `logZ`). §10.3 resolved with the DM `hex_ice` convention. New `nflojax/utils/` subdir; AGENTS.md dependency graph extended. 84 new tests, 5 minutes total session wall-clock for the Stage. Spherical truncation in `LatticeBase` deferred — no concrete trigger in v1.0 scope.

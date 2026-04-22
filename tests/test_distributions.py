@@ -6,7 +6,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from nflojax.distributions import StandardNormal, DiagNormal
+from nflojax.distributions import StandardNormal, DiagNormal, UniformBox, LatticeBase
+from nflojax.geometry import Geometry
 
 
 class TestStandardNormal:
@@ -336,3 +337,269 @@ class TestDistributionRepr:
         assert StandardNormal(dim=4) == StandardNormal(event_shape=(4,))
         assert DiagNormal(dim=4) == DiagNormal(event_shape=4)
         assert StandardNormal(event_shape=(8, 3)) != StandardNormal(event_shape=(3, 8))
+
+
+# ============================================================================
+# UniformBox (Stage B1)
+# ============================================================================
+class TestUniformBox:
+    """Per-axis uniform base distribution on `geometry.box`."""
+
+    def test_sample_shape_and_bounds_rank1(self):
+        """Rank-1 event: samples shape `(batch, d)` and lie inside the box."""
+        geom = Geometry(lower=[-2.0, -1.0, 0.0], upper=[3.0, 4.0, 5.0])
+        dist = UniformBox(geometry=geom, event_shape=(3,))
+        x = dist.sample(None, jax.random.PRNGKey(0), (200,))
+        assert x.shape == (200, 3)
+        lower = jnp.asarray(geom.lower)
+        upper = jnp.asarray(geom.upper)
+        assert bool(jnp.all(x >= lower))
+        assert bool(jnp.all(x <= upper))
+
+    def test_sample_shape_rank2_particle_event(self):
+        """Rank-2 event: samples shape `(batch, N, d)`; each particle per-axis in box."""
+        geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+        N = 8
+        dist = UniformBox(geometry=geom, event_shape=(N, 3))
+        x = dist.sample(None, jax.random.PRNGKey(0), (16,))
+        assert x.shape == (16, N, 3)
+        assert bool(jnp.all(x >= -1.0)) and bool(jnp.all(x <= 1.0))
+
+    def test_log_prob_closed_form_rank1(self):
+        """Constant log-density matches `-sum(log(box))`."""
+        geom = Geometry(lower=[-2.0, -1.0, 0.0], upper=[3.0, 4.0, 5.0])
+        dist = UniformBox(geometry=geom, event_shape=(3,))
+        box = jnp.asarray(geom.box)
+        expected = -jnp.sum(jnp.log(box))
+        x = dist.sample(None, jax.random.PRNGKey(0), (10,))
+        log_p = dist.log_prob(None, x)
+        assert log_p.shape == (10,)
+        assert jnp.allclose(log_p, expected)
+
+    def test_log_prob_scales_with_particle_count(self):
+        """Rank-2 event: log_prob = -N * sum(log(box))."""
+        geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+        N = 5
+        dist = UniformBox(geometry=geom, event_shape=(N, 3))
+        box = jnp.asarray(geom.box)
+        expected = -N * jnp.sum(jnp.log(box))
+        x = dist.sample(None, jax.random.PRNGKey(0), (4,))
+        log_p = dist.log_prob(None, x)
+        assert log_p.shape == (4,)
+        assert jnp.allclose(log_p, expected)
+
+    def test_log_prob_out_of_box_is_neg_inf(self):
+        """Samples outside the box get -inf log_prob."""
+        geom = Geometry.cubic(d=2, side=1.0, lower=0.0)  # [0, 1]^2
+        dist = UniformBox(geometry=geom, event_shape=(2,))
+        x = jnp.stack(
+            [
+                jnp.array([0.5, 0.5]),   # in
+                jnp.array([1.5, 0.5]),   # out (x>1)
+                jnp.array([-0.1, 0.5]),  # out (x<0)
+                jnp.array([0.5, 0.5]),   # in
+            ]
+        )
+        log_p = dist.log_prob(None, x)
+        assert log_p.shape == (4,)
+        assert jnp.isfinite(log_p[0])
+        assert jnp.isneginf(log_p[1])
+        assert jnp.isneginf(log_p[2])
+        assert jnp.isfinite(log_p[3])
+
+    def test_log_prob_at_box_edges_is_finite(self):
+        """The boundary [lower, upper] is inclusive."""
+        geom = Geometry.cubic(d=2, side=1.0, lower=0.0)
+        dist = UniformBox(geometry=geom, event_shape=(2,))
+        x = jnp.stack(
+            [
+                jnp.array([0.0, 0.0]),
+                jnp.array([1.0, 1.0]),
+                jnp.array([0.0, 1.0]),
+            ]
+        )
+        log_p = dist.log_prob(None, x)
+        assert bool(jnp.all(jnp.isfinite(log_p)))
+
+    def test_sample_and_log_prob_consistency(self):
+        """log_prob(sample(...)) is finite and constant."""
+        geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+        dist = UniformBox(geometry=geom, event_shape=(4, 3))
+        x = dist.sample(None, jax.random.PRNGKey(42), (64,))
+        log_p = dist.log_prob(None, x)
+        # All finite (samples are all in-box by construction).
+        assert bool(jnp.all(jnp.isfinite(log_p)))
+        # All equal (constant density).
+        assert jnp.allclose(log_p, log_p[0])
+
+    def test_jit(self):
+        """log_prob and sample compile under jit."""
+        geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+        dist = UniformBox(geometry=geom, event_shape=(3,))
+        sample = jax.jit(dist.sample, static_argnums=(2,))
+        log_prob = jax.jit(dist.log_prob)
+        x = sample(None, jax.random.PRNGKey(0), (10,))
+        log_p = log_prob(None, x)
+        assert x.shape == (10, 3)
+        assert log_p.shape == (10,)
+        assert bool(jnp.all(jnp.isfinite(log_p)))
+
+    def test_init_params_returns_none(self):
+        geom = Geometry.cubic(d=3)
+        dist = UniformBox(geometry=geom, event_shape=(3,))
+        assert dist.init_params() is None
+
+    def test_invalid_event_shape_raises(self):
+        """event_shape last axis must equal geometry.d."""
+        geom = Geometry.cubic(d=3)
+        with pytest.raises(ValueError, match="event_shape must end in the coord dim"):
+            UniformBox(geometry=geom, event_shape=(4, 2))
+        with pytest.raises(ValueError, match="event_shape must end in the coord dim"):
+            UniformBox(geometry=geom, event_shape=())
+
+    def test_invalid_geometry_raises(self):
+        """Non-Geometry raises."""
+        with pytest.raises(TypeError, match="geometry must be a Geometry instance"):
+            UniformBox(geometry="cube", event_shape=(3,))  # type: ignore[arg-type]
+
+
+# ============================================================================
+# LatticeBase (Stage B3)
+# ============================================================================
+import math as _math
+
+
+_FACTORIES = ("fcc", "diamond", "bcc", "hcp", "hex_ice")
+
+
+class TestLatticeBaseFactories:
+    """Smoke tests across all 5 named factories."""
+
+    @pytest.mark.parametrize("name", _FACTORIES)
+    def test_factory_shapes(self, name):
+        """LatticeBase.<name>(2, 1.0, 0.1) returns the expected (N, 3) event."""
+        lb = getattr(LatticeBase, name)(n_cells=2, a=1.0, noise_scale=0.1)
+        from nflojax.utils.lattice import ATOMS_PER_CELL
+        expected_n = 8 * ATOMS_PER_CELL[name]
+        assert lb.event_shape == (expected_n, 3)
+        assert lb.N == expected_n
+        assert lb.d == 3
+
+    @pytest.mark.parametrize("name", _FACTORIES)
+    def test_factory_geometry_extent(self, name):
+        """Geometry box matches `n_cells * a * cell_aspect`."""
+        from nflojax.utils.lattice import cell_aspect, make_box
+        lb = getattr(LatticeBase, name)(n_cells=2, a=1.5, noise_scale=0.1)
+        expected = make_box(2, 1.5, cell_aspect(name))
+        assert jnp.allclose(jnp.asarray(lb.geometry.box), expected, atol=1e-6)
+
+    @pytest.mark.parametrize("name", _FACTORIES)
+    def test_sample_then_log_prob_finite(self, name):
+        """sample(...) + log_prob round-trip is finite."""
+        lb = getattr(LatticeBase, name)(n_cells=2, a=1.0, noise_scale=0.1)
+        x = lb.sample(None, jax.random.PRNGKey(0), (4,))
+        assert x.shape == (4, lb.N, lb.d)
+        log_p = lb.log_prob(None, x)
+        assert log_p.shape == (4,)
+        assert bool(jnp.all(jnp.isfinite(log_p)))
+
+
+class TestLatticeBaseDensity:
+    """log_prob math, sampling stats, permutation correction."""
+
+    def test_log_prob_closed_form_at_lattice_sites(self):
+        """At x == positions: log_prob == -0.5*N*d*log(2π) - N*d*log(σ)."""
+        lb = LatticeBase.fcc(n_cells=1, a=1.0, noise_scale=0.2)
+        x = lb.positions[None, ...]   # (1, 4, 3)
+        nd = lb.N * lb.d
+        expected = -0.5 * nd * jnp.log(2 * jnp.pi) - nd * jnp.log(0.2)
+        log_p = lb.log_prob(None, x)
+        assert jnp.allclose(log_p[0], expected, atol=1e-5)
+
+    def test_permute_subtracts_log_n_factorial(self):
+        """log_prob with permute=True is the labelled value minus log(N!)."""
+        N = 4  # FCC n_cells=1 -> N=4.
+        lb_label = LatticeBase.fcc(n_cells=1, a=1.0, noise_scale=0.1, permute=False)
+        lb_perm = LatticeBase.fcc(n_cells=1, a=1.0, noise_scale=0.1, permute=True)
+        x = lb_label.sample(None, jax.random.PRNGKey(0), (8,))
+        log_label = lb_label.log_prob(None, x)
+        log_perm = lb_perm.log_prob(None, x)
+        expected_diff = -_math.lgamma(N + 1)
+        assert jnp.allclose(log_perm - log_label, expected_diff, atol=1e-5)
+
+    def test_sample_centred_on_lattice(self):
+        """Mean of sampled positions converges to lattice positions."""
+        lb = LatticeBase.fcc(n_cells=2, a=1.0, noise_scale=0.05)
+        x = lb.sample(None, jax.random.PRNGKey(0), (4096,))
+        mean = jnp.mean(x, axis=0)  # (N, d)
+        assert jnp.allclose(mean, lb.positions, atol=5e-3)
+
+    def test_sample_std_matches_noise_scale(self):
+        """Standard deviation of samples matches noise_scale."""
+        lb = LatticeBase.fcc(n_cells=2, a=1.0, noise_scale=0.05)
+        x = lb.sample(None, jax.random.PRNGKey(1), (4096,))
+        std = jnp.std(x, axis=0)  # (N, d)
+        assert jnp.allclose(std, 0.05, atol=5e-3)
+
+    def test_permute_sample_shuffles_particle_axis(self):
+        """With permute=True, the per-batch particle order is shuffled."""
+        lb_no = LatticeBase.fcc(n_cells=2, a=1.0, noise_scale=0.0001, permute=False)
+        lb_yes = LatticeBase.fcc(n_cells=2, a=1.0, noise_scale=0.0001, permute=True)
+        x_no = lb_no.sample(None, jax.random.PRNGKey(0), (32,))
+        x_yes = lb_yes.sample(None, jax.random.PRNGKey(0), (32,))
+        # Without permute: every batch sample's particles are in site order.
+        nearest_no = jnp.allclose(x_no, lb_no.positions, atol=5e-3)
+        assert nearest_no
+        # With permute: not equal to lattice (almost always shuffled).
+        nearest_yes = jnp.allclose(x_yes, lb_yes.positions, atol=5e-3)
+        assert not nearest_yes
+        # Sorted positions still match (permutation is the only change).
+        x_yes_sorted = jnp.sort(x_yes.reshape(32, -1), axis=-1)
+        x_no_sorted = jnp.sort(x_no.reshape(32, -1), axis=-1)
+        assert jnp.allclose(x_yes_sorted, x_no_sorted, atol=5e-3)
+
+
+class TestLatticeBaseValidation:
+    def test_non_geometry_raises(self):
+        with pytest.raises(TypeError, match="geometry must be a Geometry instance"):
+            LatticeBase(positions=jnp.zeros((4, 3)), geometry="cube",  # type: ignore[arg-type]
+                        noise_scale=0.1)
+
+    def test_positions_2d_required(self):
+        geom = Geometry(lower=[0., 0., 0.], upper=[1., 1., 1.])
+        with pytest.raises(ValueError, match="positions must be 2-D"):
+            LatticeBase(positions=jnp.zeros((4, 3, 1)), geometry=geom, noise_scale=0.1)
+
+    def test_positions_match_geometry_d(self):
+        geom = Geometry(lower=[0., 0., 0.], upper=[1., 1., 1.])  # d=3
+        with pytest.raises(ValueError, match="positions.shape\\[-1\\]"):
+            LatticeBase(positions=jnp.zeros((4, 2)), geometry=geom, noise_scale=0.1)
+
+    def test_noise_scale_positive(self):
+        geom = Geometry(lower=[0., 0., 0.], upper=[1., 1., 1.])
+        with pytest.raises(ValueError, match="noise_scale must be positive"):
+            LatticeBase(positions=jnp.zeros((4, 3)), geometry=geom, noise_scale=0.0)
+
+
+class TestLatticeBaseJit:
+    def test_log_prob_jit(self):
+        lb = LatticeBase.bcc(n_cells=2, a=1.0, noise_scale=0.1)
+        x = lb.sample(None, jax.random.PRNGKey(0), (4,))
+        log_prob_jit = jax.jit(lb.log_prob)
+        assert jnp.allclose(log_prob_jit(None, x), lb.log_prob(None, x), atol=1e-5)
+
+    def test_sample_jit_no_permute(self):
+        lb = LatticeBase.bcc(n_cells=2, a=1.0, noise_scale=0.1, permute=False)
+        sample_jit = jax.jit(lb.sample, static_argnums=(2,))
+        x_jit = sample_jit(None, jax.random.PRNGKey(0), (4,))
+        x_ref = lb.sample(None, jax.random.PRNGKey(0), (4,))
+        assert jnp.allclose(x_jit, x_ref, atol=1e-5)
+
+    def test_sample_jit_with_permute(self):
+        """permute=True path also compiles."""
+        lb = LatticeBase.bcc(n_cells=2, a=1.0, noise_scale=0.1, permute=True)
+        sample_jit = jax.jit(lb.sample, static_argnums=(2,))
+        x = sample_jit(None, jax.random.PRNGKey(0), (4,))
+        assert x.shape == (4, lb.N, lb.d)
+        log_p = lb.log_prob(None, x)
+        assert bool(jnp.all(jnp.isfinite(log_p)))

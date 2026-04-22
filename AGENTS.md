@@ -4,7 +4,12 @@ Project context for coding agents (Claude Code, Cursor, Copilot, etc.).
 
 ## Project Summary
 
-Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Not a pip package; clone and import directly.
+Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Particle-system toolkit (Stages A + B): `Geometry` value object, `Rescale` / `CircularShift` / `CoMProjection` bijections, `UniformBox` / `LatticeBase` (5 crystal factories) base distributions, and `utils/pbc` + `utils/lattice` helpers. Not a pip package; clone and import directly.
+
+For current stage status and what's next, read [PLAN.md §0](PLAN.md). For
+the design philosophy and what nflojax refuses to build, read
+[DESIGN.md](DESIGN.md). Before any change, run [Testing Strategy](#testing-strategy)
+checks.
 
 ## Philosophy
 
@@ -34,11 +39,15 @@ nflojax/
   builders.py          High-level constructors + assembly API
   flows.py             Flow and Bijection classes
   transforms.py        All transform types + CompositeTransform
-  distributions.py     StandardNormal, DiagNormal
+  distributions.py     StandardNormal, DiagNormal, UniformBox
   nets.py              MLP conditioner, ResNet init
   splines.py           Rational-quadratic spline primitives
   scalar_function.py   LOFT forward/inverse scalar functions
   geometry.py          Geometry value object (box bounds + per-axis periodicity)
+  utils/
+    __init__.py        empty
+    pbc.py             nearest_image, pairwise_distance(_sq) under PBC
+    lattice.py         fcc / diamond / bcc / hcp / hex_ice generators
 tests/
   conftest.py          Shared fixtures + check_logdet_vs_autodiff + requires_x64
   test_builders.py
@@ -48,16 +57,21 @@ tests/
   test_splines.py
   test_distributions.py
   test_nets.py
+  test_utils_pbc.py
+  test_utils_lattice.py
 ```
 
 ## Module Dependency Graph
 
 ```
-builders   -> flows, transforms, distributions, nets
-flows      -> transforms (gate), nets (types)
-transforms -> nets (MLP), splines, scalar_function, geometry
-geometry   -> numpy (no JAX / Flax — configuration values only)
-nets       -> flax.linen
+builders     -> flows, transforms, distributions, nets
+flows        -> transforms (gate), nets (types)
+transforms   -> nets (MLP), splines, scalar_function, geometry
+distributions -> geometry (UniformBox), nets (types)
+utils.pbc    -> geometry, nets (types)
+utils.lattice -> numpy (no JAX / Flax — static lattice positions)
+geometry     -> numpy (no JAX / Flax — configuration values only)
+nets         -> flax.linen
 ```
 
 ## Entry Points
