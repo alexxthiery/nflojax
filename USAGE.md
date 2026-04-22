@@ -361,6 +361,92 @@ equivariance profile; all three satisfy the same
 [REFERENCE.md#conditioners](REFERENCE.md#conditioners) for the constructor
 signatures.
 
+## Build a particle flow
+
+`build_particle_flow` composes `Rescale`, alternating-swap `SplitCoupling`
+pairs, `CircularShift`, and an optional `_CoMEmbed` shim into the canonical
+DM / bgmat topology. Pick a base (liquid or solid), pick a conditioner
+(flat or per-token), and pass a keyword-only factory.
+
+### Liquid: `UniformBox` base + `DeepSets`
+
+```python
+import jax
+from nflojax.builders import build_particle_flow
+from nflojax.distributions import UniformBox
+from nflojax.geometry import Geometry
+from nflojax.nets import DeepSets
+
+key = jax.random.PRNGKey(0)
+N, d = 32, 3
+geom = Geometry.cubic(d=d, side=2.0, lower=-1.0)
+
+flow, params = build_particle_flow(
+    key,
+    geometry=geom,
+    event_shape=(N, d),
+    num_layers=4,
+    conditioner=(lambda *, required_out_dim, **_: DeepSets(
+        phi_hidden=(64, 64), rho_hidden=(64,),
+        out_dim=required_out_dim,
+    )),
+    base_dist=UniformBox(geometry=geom, event_shape=(N, d)),
+    num_bins=8, tail_bound=5.0,
+)
+
+samples = flow.sample(params, key, (16,))           # (16, N, d)
+log_prob = flow.log_prob(params, samples)           # (16,)
+```
+
+### Solid: `LatticeBase.fcc` base + `Transformer` conditioner
+
+```python
+from nflojax.distributions import LatticeBase
+from nflojax.nets import Transformer
+
+lb = LatticeBase.fcc(n_cells=2, a=1.0, noise_scale=0.05)
+N = lb.positions.shape[0]       # 32 atoms for 2x2x2 FCC
+geom = lb.geometry
+
+flow, params = build_particle_flow(
+    key,
+    geometry=geom,
+    event_shape=(N, 3),
+    num_layers=4,
+    conditioner=(lambda *, out_per_particle, **_: Transformer(
+        num_layers=2, num_heads=4, embed_dim=64,
+        out_per_particle=out_per_particle,
+    )),
+    base_dist=lb,
+    num_bins=8, tail_bound=5.0,
+)
+
+samples = flow.sample(params, key, (16,))           # (16, N, 3)
+```
+
+For a zero-CoM subspace flow (translation-invariant target), set
+`use_com_shift=True` and provide a base on `(N-1, d)`. The simplest
+`(N-1, d)` base is `UniformBox(geometry, event_shape=(N-1, d))`; shipping
+a `LatticeBase`-on-`(N-1, d)` requires picking which site to drop, which
+is application-specific. Remember `CoMProjection.ambient_correction(N, d)
+= (d/2)·log(N)` if you need an ambient log-density (importance weights,
+ESS, `logZ`); gradient training is invariant to the constant.
+
+The factory's kwargs are computed per-layer from `event_shape`, `d`,
+`num_bins`, and `boundary_slopes`:
+
+- `required_out_dim = N_transformed * d * params_per_scalar` — used by
+  flat-output conditioners (`DeepSets`).
+- `out_per_particle = d * params_per_scalar` — used by per-token
+  conditioners (`Transformer`, `GNN`). Per-token conditioners require
+  `N_frozen == N_transformed` (even `N_eff`).
+- `n_frozen` — optional; useful for user conditioners that shape context
+  per frozen particle.
+
+Absorb the unused kwargs with `**_`. For the full signature and the
+`use_com_shift` semantics, see
+[REFERENCE.md#build_particle_flow](REFERENCE.md#build_particle_flow).
+
 ## Particle bases
 
 For `(N, d)` particle events the base distribution lives on the particle
