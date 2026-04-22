@@ -517,6 +517,44 @@ warning.
 - **Relative density within one flow** (ratios, conditional quantities):
   cancels; no correction needed.
 
+## Transformer conditioner: pre-norm choice
+
+`nflojax.nets.Transformer` uses the pre-norm residual layout
+
+```
+h = h + attn(LayerNorm(h))
+h = h + ffn(LayerNorm(h))
+```
+
+with a final `LayerNorm` before `dense_out`. This resolves PLAN.md §10.4.
+
+**Pre-norm vs post-norm.** The original "Attention Is All You Need" paper
+used the post-norm layout `LayerNorm(h + sublayer(h))`. Post-norm routes
+the residual branch *through* the normalization, which gives signal in
+the very first training steps (every layer's contribution reaches the
+output scaled to unit variance) but makes gradient magnitudes collapse
+as depth grows — deeper stacks require a long warm-up schedule and are
+notoriously harder to train. Pre-norm applies normalization on the
+branch *before* the residual addition, so the identity path through the
+residual sum is never renormalized. The gradient of the loss at any
+depth has a direct path to every layer. Pre-norm stacks train stably
+with standard learning rates up to at least 48 layers and are the
+modern default (GPT, Llama, PaLM, ViT).
+
+**Why it matters here.** We start with `dense_out` zeroed, so at init
+the whole attention stack is a no-op on the output (identity flow). But
+during training, gradient updates propagate back through every attention
+layer. With post-norm, the early training signal into deeper layers can
+vanish; pre-norm gives every layer a clean gradient path. For the small
+stacks nflojax ships against (≤ 8 layers in typical particle flows),
+both would work, but pre-norm removes the warm-up requirement and is
+easier for downstream apps to tune. The deeper DM-style atomic-solid
+flows (16+ coupling blocks × 2–4 attention layers each) prefer
+pre-norm's stability margin.
+
+**Background.** See Xiong et al. (2020), "On Layer Normalization in the
+Transformer Architecture" (§ref 6) for the depth-stability argument.
+
 ## References
 
 1. Dinh, L., Sohl-Dickstein, J., and Bengio, S. (2017). "Density estimation using Real-NVP." ICLR.
@@ -528,3 +566,5 @@ warning.
 4. Andrade, D. (2021). "Stable Training of Normalizing Flows for High-dimensional Variational Inference."
 
 5. Papamakarios, G., Nalisnick, E., Rezende, D.J., Mohamed, S., and Lakshminarayanan, B. (2021). "Normalizing Flows for Probabilistic Modeling and Inference." JMLR.
+
+6. Xiong, R., Yang, Y., He, D., Zheng, K., Zheng, S., Xing, C., Zhang, H., Lan, Y., Wang, L., and Liu, T.Y. (2020). "On Layer Normalization in the Transformer Architecture." ICML.

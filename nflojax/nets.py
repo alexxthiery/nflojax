@@ -4,8 +4,8 @@ Neural network modules for normalizing flow conditioners.
 
 Conditioner Interface
 ---------------------
-Conditioners used with coupling layers (AffineCoupling, SplineCoupling) should
-implement the following interface:
+Conditioners used with coupling layers (`AffineCoupling`, `SplineCoupling`,
+`SplitCoupling`) should implement the following interface:
 
 Required:
     - ``apply({"params": params}, x, context) -> output`` (Flax convention)
@@ -16,23 +16,43 @@ Optional (enables automatic output layer initialization):
     - ``set_output_layer(params, kernel, bias) -> params``
 
 If the optional methods are present, coupling layers will automatically
-zero-initialize (AffineCoupling) or identity-initialize (SplineCoupling)
-the output layer for stable training. If missing, AffineCoupling skips
-auto-init; SplineCoupling raises an error.
+zero-initialize (`AffineCoupling`) or identity-initialize (`SplineCoupling`,
+`SplitCoupling`) the output layer for stable training. If missing,
+`AffineCoupling` skips auto-init; the spline couplings raise an error.
 
-The built-in MLP and ResNet classes implement the full interface.
+Identity init infers the bias length from the conditioner's `dense_out`
+and sizes `identity_spline_bias` to match, so both flat-output conditioners
+(`MLP`, bias of size `num_scalars · params_per_scalar`) and per-token
+conditioners (`Transformer`, `GNN`, bias of size `d · params_per_scalar`)
+plug in with the same trivial `set_output_layer`.
+
+The built-in `MLP` + `ResNet` (flat) and `DeepSets` / `Transformer` / `GNN`
+(structured, use with `SplitCoupling(flatten_input=False)`) all implement
+the full interface.
 """
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Callable, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from .geometry import Geometry
+from .utils.pbc import pairwise_distance_sq
+
 
 Array = jnp.ndarray
 PRNGKey = jax.Array  # type alias for JAX random keys
+
+
+# Module-level helper used by GNN to gather per-particle neighbour features
+# without vmapping the caller. `signature="(n,h),(n,k)->(n,k,h)"` makes it
+# batch-polymorphic over any leading axes.
+_gather_neighbours = jnp.vectorize(
+    lambda h_row, i_row: jnp.take(h_row, i_row, axis=0),
+    signature="(n,h),(n,k)->(n,k,h)",
+)
 
 
 def validate_conditioner(conditioner, name: str = "conditioner") -> None:
@@ -383,3 +403,406 @@ def init_resnet(
         params = resnet.set_output_layer(params, kernel, bias)
 
     return resnet, params
+
+
+# ===================================================================
+# DeepSets: permutation-invariant conditioner for particle-axis events
+# ===================================================================
+# Classic Deep Sets (Zaheer et al., 2017). phi is a per-particle MLP
+# applied with shared weights over the particle axis; sum-pool over
+# particles yields a permutation-invariant feature; rho then maps it to
+# the flow-level output. Intended for use with SplitCoupling when
+# flatten_input=False so the particle axis is visible to phi.
+class DeepSets(nn.Module):
+    """
+    Permutation-invariant conditioner for particle-axis events.
+
+    Architecture:
+      1. (optional) Broadcast `context` across the particle axis and
+         concatenate into each per-particle feature vector.
+      2. phi: a Dense stack applied per-particle with shared weights.
+      3. Sum-pool over the particle axis.
+      4. rho: a Dense stack on the pooled feature.
+      5. dense_out: final Dense(out_dim); the layer that
+         `SplitCoupling.init_params` zeroes and patches with
+         `identity_spline_bias`.
+
+    Output is permutation-invariant with respect to the input particle
+    axis because step 3 is a commutative reduction.
+
+    Input shape:  `(*batch, N, in_dim)` when used with
+      `SplitCoupling(flatten_input=False)` on a `(*batch, N, d)` event.
+      The per-particle feature width is inferred from `x.shape[-1]` on
+      first call; there is no `in_dim` constructor argument.
+
+    Output shape: `(*batch, out_dim)`, where `out_dim` is a flat size
+      chosen by the caller (typically `N_transformed * d * (3K - 1)`
+      for a spline coupling with K bins).
+
+    Attributes:
+      phi_hidden: Hidden widths for the per-particle stack. The last
+        entry is the per-particle feature width fed to the sum-pool.
+      rho_hidden: Hidden widths for the pooled stack. Empty tuple
+        skips rho and feeds the pooled features directly to
+        `dense_out`.
+      out_dim: Total flat output size.
+      context_dim: Context width (0 for unconditional). Context is
+        broadcast across the particle axis.
+      activation: Activation between Dense layers (default: elu).
+    """
+    phi_hidden: Sequence[int]
+    rho_hidden: Sequence[int]
+    out_dim: int
+    context_dim: int = 0
+    activation: Callable[[Array], Array] = nn.elu
+
+    @nn.compact
+    def __call__(self, x: Array, context: Array | None = None) -> Array:
+        if x.ndim < 2:
+            raise ValueError(
+                f"DeepSets expects input with rank >= 2 "
+                f"(a particle axis is required); got shape {x.shape}."
+            )
+
+        if context is not None and self.context_dim == 0:
+            raise ValueError(
+                "context was passed but context_dim=0. "
+                "Set context_dim to match your context features."
+            )
+        if context is None and self.context_dim > 0:
+            raise ValueError(
+                f"context_dim={self.context_dim} but context was not passed."
+            )
+        if context is not None and self.context_dim > 0:
+            if context.shape[-1] != self.context_dim:
+                raise ValueError(
+                    f"DeepSets expected context with last dim {self.context_dim}, "
+                    f"got {context.shape[-1]}."
+                )
+            # Broadcast across the particle axis so phi sees it per-token.
+            # x is (*batch, N, in_dim); target context shape: (*batch, N, context_dim).
+            target_shape = x.shape[:-1] + (self.context_dim,)
+            ctx = jnp.broadcast_to(context[..., None, :], target_shape) \
+                if context.ndim == x.ndim - 1 \
+                else jnp.broadcast_to(context, target_shape)
+            h = jnp.concatenate([x, ctx], axis=-1)
+        else:
+            h = x
+
+        # phi: per-particle stack with shared weights over the particle axis.
+        for i, width in enumerate(self.phi_hidden):
+            h = nn.Dense(width, name=f"phi_{i}")(h)
+            h = self.activation(h)
+
+        # Permutation-invariant pooling.
+        h = jnp.sum(h, axis=-2)
+
+        # rho: stack on the pooled feature.
+        for i, width in enumerate(self.rho_hidden):
+            h = nn.Dense(width, name=f"rho_{i}")(h)
+            h = self.activation(h)
+
+        return nn.Dense(self.out_dim, name="dense_out")(h)
+
+    def get_output_layer(self, params: dict) -> dict:
+        return params["dense_out"]
+
+    def set_output_layer(self, params: dict, kernel: Array, bias: Array) -> dict:
+        new_params = dict(params)
+        new_params["dense_out"] = {"kernel": kernel, "bias": bias}
+        return new_params
+
+
+def init_conditioner(
+    key: PRNGKey,
+    conditioner,
+    dummy_x: Array,
+    dummy_context: Array | None = None,
+) -> dict:
+    """Init a conditioner and zero its `dense_out` for an identity-start flow.
+
+    Works with any conditioner implementing the optional half of the
+    conditioner contract (`get_output_layer` / `set_output_layer`). For a
+    conditioner plugged into `SplitCoupling` you do not need this — the
+    coupling's `init_params` handles init and identity patching on its own.
+    Use this helper when you want a pre-initialised conditioner standalone,
+    or when writing a test that exercises the conditioner outside a coupling.
+
+    Arguments:
+        key: PRNG key.
+        conditioner: Flax `nn.Module` satisfying the conditioner contract.
+        dummy_x: Example input tensor; its leading axes may be any batch
+            shape (e.g. `(1, d)` for flat MLP input, `(1, N, d)` for
+            structured particle input).
+        dummy_context: Example context tensor, or `None` for unconditional.
+
+    Returns:
+        Params PyTree with `dense_out` kernel and bias zeroed.
+    """
+    variables = conditioner.init(key, dummy_x, dummy_context)
+    params = variables.get("params", {})
+    out = conditioner.get_output_layer(params)
+    return conditioner.set_output_layer(
+        params, jnp.zeros_like(out["kernel"]), jnp.zeros_like(out["bias"])
+    )
+
+
+# ===================================================================
+# Transformer: permutation-equivariant self-attention conditioner
+# ===================================================================
+# Pre-norm stack of multi-head self-attention + feed-forward blocks.
+# Fully connected attention (no mask) because the particle set is small
+# and dense interactions are the whole point. The output is per-token,
+# so when used with SplitCoupling(flatten_input=False) and N_frozen ==
+# N_transformed (the half-half split), the coupling-level mapping
+# input-particle -> output-particle is permutation-equivariant.
+#
+# §10.4 decision: pre-norm (`h = h + attn(LayerNorm(h))`). More stable
+# for deep stacks than the original "Attention Is All You Need" post-norm
+# layout; see INTERNALS.md.
+class Transformer(nn.Module):
+    """
+    Permutation-equivariant self-attention conditioner.
+
+    Architecture (pre-norm):
+      1. `input_proj`: Dense(embed_dim) applied per-particle.
+      2. (optional) Broadcast-add a learned context projection to every
+         token.
+      3. For each of `num_layers` blocks:
+           h = h + SelfAttention(LayerNorm(h))
+           h = h + FFN(LayerNorm(h))
+         where FFN = Dense(ffn_multiplier * embed_dim) -> gelu ->
+         Dense(embed_dim).
+      4. Final LayerNorm.
+      5. `dense_out`: per-token Dense(out_per_particle); caller reshapes.
+
+    Permutation equivariance. Attention, LayerNorm, and per-token Dense
+    layers all commute with particle-axis permutations. Shuffling the
+    input along the particle axis shuffles the output the same way.
+
+    Output shape: `(*batch, N, out_per_particle)`. When used with
+    `SplitCoupling(flatten_input=False)` and `N_frozen == N_transformed`
+    (the half-half split), set `out_per_particle = d * params_per_scalar`
+    so the total trailing size matches `required_out_dim`.
+
+    Attributes:
+      num_layers: Stacked attention/FFN block count.
+      num_heads: Heads in multi-head self-attention; must divide
+        `embed_dim`.
+      embed_dim: Token feature width.
+      out_per_particle: Output width for each particle (e.g.,
+        `d * (3K-1)` for a linear-tails spline with K bins).
+      ffn_multiplier: FFN hidden width = `ffn_multiplier * embed_dim`
+        (default 4, standard Transformer).
+      context_dim: Context width (0 for unconditional). Context is
+        projected to `embed_dim` and broadcast-added to every token.
+    """
+    num_layers: int
+    num_heads: int
+    embed_dim: int
+    out_per_particle: int
+    ffn_multiplier: int = 4
+    context_dim: int = 0
+
+    @nn.compact
+    def __call__(self, x: Array, context: Array | None = None) -> Array:
+        if x.ndim < 2:
+            raise ValueError(
+                f"Transformer expects input with rank >= 2 "
+                f"(a particle axis is required); got shape {x.shape}."
+            )
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError(
+                f"Transformer.embed_dim={self.embed_dim} must be divisible "
+                f"by num_heads={self.num_heads}."
+            )
+
+        if context is not None and self.context_dim == 0:
+            raise ValueError(
+                "context was passed but context_dim=0. "
+                "Set context_dim to match your context features."
+            )
+        if context is None and self.context_dim > 0:
+            raise ValueError(
+                f"context_dim={self.context_dim} but context was not passed."
+            )
+
+        h = nn.Dense(self.embed_dim, name="input_proj")(x)
+
+        if context is not None and self.context_dim > 0:
+            if context.shape[-1] != self.context_dim:
+                raise ValueError(
+                    f"Transformer expected context with last dim "
+                    f"{self.context_dim}, got {context.shape[-1]}."
+                )
+            c = nn.Dense(self.embed_dim, name="context_proj")(context)
+            if c.ndim == h.ndim - 1:
+                c = c[..., None, :]
+            c = jnp.broadcast_to(c, h.shape)
+            h = h + c
+
+        for i in range(self.num_layers):
+            h_norm = nn.LayerNorm(name=f"ln_attn_{i}")(h)
+            # Self-attention: pass `h_norm` as `inputs_q`; the module reuses it
+            # as keys/values when `inputs_kv` is omitted.
+            attn_out = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                qkv_features=self.embed_dim,
+                out_features=self.embed_dim,
+                use_bias=True,
+                name=f"attn_{i}",
+            )(h_norm)
+            h = h + attn_out
+            h_norm = nn.LayerNorm(name=f"ln_ffn_{i}")(h)
+            h2 = nn.Dense(self.ffn_multiplier * self.embed_dim,
+                          name=f"ffn_in_{i}")(h_norm)
+            h2 = nn.gelu(h2)
+            h2 = nn.Dense(self.embed_dim, name=f"ffn_out_{i}")(h2)
+            h = h + h2
+
+        h = nn.LayerNorm(name="ln_final")(h)
+        return nn.Dense(self.out_per_particle, name="dense_out")(h)
+
+    def get_output_layer(self, params: dict) -> dict:
+        return params["dense_out"]
+
+    def set_output_layer(self, params: dict, kernel: Array, bias: Array) -> dict:
+        new_params = dict(params)
+        new_params["dense_out"] = {"kernel": kernel, "bias": bias}
+        return new_params
+
+
+# ===================================================================
+# GNN: permutation-equivariant message-passing conditioner
+# ===================================================================
+# Per-forward top-`num_neighbours` edges under orthogonal-box PBC (via
+# nflojax.utils.pbc.pairwise_distance). Messages are MLPs over
+# [node_i, node_j, distance_ij]; aggregation is sum over neighbours;
+# node update is a residual MLP. Output is per-token — equivariance
+# story identical to `Transformer`.
+#
+# §10.5 decision: default `num_neighbours=12`. Applications (bgmat
+# uses 18) override via the constructor.
+class GNN(nn.Module):
+    """
+    Permutation-equivariant message-passing conditioner.
+
+    Architecture:
+      1. `embed`: Dense(hidden) applied per-particle.
+      2. (optional) Context broadcast-added to each node (projected to
+         `hidden`).
+      3. Per-forward neighbour list: top-`num_neighbours` nearest
+         particles (excluding self) by squared distance. Orthogonal-box
+         PBC when `geometry` is provided.
+      4. For each of `num_layers` blocks:
+           msg = Dense -> activation -> Dense over [h_i, h_j, d_ij]
+           agg = sum over the neighbour axis
+           h   = h + Dense -> activation -> Dense over [h, agg]
+      5. `dense_out`: per-token Dense(out_per_particle).
+
+    Permutation equivariance. Sum aggregation, per-token Dense, and the
+    symmetric neighbour list all commute with particle-axis permutations.
+
+    Output shape: `(*batch, N, out_per_particle)`. Use with
+    `SplitCoupling(flatten_input=False)` and half-half split.
+
+    Attributes:
+      num_layers: Message-passing depth.
+      hidden: Node feature width.
+      out_per_particle: Output width per particle.
+      num_neighbours: K nearest neighbours per forward. Default 12.
+      cutoff: Optional distance cutoff; messages from neighbours farther
+        than `cutoff` are zero-weighted. `None` keeps all K neighbours.
+      geometry: Optional `Geometry` for PBC minimum-image distances.
+        `None` uses plain Euclidean distances.
+      context_dim: Context width (0 for unconditional).
+      activation: Activation inside message and update MLPs.
+    """
+    num_layers: int
+    hidden: int
+    out_per_particle: int
+    num_neighbours: int = 12
+    cutoff: float | None = None
+    geometry: Geometry | None = None
+    context_dim: int = 0
+    activation: Callable[[Array], Array] = nn.silu
+
+    @nn.compact
+    def __call__(self, x: Array, context: Array | None = None) -> Array:
+        if x.ndim < 2:
+            raise ValueError(
+                f"GNN expects input with rank >= 2; got shape {x.shape}."
+            )
+        N = x.shape[-2]
+        K = int(self.num_neighbours)
+        if K >= N:
+            raise ValueError(
+                f"GNN.num_neighbours={K} must be < N={N} "
+                f"(self-edges are excluded)."
+            )
+
+        if context is not None and self.context_dim == 0:
+            raise ValueError(
+                "context was passed but context_dim=0. "
+                "Set context_dim to match your context features."
+            )
+        if context is None and self.context_dim > 0:
+            raise ValueError(
+                f"context_dim={self.context_dim} but context was not passed."
+            )
+
+        h = nn.Dense(self.hidden, name="embed")(x)
+
+        if context is not None and self.context_dim > 0:
+            if context.shape[-1] != self.context_dim:
+                raise ValueError(
+                    f"GNN expected context with last dim {self.context_dim}, "
+                    f"got {context.shape[-1]}."
+                )
+            c = nn.Dense(self.hidden, name="context_proj")(context)
+            if c.ndim == h.ndim - 1:
+                c = c[..., None, :]
+            c = jnp.broadcast_to(c, h.shape)
+            h = h + c
+
+        # Per-forward neighbour list. Remove self-edges by pinning the diagonal
+        # to +inf BEFORE top_k. Do NOT use `jnp.eye(N) * jnp.inf`: that gives
+        # `0 * inf = NaN` off-diagonal and silently poisons the neighbour list.
+        d_sq = pairwise_distance_sq(x, self.geometry)
+        eye_bool = jnp.eye(N, dtype=bool)
+        d_sq_no_self = jnp.where(eye_bool, jnp.inf, d_sq)
+        neg_topk, idx_topk = jax.lax.top_k(-d_sq_no_self, K)  # (..., N, K)
+        d_nearest = jnp.sqrt(jnp.maximum(-neg_topk, 0.0))      # (..., N, K)
+
+        for layer_idx in range(self.num_layers):
+            neighbours = _gather_neighbours(h, idx_topk)            # (..., N, K, H)
+            node_i = jnp.broadcast_to(h[..., :, None, :], neighbours.shape)
+            msg_inp = jnp.concatenate(
+                [node_i, neighbours, d_nearest[..., None]], axis=-1
+            )
+            msg = nn.Dense(self.hidden, name=f"msg_in_{layer_idx}")(msg_inp)
+            msg = self.activation(msg)
+            msg = nn.Dense(self.hidden, name=f"msg_out_{layer_idx}")(msg)
+
+            if self.cutoff is not None:
+                cutoff_mask = (d_nearest < float(self.cutoff))[..., None]
+                msg = msg * cutoff_mask.astype(msg.dtype)
+
+            agg = jnp.sum(msg, axis=-2)                              # (..., N, H)
+            upd_inp = jnp.concatenate([h, agg], axis=-1)
+            upd = nn.Dense(self.hidden, name=f"upd_in_{layer_idx}")(upd_inp)
+            upd = self.activation(upd)
+            upd = nn.Dense(self.hidden, name=f"upd_out_{layer_idx}")(upd)
+            h = h + upd
+
+        return nn.Dense(self.out_per_particle, name="dense_out")(h)
+
+    def get_output_layer(self, params: dict) -> dict:
+        return params["dense_out"]
+
+    def set_output_layer(self, params: dict, kernel: Array, bias: Array) -> dict:
+        new_params = dict(params)
+        new_params["dense_out"] = {"kernel": kernel, "bias": bias}
+        return new_params
+
+

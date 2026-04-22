@@ -369,11 +369,31 @@ coupling, params = SplitCoupling.create(
 | `activation` | callable | `nn.elu` | MLP activation function |
 | `res_scale` | float | `0.1` | Residual connection scale |
 
+**Direct construction** (for non-MLP conditioners such as `DeepSets`, `Transformer`, `GNN`):
+
+```python
+coupling = SplitCoupling(
+    event_shape=(N, d), split_axis=-2, split_index=N // 2,
+    event_ndims=2, conditioner=my_conditioner,
+    num_bins=K, flatten_input=False,   # False = conditioner sees (*batch, N_frozen, d)
+)
+params = coupling.init_params(key)
+```
+
+The additional field `flatten_input: bool = True` selects the conditioner input contract:
+
+| `flatten_input` | Conditioner input shape | When to use |
+|-----------------|-------------------------|-------------|
+| `True` (default) | `(*batch, frozen_flat)` | Flat-input conditioners: `MLP`, any custom Dense-only network. Matches the contract `SplitCoupling.create()` assumes. |
+| `False` | `(*batch, *frozen_shape)` (structured) | Permutation-aware conditioners: `DeepSets`, `Transformer`, `GNN`. Required to preserve the particle axis. |
+
+The output-side reshape only depends on total element count, so the conditioner may emit either a flat `(*batch, transformed_flat * (3K - 1))` or a structured `(*batch, *transformed_shape, 3K - 1)` tensor of the same total size — both unflatten correctly.
+
 **Params dict:**
 
 | Key | Shape | Description |
 |-----|-------|-------------|
-| `"mlp"` | PyTree | Flax params for conditioner MLP (output dim = `transformed_flat * (3K - 1)`) |
+| `"mlp"` | PyTree | Flax params for conditioner (output dim = `transformed_flat * (3K - 1)`) |
 
 Where `transformed_flat = prod(event_shape) * (axis_size - split_index) / axis_size` (or the swapped complement).
 
@@ -682,6 +702,117 @@ params = [params1, params2, params3]  # list matching block order
 **Params:** A list of per-block param dicts, one per block in the same order as `blocks`.
 
 **Rank-polymorphic:** `CompositeTransform` works with any event rank. It initializes the log-det accumulator as a scalar zero and lets each block's log-det broadcast up to its own batch shape. This means a `CompositeTransform([SplitCoupling(...), SplitCoupling(...)])` on a rank-3 event returns `log_det` of shape `batch`, same as rank-1.
+
+## Conditioners
+
+Reference neural modules for coupling layers. All satisfy the contract in `nflojax/nets.py` (see [DESIGN.md §5.4](DESIGN.md#54-conditioner-contract)): a Flax `nn.Module` with `context_dim: int`, `apply({"params": params}, x, context=None)`, `get_output_layer(params)`, `set_output_layer(params, kernel, bias)`.
+
+Importable names: `MLP`, `ResNet`, `DeepSets`, `Transformer`, `GNN` (modules); `init_mlp`, `init_resnet` (full-featured builders for the flat MLP path kept for the pre-Stage-D builders); and `init_conditioner` (generic helper that calls `module.init` and zeroes `dense_out` for any module satisfying the optional half of the contract). When wiring a conditioner into `SplitCoupling`, you do not need `init_conditioner` — the coupling's `init_params` handles init and identity patching.
+
+| Conditioner | Equivariance | Input contract | Use with |
+|-------------|--------------|----------------|----------|
+| `MLP` | none (fully connected) | flat `(*batch, x_dim)` | `SplineCoupling`, `AffineCoupling`, or `SplitCoupling(flatten_input=True)` (default) |
+| `DeepSets` | permutation-**invariant** | structured `(*batch, N, in_dim)` | `SplitCoupling(flatten_input=False)` |
+| `Transformer` | permutation-**equivariant** (per-token output) | structured `(*batch, N, in_dim)` | `SplitCoupling(flatten_input=False)`; the per-token output lines up with the transformed particles only when `N_frozen == N_transformed` (the default half-half split). Asymmetric splits still work, but coupling-level equivariance is lost. |
+| `GNN` | permutation-**equivariant** (per-token output) | structured `(*batch, N, in_dim)` | `SplitCoupling(flatten_input=False)` |
+
+### DeepSets
+
+```python
+from nflojax.nets import DeepSets
+from nflojax.transforms import SplitCoupling
+
+ds = DeepSets(
+    phi_hidden=(64, 64), rho_hidden=(64,),
+    out_dim=N_transformed * d * (3 * K - 1),
+    context_dim=0,
+)
+coupling = SplitCoupling(
+    event_shape=(N, d), split_axis=-2, split_index=N // 2, event_ndims=2,
+    conditioner=ds, num_bins=K, flatten_input=False,
+)
+params = coupling.init_params(key)
+
+# Or standalone (no coupling): use `init_conditioner` to get a zero'd dense_out.
+from nflojax.nets import init_conditioner
+ds_params = init_conditioner(key, ds, jnp.zeros((1, N_frozen, d)))
+```
+
+**Architecture:** per-particle `phi` MLP → sum-pool over the particle axis → `rho` MLP → `dense_out`. Permutation-invariant because sum is symmetric.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `phi_hidden` | tuple of int | Hidden widths for the shared per-particle stack |
+| `rho_hidden` | tuple of int | Hidden widths for the pooled stack (empty tuple skips) |
+| `out_dim` | int | Total flat output size (typically `N_transformed · d · (3K − 1)`) |
+| `context_dim` | int | 0 for unconditional; context is broadcast across the particle axis |
+| `activation` | callable | Default `nn.elu` |
+
+**Params dict:** `{"phi_0": …, "phi_1": …, …, "rho_0": …, …, "dense_out": {"kernel", "bias"}}`.
+
+### Transformer
+
+```python
+from nflojax.nets import Transformer
+from nflojax.transforms import SplitCoupling
+
+t = Transformer(
+    num_layers=4, num_heads=4, embed_dim=64,
+    out_per_particle=d * (3 * K - 1),
+    ffn_multiplier=4, context_dim=0,
+)
+coupling = SplitCoupling(
+    event_shape=(N, d), split_axis=-2, split_index=N // 2, event_ndims=2,
+    conditioner=t, num_bins=K, flatten_input=False,
+)
+params = coupling.init_params(key)
+```
+
+**Architecture (pre-norm, resolved in PLAN.md §10.4):** per-particle `input_proj` → `L × [attn(LN(h)) + ffn(LN(h))]` with residual connections → final `LN` → per-token `dense_out`. Output shape `(*batch, N, out_per_particle)`. Equivariance holds per-token.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `num_layers` | int | Attention/FFN block count |
+| `num_heads` | int | Must divide `embed_dim` |
+| `embed_dim` | int | Token feature width |
+| `out_per_particle` | int | Per-particle output; `d · (3K − 1)` for a spline coupling |
+| `ffn_multiplier` | int | FFN hidden width = `ffn_multiplier · embed_dim` (default 4) |
+| `context_dim` | int | 0 for unconditional; context projected to `embed_dim` and broadcast-added to every token |
+
+### GNN
+
+```python
+from nflojax.nets import GNN
+from nflojax.geometry import Geometry
+from nflojax.transforms import SplitCoupling
+
+geom = Geometry.cubic(d=3, side=2.0)
+gnn = GNN(
+    num_layers=3, hidden=64,
+    out_per_particle=3 * (3 * K - 1),
+    num_neighbours=12, cutoff=None, geometry=geom,
+)
+coupling = SplitCoupling(
+    event_shape=(N, 3), split_axis=-2, split_index=N // 2, event_ndims=2,
+    conditioner=gnn, num_bins=K, flatten_input=False,
+)
+params = coupling.init_params(key)
+```
+
+**Architecture:** per-particle `embed` → for each layer, compute the top-`num_neighbours` neighbour list via `nflojax.utils.pbc.pairwise_distance_sq(x, geometry)` and `jax.lax.top_k(-d_sq)` (self-edge pinned to +∞ via `jnp.where`), run a message MLP over `[h_i, h_j, d_ij]`, sum-aggregate, residual node update → per-token `dense_out`. Equivariance holds per-token.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `num_layers` | int | required | Message-passing depth |
+| `hidden` | int | required | Node feature width |
+| `out_per_particle` | int | required | Per-particle output |
+| `num_neighbours` | int | `12` | K nearest neighbours per forward (resolved in PLAN.md §10.5; apps may override) |
+| `cutoff` | float \| None | `None` | If set, messages from neighbours with distance ≥ `cutoff` are zero-weighted |
+| `geometry` | `Geometry` \| None | `None` | `None` → Euclidean distances; `Geometry` → PBC minimum-image |
+| `context_dim` | int | `0` | 0 for unconditional |
+| `activation` | callable | `nn.silu` | Activation inside message and update MLPs |
+
+Note: not SE(3)-equivariant — only permutation-equivariant. For E(3)/SE(3), supply a user-side EGNN / NequIP / MACE conditioner (see [DESIGN.md §4 item 7](DESIGN.md)).
 
 ## Geometry
 

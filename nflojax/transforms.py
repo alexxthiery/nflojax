@@ -1508,18 +1508,14 @@ class SplineCoupling:
 
     def _patch_dense_out(self, mlp_params: Any) -> Any:
         """
-        Patch MLP final layer for near-identity spline initialization.
+        Install an identity-spline bias on the conditioner's `dense_out`.
 
-        Sets kernel to zero and biases for identity spline.
-
-        Arguments:
-            mlp_params: MLP parameter dict.
-
-        Returns:
-            Patched MLP parameters.
-
-        Raises:
-            RuntimeError: If conditioner lacks get_output_layer/set_output_layer methods.
+        The bias length is read from the conditioner itself, so any conditioner
+        whose `dense_out` bias is a multiple of `params_per_scalar` works —
+        `MLP` (flat, `dim * params_per_scalar`) and any hypothetical per-scalar
+        variant (`params_per_scalar` repeated over `dim` scalars) are handled
+        uniformly. `identity_spline_bias` is the same per-scalar pattern tiled
+        across `num_scalars`.
         """
         if not (hasattr(self.conditioner, "get_output_layer") and
                 hasattr(self.conditioner, "set_output_layer")):
@@ -1529,9 +1525,16 @@ class SplineCoupling:
             )
 
         out_layer = self.conditioner.get_output_layer(mlp_params)
+        bias_size = int(out_layer["bias"].shape[0])
+        params_per_scalar = _params_per_scalar(self.num_bins, self.boundary_slopes)
+        if bias_size % params_per_scalar != 0:
+            raise ValueError(
+                f"SplineCoupling: conditioner dense_out bias shape ({bias_size},) "
+                f"is not a multiple of params_per_scalar={params_per_scalar}."
+            )
         new_kernel = jnp.zeros_like(out_layer["kernel"])
         new_bias = identity_spline_bias(
-            num_scalars=int(self.mask.shape[0]),
+            num_scalars=bias_size // params_per_scalar,
             num_bins=self.num_bins,
             min_derivative=self.min_derivative,
             max_derivative=self.max_derivative,
@@ -1591,7 +1594,9 @@ class SplitCoupling:
 
     Target use case (particle systems):
       event_shape = (N, d),  split_axis=-2,  split_index=N//2,  event_ndims=2
-      frozen slice:      (*batch, N//2, d)      -> MLP input after reshape
+      frozen slice:      (*batch, N//2, d)      -> conditioner input
+                                                   (flattened to (*batch, N//2 * d)
+                                                    when flatten_input=True)
       transformed slice: (*batch, N//2, d)      -> elementwise spline
 
     Fields:
@@ -1601,11 +1606,22 @@ class SplitCoupling:
                    axes (i.e., abs(split_axis) <= event_ndims).
       split_index: size of the first partition along split_axis.
       event_ndims: number of trailing event axes (>= 1).
-      conditioner: Flax module mapping (*batch, frozen_flat) -> (*batch, out).
-                   `out = required_out_dim(transformed_flat, num_bins, boundary_slopes)`;
-                   `transformed_flat * (3K-1)` for `linear_tails` (default),
-                   `transformed_flat * 3K` for `circular`.
+      conditioner: Flax module producing a tensor whose total trailing size
+                   equals `required_out_dim(transformed_flat, num_bins,
+                   boundary_slopes)` = `transformed_flat * (3K-1)` for
+                   `linear_tails` or `transformed_flat * 3K` for `circular`.
+                   Input shape depends on `flatten_input` (see below).
       swap:        if False, the first partition is frozen; if True, the last.
+      flatten_input: when True (default), the frozen slice is flattened to
+                   `(*batch, frozen_flat)` before the conditioner call — the
+                   contract `MLP` expects. When False, the conditioner sees
+                   the structured frozen slice `(*batch, *frozen_shape)`
+                   directly; use this for permutation-aware conditioners
+                   (`DeepSets`, `Transformer`, `GNN`) that need the particle
+                   axis preserved. The output-side reshape only requires the
+                   total element count; the conditioner may emit either flat
+                   `(*batch, transformed_flat * params_per_scalar)` or
+                   structured `(*batch, *transformed_shape, params_per_scalar)`.
       num_bins..max_derivative: same as SplineCoupling.
 
     Mask semantics: none. The partition is geometric (axis+index), not a
@@ -1630,6 +1646,7 @@ class SplitCoupling:
     min_derivative: float = 1e-2
     max_derivative: float = 10.0
     boundary_slopes: str = "linear_tails"
+    flatten_input: bool = True
 
     def __post_init__(self):
         self.event_shape = tuple(int(d) for d in self.event_shape)
@@ -1816,10 +1833,13 @@ class SplitCoupling:
         transformed_event_shape = transformed.shape[-self.event_ndims:]
         batch_shape = frozen.shape[: -self.event_ndims]
 
-        # Conditioner sees the flattened frozen slice; its output is reshaped
-        # to per-scalar spline params over the transformed slice.
-        frozen_flat = frozen.reshape(batch_shape + (-1,))
-        theta = self.conditioner.apply({"params": mlp_params}, frozen_flat, context)
+        # Conditioner sees the frozen slice (flat or structured per
+        # `flatten_input`); its output is reshaped to per-scalar spline params
+        # over the transformed slice. The output reshape depends only on the
+        # total element count, so the conditioner is free to emit a flat or
+        # structured tensor of the right size.
+        cond_input = frozen.reshape(batch_shape + (-1,)) if self.flatten_input else frozen
+        theta = self.conditioner.apply({"params": mlp_params}, cond_input, context)
         theta = theta.reshape(batch_shape + transformed_event_shape + (params_per_scalar,))
         widths = theta[..., :K]
         heights = theta[..., K : 2 * K]
@@ -1862,7 +1882,16 @@ class SplitCoupling:
     ) -> Tuple[Array, Array]:
         return self._forward_or_inverse(params, y, context, inverse=True)
 
-    def _patch_dense_out(self, mlp_params: Any, transformed_flat: int) -> Any:
+    def _patch_dense_out(self, mlp_params: Any) -> Any:
+        """Install an identity-spline bias on the conditioner's `dense_out`.
+
+        The bias length is read from the conditioner itself, so both flat-output
+        (`MLP`, bias = `transformed_flat * params_per_scalar`) and per-token
+        output (`Transformer`, `GNN`, bias = `d * params_per_scalar`) conditioners
+        are handled uniformly. `identity_spline_bias` is the same per-scalar
+        pattern tiled across `num_scalars` scalars, so sizing it to match the
+        conditioner's bias works for any multiple of `params_per_scalar`.
+        """
         if not (hasattr(self.conditioner, "get_output_layer") and
                 hasattr(self.conditioner, "set_output_layer")):
             raise RuntimeError(
@@ -1870,9 +1899,16 @@ class SplitCoupling:
                 "get_output_layer() and set_output_layer()."
             )
         out_layer = self.conditioner.get_output_layer(mlp_params)
+        bias_size = int(out_layer["bias"].shape[0])
+        params_per_scalar = _params_per_scalar(self.num_bins, self.boundary_slopes)
+        if bias_size % params_per_scalar != 0:
+            raise ValueError(
+                f"SplitCoupling: conditioner dense_out bias shape ({bias_size},) "
+                f"is not a multiple of params_per_scalar={params_per_scalar}."
+            )
         new_kernel = jnp.zeros_like(out_layer["kernel"])
         new_bias = identity_spline_bias(
-            num_scalars=transformed_flat,
+            num_scalars=bias_size // params_per_scalar,
             num_bins=self.num_bins,
             min_derivative=self.min_derivative,
             max_derivative=self.max_derivative,
@@ -1885,18 +1921,52 @@ class SplitCoupling:
         Initialize conditioner params with an identity-spline output layer.
 
         Shapes are derived from `self.event_shape` + the partition fields.
+        After init, the conditioner's full output shape is checked against the
+        coupling's expectation — a per-token conditioner (`Transformer`, `GNN`)
+        sized for a symmetric split but used with an asymmetric `split_index`
+        raises here, not as a cryptic reshape error during the first forward.
         """
         frozen_flat, transformed_flat = self._partition_flats(
             self.event_shape, self.split_axis, self.split_index,
             self.event_ndims, self.swap,
         )
-        dummy_x = jnp.zeros((1, frozen_flat), dtype=jnp.float32)
+        if self.flatten_input:
+            dummy_x = jnp.zeros((1, frozen_flat), dtype=jnp.float32)
+        else:
+            event_axis = self.event_ndims + self.split_axis
+            axis_size = self.event_shape[event_axis]
+            frozen_sz = self.split_index if not self.swap else axis_size - self.split_index
+            frozen_shape = list(self.event_shape)
+            frozen_shape[event_axis] = frozen_sz
+            dummy_x = jnp.zeros((1,) + tuple(frozen_shape), dtype=jnp.float32)
         dummy_context = (
             jnp.zeros((1, context_dim), dtype=jnp.float32) if context_dim > 0 else None
         )
         variables = self.conditioner.init(key, dummy_x, dummy_context)
         mlp_params = variables["params"]
-        mlp_params = self._patch_dense_out(mlp_params, transformed_flat)
+        mlp_params = self._patch_dense_out(mlp_params)
+
+        # Validate the conditioner's output shape against the coupling's
+        # expectation. The reshape in `_forward_or_inverse` requires
+        # `prod(trailing) == transformed_flat * params_per_scalar`.
+        params_per_scalar = _params_per_scalar(self.num_bins, self.boundary_slopes)
+        expected = transformed_flat * params_per_scalar
+        dummy_out = self.conditioner.apply(
+            {"params": mlp_params}, dummy_x, dummy_context
+        )
+        total_trailing = math.prod(dummy_out.shape[1:])
+        if total_trailing != expected:
+            axis_size = self.event_shape[self.event_ndims + self.split_axis]
+            raise ValueError(
+                f"SplitCoupling: conditioner "
+                f"{type(self.conditioner).__name__!r} produces output with "
+                f"total trailing size {total_trailing}; expected {expected} "
+                f"(= transformed_flat={transformed_flat} * "
+                f"params_per_scalar={params_per_scalar}). Common cause: a "
+                f"per-token conditioner (Transformer, GNN) sized for a "
+                f"symmetric split but used with split_index={self.split_index} "
+                f"on an axis of size {axis_size} (N_frozen != N_transformed)."
+            )
         return {"mlp": mlp_params}
 
 

@@ -4,7 +4,7 @@ Project context for coding agents (Claude Code, Cursor, Copilot, etc.).
 
 ## Project Summary
 
-Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Particle-system toolkit (Stages A + B): `Geometry` value object, `Rescale` / `CircularShift` / `CoMProjection` bijections, `UniformBox` / `LatticeBase` (5 crystal factories) base distributions, and `utils/pbc` + `utils/lattice` helpers. Not a pip package; clone and import directly.
+Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Particle-system toolkit (Stages A + B): `Geometry` value object, `Rescale` / `CircularShift` / `CoMProjection` bijections, `UniformBox` / `LatticeBase` (5 crystal factories) base distributions, and `utils/pbc` + `utils/lattice` helpers. Reference conditioners (Stage D): `MLP` + `DeepSets` (invariant) + `Transformer` (pre-norm, equivariant) + `GNN` (KNN under PBC, equivariant); plug into `SplitCoupling(flatten_input=False)` for the structured-input path. Not a pip package; clone and import directly.
 
 For current stage status and what's next, read [PLAN.md §0](PLAN.md). For
 the design philosophy and what nflojax refuses to build, read
@@ -140,6 +140,8 @@ Previously fixed:
 - Raw context vs extracted: when using a feature extractor, the gate still gets raw context.
 - No `__init__.py` exports: must use `from nflojax.builders import build_realnvp`.
 - **`CoMProjection` log-det is zero by design** (Convention 1: density on the `(N−1, d)` reduced space). If you need an ambient log-density (reverse-KL with ambient `E(x)`, ESS, `logZ`), add `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)`. Do **not** stack `CoMProjection` with an augmented-coupling pattern — they double-count. See [REFERENCE.md — CoMProjection](REFERENCE.md#comprojection) and [EXTENDING.md — CoM handling](EXTENDING.md#com-handling).
+- **`SplitCoupling.flatten_input` is True by default.** The flat contract matches `MLP`. To plug in a permutation-aware conditioner (`DeepSets`, `Transformer`, `GNN`, or a user's own), construct `SplitCoupling(..., flatten_input=False)` so the conditioner sees `(*batch, N_frozen, d)`. `SplitCoupling.create()` always uses the MLP path and ignores this.
+- **`GNN` self-edge masking uses `jnp.where`, not multiplication.** `jnp.eye(N) * jnp.inf` gives `0 * inf = NaN` off-diagonal and silently poisons the neighbour list. Use `jnp.where(eye_bool, jnp.inf, d_sq)` instead.
 
 ## Documentation Map
 

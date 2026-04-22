@@ -26,7 +26,8 @@ from typing import Optional
 import jax.numpy as jnp
 
 from ..geometry import Geometry
-from ..nets import Array
+
+Array = jnp.ndarray
 
 
 def nearest_image(dx: Array, geometry: Geometry) -> Array:
