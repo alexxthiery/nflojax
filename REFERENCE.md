@@ -559,7 +559,9 @@ transform, params = CoMProjection.create(key, event_axis=-3)  # (B, species, N, 
 > #                                             = (d / 2) * log(N)
 > ```
 >
-> **When the constant matters:**
+> **When the constant matters:** see [Bookkeeping
+> constants](#bookkeeping-constants) for the unified rule (this primitive
+> and `LatticeBase(permute=True)` follow the same convention).
 >
 > | Use case | Add the correction? |
 > |---|---|
@@ -687,7 +689,7 @@ params = [params1, params2, params3]  # list matching block order
 from nflojax.geometry import Geometry
 ```
 
-**What:** Value object for an axis-aligned rectangular box in `R^d` plus per-axis periodicity flags. Consumed by any geometry-aware primitive (`CircularShift`, `Rescale` today; `UniformBox`, `LatticeBase`, `utils/pbc.nearest_image` in future stages). Numpy-backed, frozen, not a PyTree.
+**What:** Value object for an axis-aligned rectangular box in `R^d` plus per-axis periodicity flags. Consumed by every geometry-aware primitive shipped today: `CircularShift`, `Rescale`, `CoMProjection` (Stage A), `UniformBox`, `LatticeBase` (Stage B), and `utils.pbc.nearest_image` / `pairwise_distance` (Stage B). Numpy-backed, frozen, not a PyTree.
 
 **Scope:**
 
@@ -732,18 +734,20 @@ There is intentionally no `Geometry.box(...)` factory — it would shadow the `@
 ## Distributions
 
 ```python
-from nflojax.distributions import StandardNormal, DiagNormal
+from nflojax.distributions import StandardNormal, DiagNormal, UniformBox
 ```
 
-Both distributions accept an event of arbitrary rank. See
+All distributions accept an event of arbitrary rank. See
 [Event Shape Convention](#event-shape-convention) for the canonical form.
 
 | Distribution | Constructor forms | Params | Description |
 |-------------|-------------------|--------|-------------|
 | `StandardNormal` | `(event_shape=(N, d))`, `(event_shape=N)`, `(dim=N)`, `(N)` | `None` | Isotropic `N(0, I)` on the event |
 | `DiagNormal` | same | `{"loc": event_shape, "log_scale": event_shape}` | Diagonal-covariance Gaussian on the event |
+| `UniformBox` | `(geometry=..., event_shape=(N, d))` | `None` | Per-axis uniform on `geometry.box`; i.i.d. over leading event axes |
+| `LatticeBase` | `.fcc / .diamond / .bcc / .hcp / .hex_ice(n_cells, a, noise_scale, permute=False)` | `None` | Gaussian-perturbed crystalline lattice |
 
-Both provide: `log_prob(params, x)`, `sample(params, key, shape)`, `init_params()`. For `DiagNormal`, `init_params()` returns zero `loc` and `log_scale`, i.e. a standard Gaussian over the event.
+All provide: `log_prob(params, x)`, `sample(params, key, shape)`, `init_params()`. For `DiagNormal`, `init_params()` returns zero `loc` and `log_scale`, i.e. a standard Gaussian over the event. For `UniformBox` and `LatticeBase`, `init_params()` returns `None`.
 
 **Attributes:**
 
@@ -765,6 +769,159 @@ dist.log_prob(params, samples).shape            # (16,)
 ```
 
 Both provide: `log_prob(params, x)`, `sample(params, key, shape)`, `init_params()`.
+
+### UniformBox
+
+**What:** Per-axis uniform distribution on a `Geometry` box. Sample space is the hyperrectangle `[lower_j, upper_j]` for each coord axis; for rank-`≥ 2` events (e.g. particle events `(N, d)`), every leading event entry is i.i.d. uniform.
+
+**Constructor:**
+
+```python
+from nflojax.geometry import Geometry
+from nflojax.distributions import UniformBox
+
+geom = Geometry(lower=[-L/2, -L/2, -L/2], upper=[L/2, L/2, L/2])
+
+# Single-particle d-vector:
+dist = UniformBox(geometry=geom, event_shape=(3,))
+
+# N-particle event:
+dist = UniformBox(geometry=geom, event_shape=(N, 3))
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `geometry` | `Geometry` | required | Defines the per-axis box. |
+| `event_shape` | `tuple[int, ...]` or `int` | required | Event shape whose last axis is the coord axis (`geometry.d`). |
+
+**log_prob:**
+
+```
+in_box        = all(lower <= x <= upper, reduced over every event axis)
+log_prob(x)   = -event_factor * sum_j log(box_j)  if in_box
+              = -inf                               otherwise
+
+event_factor  = prod(event_shape[:-1])  # 1 for rank-1, N for (N, d), etc.
+```
+
+**sample(params, key, shape):** `jax.random.uniform` with per-axis `lower`/`upper`, returning shape `shape + event_shape`. Every position (including particle axes) is an i.i.d. draw.
+
+**Params dict:** `None` (non-learnable).
+
+**Pairing:** `UniformBox` + `Rescale` is the "liquid starter kit": sample uniform in `geometry.box`, flow into a canonical `[-1, 1]` spline range, apply coupling layers. See [USAGE.md — Particle bases](USAGE.md#particle-bases).
+
+### LatticeBase
+
+**What:** Gaussian-perturbed lattice base distribution for crystalline solids. Each particle `i` is drawn from `N(positions[i], noise_scale^2 · I_d)`, independently across particles. Sites come from one of five named factories wrapping `nflojax.utils.lattice` (`fcc`, `diamond`, `bcc`, `hcp`, `hex_ice`).
+
+**Constructor — use a factory.** Direct construction is allowed but the factories handle positions + geometry consistently:
+
+```python
+from nflojax.distributions import LatticeBase
+
+lb = LatticeBase.fcc(n_cells=2, a=1.5, noise_scale=0.1)            # 32 atoms
+lb = LatticeBase.diamond(n_cells=(3, 3, 3), a=1.0, noise_scale=0.05)
+lb = LatticeBase.bcc(n_cells=4, a=1.2, noise_scale=0.08)
+lb = LatticeBase.hcp(n_cells=2, a=1.0, noise_scale=0.1)
+lb = LatticeBase.hex_ice(n_cells=2, a=1.0, noise_scale=0.1)        # 64 atoms
+```
+
+| Arg | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `n_cells` | `int` or length-3 tuple | required | Cell repeats per axis. |
+| `a` | `float` | required | Lattice constant. |
+| `noise_scale` | `float` | required | Per-coord Gaussian σ for the per-site jitter. |
+| `permute` | `bool` | `False` | Indistinguishability switch — see below. |
+
+**log_prob:**
+
+```
+z         = (x - positions) / noise_scale         # shape (..., N, d)
+log_p     = -1/2 * sum(z^2)                       # over all event axes
+            -1/2 * N*d * log(2π) - N*d * log(σ)   # Gaussian normaliser
+            (-log(N!)  if permute=True)           # indistinguishability constant
+```
+
+**sample(params, key, shape):**
+
+```
+eps  = jax.random.normal(key, shape + (N, d))
+x    = positions + noise_scale * eps
+        (per-batch random shuffle along the particle axis if permute=True)
+```
+
+**Params dict:** `None` (non-learnable; positions and noise_scale are static configuration).
+
+---
+
+> ### `permute=True` — what it does
+>
+> - **Sampling:** the particle axis is shuffled per batch sample (so the
+>   user cannot infer which lattice site each output came from).
+> - **Density:** subtracts `log(N!)` from the labelled-Gaussian density.
+>   This is the standard distinguishable → indistinguishable correction.
+>
+> The labelled Gaussian itself is not exactly invariant under permuting
+> `x`'s particle axis; the `-log(N!)` is the correct indistinguishability
+> constant only when one permutation dominates the likelihood (the small-
+> noise / well-separated-sites regime). For larger `noise_scale` relative
+> to lattice spacing, a permutation-marginalised density would differ.
+>
+> **The `-log(N!)` is a constant**, so it doesn't affect gradients of a
+> training loss. It does affect absolute densities, ESS, `logZ`. See
+> [Bookkeeping constants](#bookkeeping-constants) for the unified rule
+> (this and `CoMProjection.ambient_correction` follow the same convention).
+
+---
+
+**Pairing for a Boltzmann generator on a crystalline solid:**
+
+```
+LatticeBase  ->  Rescale (lattice box -> [-1, 1])  ->  inner couplings  ->  CoMProjection.inverse  ->  ambient
+```
+
+- The lattice base lives on `(N, d)` reduced coordinates (no CoM removal yet).
+- `Rescale` puts coords into the canonical spline range.
+- Couplings learn the residual deformation.
+- `CoMProjection.inverse` (Stage A) embeds back into the zero-CoM ambient
+  subspace, ready to score against an ambient `E(x)`.
+
+For `T(d)`-invariant targets you typically want `permute=True`; for
+distinguishable-particle targets (toy benchmarks) leave it `False`.
+
+## Bookkeeping constants
+
+Two primitives in nflojax expose a constant log-density correction that
+**the caller is responsible for applying when needed**. Both follow the
+same rule: they are no-ops for gradient-based training (zero gradient) but
+load-bearing for absolute densities, importance weights, ESS, `logZ`, and
+any quantitative cross-model comparison.
+
+| Primitive | Constant | API | When it matters |
+|-----------|----------|-----|-----------------|
+| [`CoMProjection`](#comprojection) | `(d/2) · log(N)` | `CoMProjection.ambient_correction(N, d)` | Ambient-subspace density vs reduced-space density. Required for reverse-KL against ambient `E(x)` when reporting absolute log-prob. |
+| [`LatticeBase`](#latticebase) (`permute=True`) | `-log(N!)` | Built into `log_prob` when `permute=True`; *not* added when `permute=False` | Distinguishable → indistinguishable particle convention. Required for ESS / `logZ` against an indistinguishable target. |
+
+**Rule of thumb:**
+
+| Use case | Apply correction? |
+|----------|-------------------|
+| Gradient-based training loss (reverse-KL, forward-KL) | **No** — constant → zero gradient |
+| Importance weights `w = exp(−β E − log q)` / SNIS / ESS | **Yes** |
+| `logZ` estimates | **Yes** |
+| Absolute density comparisons across models | **Yes** (apply consistently to every model compared) |
+| Ratios within one flow | **No** — cancels |
+
+**Do not stack patterns that solve the same problem twice.** If a flow
+already removes translations via the augmented-coupling pattern (see
+[EXTENDING.md — CoM handling](EXTENDING.md#com-handling)), do *not* also
+apply `CoMProjection.ambient_correction`. Likewise if your inner flow
+already permutation-symmetrises samples, do not also subtract `log(N!)`
+via `LatticeBase(permute=True)`.
+
+When a future primitive adds a third such constant (most likely candidate:
+a unit-of-volume rescale for non-orthogonal cells), document it here and
+update the rule table; this is the canonical place to look.
 
 ## Utilities
 
@@ -804,6 +961,96 @@ u = stable_logit(p)  # logit with input clipped into [1e-6, 1 - 1e-6]
 ```
 
 Numerically stable logit used internally for bounding knot derivatives.
+
+### nflojax.utils.pbc
+
+```python
+from nflojax.utils.pbc import (
+    nearest_image,
+    pairwise_distance,
+    pairwise_distance_sq,
+)
+```
+
+Pure functions for orthogonal periodic-box geometry. All consume the
+`Geometry` value object; non-periodic axes (per `geometry.periodic`) pass
+through unchanged. Triclinic cells are out of scope (DESIGN.md §4.8).
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `nearest_image` | `(dx, geometry) -> Array` | Minimum-image wrap of displacement `dx` of shape `(..., d)`. Returns the same shape, with each periodic axis wrapped to `(-box[j]/2, box[j]/2]` and non-periodic axes unchanged. |
+| `pairwise_distance` | `(x, geometry=None) -> Array` | Pairwise Euclidean distances for `(..., N, d)` positions; output shape `(..., N, N)`. With `geometry`, wraps displacements via `nearest_image` first. |
+| `pairwise_distance_sq` | `(x, geometry=None) -> Array` | Squared version. Avoids `sqrt`; preferred in hot paths (neighbour-list cutoffs, network features). |
+
+**Example:**
+
+```python
+from nflojax.geometry import Geometry
+from nflojax.utils.pbc import nearest_image, pairwise_distance
+
+geom = Geometry.cubic(d=3, side=1.0, lower=0.0)        # [0, 1]^3, all-periodic
+dx   = jnp.array([0.8, 0.8, 0.8])
+nearest_image(dx, geom)                                # [-0.2, -0.2, -0.2]
+
+# Slab: periodic in x, y; open in z.
+geom = Geometry(lower=[0,0,0], upper=[1,1,1], periodic=[True, True, False])
+nearest_image(jnp.array([0.8, 0.8, 0.8]), geom)        # [-0.2, -0.2, 0.8]
+
+# Pairwise PBC distances on (B, N, d) positions.
+x  = jax.random.uniform(key, (4, 8, 3))
+d  = pairwise_distance(x, geometry=geom)               # (4, 8, 8); diag = 0
+```
+
+**Not for:** energy evaluation, neighbour lists with physics-specific
+cutoffs (force-field range), or anything that pulls in domain knowledge.
+Those live in application code (DESIGN.md §4 item 1).
+
+### nflojax.utils.lattice
+
+```python
+from nflojax.utils.lattice import (
+    fcc, diamond, bcc, hcp, hex_ice,
+    make_box, cell_aspect, ATOMS_PER_CELL,
+)
+```
+
+Pure functions returning `(N, 3)` numpy arrays of crystalline lattice
+positions. Used by `LatticeBase` to define the mean sites of a
+Gaussian-perturbed lattice base distribution; can also be called standalone
+for visualisation, ground-truth comparisons, or non-flow physics code.
+
+| Lattice | Atoms / cell | Cell aspect | Notes |
+|---------|--------------|-------------|-------|
+| `fcc(n_cells, a)` | 4 | `(1, 1, 1)` | Face-centred cubic |
+| `diamond(n_cells, a)` | 8 | `(1, 1, 1)` | Diamond cubic; first 4 atoms = FCC sub-lattice |
+| `bcc(n_cells, a)` | 2 | `(1, 1, 1)` | Body-centred cubic |
+| `hcp(n_cells, a)` | 4 | `(1, √3, √(8/3))` | Orthorhombic representation; ideal `c/a = √(8/3)` |
+| `hex_ice(n_cells, a)` | 8 | `(1, √3, √(8/3))` | Ice Ih, **DM convention** with the puckering parameter `6 × 0.0625` baked in (matches `flows_for_atomic_solids`) |
+
+`n_cells` is `int` (uniform per axis) or a length-3 sequence; `a` is the
+lattice constant (scalar). Box side along axis `i` is `n_cells[i] * a *
+cell_aspect[i]`; the box origin is at zero by convention.
+
+```python
+import numpy as np
+from nflojax.geometry import Geometry
+from nflojax.utils.lattice import fcc, make_box, cell_aspect
+
+# 2x2x2 FCC, lattice constant 1.5 -> 32 atoms in a (3, 3, 3) box.
+positions = fcc(n_cells=2, a=1.5)
+box       = make_box(n_cells=2, a=1.5, cell_aspect=cell_aspect("fcc"))
+geom      = Geometry(lower=np.zeros(3), upper=box)
+```
+
+`ATOMS_PER_CELL` is a `{name: int}` dict for callers that need to invert
+the atom-count formula `N = prod(n_cells) * atoms_per_cell`.
+
+**Hex-ice convention.** PLAN.md §10.3 was resolved in favour of the DM
+convention. If you need bgmat's re-derivation instead, build a custom
+generator following the `_make_lattice` recipe in `nflojax/utils/lattice.py`.
+
+**Not for:** lattice-specific physics (Madelung sums, defect generation),
+non-orthorhombic cells (DESIGN.md §4.8).
 
 ## Parameter Structure
 

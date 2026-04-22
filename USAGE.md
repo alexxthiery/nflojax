@@ -325,6 +325,50 @@ only works when the conditioner is size-agnostic by construction (e.g. a
 GNN over particle neighborhoods). The default MLP conditioner has its
 `x_dim` / `out_dim` baked to the original `N` and will not transfer.
 
+## Particle bases
+
+For `(N, d)` particle events the base distribution lives on the particle
+configuration space. Two ship today:
+
+- `nflojax.distributions.UniformBox(geometry, event_shape)` — per-axis
+  uniform on `geometry.box`, i.i.d. over leading event axes. Natural base
+  for a **liquid starter kit** (`UniformBox` + `Rescale` → canonical
+  range → coupling layers). See
+  [REFERENCE.md#uniformbox](REFERENCE.md#uniformbox).
+- `nflojax.distributions.LatticeBase` — Gaussian-perturbed crystalline
+  lattice via five named factories
+  (`fcc / diamond / bcc / hcp / hex_ice`). Natural base for a **solid
+  starter kit** (`LatticeBase` → `Rescale` → couplings →
+  `CoMProjection.inverse`). Use `permute=True` for indistinguishable
+  particles (subtracts `log N!`; shuffles sample order). See
+  [REFERENCE.md#latticebase](REFERENCE.md#latticebase).
+
+```python
+from nflojax.geometry import Geometry
+from nflojax.distributions import UniformBox
+
+# (N, d) liquid base on a cubic box [-L/2, L/2]^3.
+geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+base = UniformBox(geometry=geom, event_shape=(N, 3))
+
+samples = base.sample(None, key, (batch,))         # (batch, N, 3)
+log_p   = base.log_prob(None, samples)             # (batch,); constant -N*sum(log(box))
+```
+
+`log_prob` returns `-inf` for configurations that fall outside the box on
+any coord — useful when evaluating `flow.log_prob` on arbitrary points.
+
+```python
+from nflojax.distributions import LatticeBase
+
+# (32, 3) FCC lattice on a [0, 2]^3 cubic box, σ = 0.05; indistinguishable.
+lb = LatticeBase.fcc(n_cells=2, a=1.0, noise_scale=0.05, permute=True)
+
+samples = lb.sample(None, key, (batch,))           # (batch, 32, 3); shuffled
+log_p   = lb.log_prob(None, samples)               # (batch,); incl. -log(N!)
+geom    = lb.geometry                              # box [0, 2]^3 ready for Rescale
+```
+
 ## Periodic boxes and the torus
 
 For flows on a periodic box, two pieces cooperate:
