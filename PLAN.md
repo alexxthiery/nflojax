@@ -21,12 +21,13 @@
   - Gate + context tests on `SplineCoupling` in circular mode.
   - `@requires_x64` skip marker covering 5 pre-existing float32-only round-trip failures.
 - **Stage A fully closed** (`2c94d18`). A1 (`Rescale`, `28b735f`), A3 (`Permutation` event_axis, Stage-0), A4 (context-type story, §5.2 contract narrowed), A2 (`CoMProjection`, Convention (1) zero log-det + `ambient_correction` helper).
-- **Stage B fully closed.** B1 (`UniformBox`), B4 (`utils/pbc.py`), B2 (`utils/lattice.py` — 5 generators), B3 (`LatticeBase` + 5 factories). New `nflojax/utils/` subdir.
+- **Stage B fully closed** (`bc90993`). B1 (`UniformBox`), B4 (`utils/pbc.py`), B2 (`utils/lattice.py` — 5 generators), B3 (`LatticeBase` + 5 factories). New `nflojax/utils/` subdir.
+- **Stage C fully closed.** C1 (`circular_embed`), C2 (`positional_embed`). New `nflojax/embeddings.py` (stateless feature transforms for conditioner inputs).
 - Test infrastructure: `pytest-xdist` adopted as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`); AGENTS.md rewritten as a one-command "Testing Strategy". Landed `9ef1141`.
-- Full test suite (parallel): **512 passed / 6 skipped under float32 (~90s); 518 passed under `JAX_ENABLE_X64=1` (~99s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
+- Full test suite (parallel): **527 passed / 6 skipped under float32 (~90s); 533 passed under `JAX_ENABLE_X64=1` (~99s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
 - DESIGN.md checked in; `AGENTS.md` updated to point at it.
 
-**Next up — Stage C** (`embeddings.py`: `circular_embed`, `positional_embed`). Small, unblocked, single new file. Then Stage D (reference conditioners, with §10.4 / §10.5 to resolve in-task).
+**Next up — Stage D** (reference conditioners: `DeepSets`, `Transformer`, `GNN`). D1 (`DeepSets`) is unblocked. D2 / D3 require resolving §10.4 (Transformer pre-norm vs post-norm) and §10.5 (GNN default `num_neighbours`).
 
 Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
 
@@ -131,13 +132,15 @@ Stateless feature transforms used by all non-MLP conditioners. New file `nflojax
 
 ### Tasks
 
-- [ ] **C1. `circular_embed(x, n_freq, lower, upper)`** stack of `cos / sin(2πk (x - lower) / (upper - lower))`.
+- [x] **C1. `circular_embed(x, geometry, n_freq)`** stack of `cos / sin(2π(k+1)(x - lower) / box)`.
   - Shape-preserving except last axis grows `× 2*n_freq`.
   - Vectorised; jit-friendly.
   - Tests: correct shape, periodic output, `n_freq=0` is a degenerate pass-through (or explicit error), jit.
-- [ ] **C2. `positional_embed(t, n_freq, base=10_000)`** sinusoidal scalar embedding.
+  - **Landed**: API signature changed from `(x, n_freq, lower, upper)` to `(x, geometry, n_freq)` to match the Stage-0 `Geometry`-first convention. `n_freq=0` raises `ValueError` (no silent zero-width output). Non-periodic axes are not gated — caller's responsibility (post-v1 `mask_non_periodic` knob if needed). 8 tests green.
+- [x] **C2. `positional_embed(t, n_freq, base=10_000)`** sinusoidal scalar embedding.
   - Output shape `(..., 2*n_freq)`; used for temperature / density / step context.
   - Tests: shape, consistent with the standard sinusoidal positional-encoding formula, jit.
+  - **Landed**: standard "Attention Is All You Need" formula adapted for continuous `t`; `n_freq=0` and `base<=0` raise `ValueError`. 7 tests green.
 
 ### Acceptance
 
@@ -278,6 +281,16 @@ Stage A checklist (2026-04-21):
 - [x] Total nflojax LOC (excluding tests) ≤ 5000.
 - [x] Every public name in `REFERENCE.md` (`Rescale`, `CoMProjection`).
 
+Stage C checklist (2026-04-22):
+
+- [x] `pytest tests/ -q` green under default float32 (527 passed / 6 skipped).
+- [x] `JAX_ENABLE_X64=1 pytest tests/ -q` green (533 passed).
+- [x] Identity-at-init not applicable (embeddings are stateless, no params).
+- [x] No new energy / training / observable term (DESIGN.md §11 greps).
+- [x] No new dependency.
+- [x] Total nflojax LOC (excluding tests) ≤ 5000.
+- [x] Every public name in `REFERENCE.md` (`circular_embed`, `positional_embed` under `nflojax.embeddings`).
+
 ---
 
 ## 8b. Long-term trajectory
@@ -367,3 +380,4 @@ Items that need a decision before the relevant stage can close.
 - *2026-04-21* — Stage A4 closed via option (a): narrow the built-in contract, keep PyTree at the flow layer. DESIGN.md §5.2 now a two-tier contract (PyTree through flows, Array for built-in `MLP` and `_compute_gate_value`, any PyTree for custom conditioners). Option (b) rejected because target apps (DM, bgmat) bring their own conditioner anyway, so `ravel_pytree` + PyTree-aware batching in the common path would add complexity for no one. A new `TestCustomConditionerPyTreeContext` test in `tests/test_conditional_flow.py` exercises a dict-context conditioner end-to-end (round-trip + jit).
 - *2026-04-21* — Stage A2 closed; Stage A fully done. `CoMProjection` ships with **Convention (1)** log-det: the bijection is a relabelling between two `(N-1)d`-dim spaces (reduced Euclidean and zero-CoM subspace of `R^(Nd)`), so `log_det = 0` both directions. The volume-element constant relating the two embeddings is `(d/2)·log(N)` (derived from `det(I + 11^T) = N` for the parameterisation `x_N = -Σy_i`), exposed as `CoMProjection.ambient_correction(N, d)`. Convention (2) — baking the constant into the log-det — was rejected: it silently double-counts in the augmented-coupling composition (bgmat's pattern), where translation invariance is handled separately and densities are already ambient-valid. Explicit caller-applied correction keeps the two patterns cleanly separable. Heavy documentation placed at six contact points to prevent silent misuse: class docstring, REFERENCE.md decision box, USAGE.md recipe, EXTENDING.md "CoM handling" (with do-not-stack warning), INTERNALS.md derivation, AGENTS.md Gotcha.
 - *2026-04-22* — **Stage B closed.** Four tasks landing in one session: `UniformBox` (B1, per-axis uniform base on a `Geometry`), `utils/pbc.py` (B4, `nearest_image` + `pairwise_distance(_sq)` consuming `Geometry`), `utils/lattice.py` (B2, pure functions for `fcc / diamond / bcc / hcp / hex_ice` returning `(N, 3)` numpy positions), `LatticeBase` + 5 factories (B3). All consume the Stage-0 `Geometry` value object — no raw `lower/upper` alternatives. `LatticeBase.permute=True` shuffles particle order per-batch via `jax.vmap(jax.random.permutation)` and subtracts `log(N!)` from `log_prob`; the constant has the same caveats as `CoMProjection.ambient_correction` (no gradient effect, matters for absolute densities / ESS / `logZ`). §10.3 resolved with the DM `hex_ice` convention. New `nflojax/utils/` subdir; AGENTS.md dependency graph extended. 84 new tests, 5 minutes total session wall-clock for the Stage. Spherical truncation in `LatticeBase` deferred — no concrete trigger in v1.0 scope.
+- *2026-04-22* — **Stage C closed.** Two stateless feature transforms in new `nflojax/embeddings.py`: `circular_embed(x, geometry, n_freq)` (per-coord Fourier features on a periodic box, lowest harmonic tiles `geometry.box`) and `positional_embed(t, n_freq, base=10_000)` (sinusoidal scalar embedding, transformer-style). Both raise `ValueError` on `n_freq=0` to avoid silent zero-width outputs that would break downstream `jnp.concatenate`. **API change vs. PLAN.md spec**: `circular_embed` takes `Geometry` (not raw `(lower, upper)`) to match the Stage-0 retrofit pattern — one path, no overload. Non-periodic axes are not gated; documented as caller's responsibility. 15 new tests; ~80 LOC. Unblocks Stage D conditioners (Transformer, GNN) which both consume these features.
