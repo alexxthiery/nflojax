@@ -325,6 +325,42 @@ only works when the conditioner is size-agnostic by construction (e.g. a
 GNN over particle neighborhoods). The default MLP conditioner has its
 `x_dim` / `out_dim` baked to the original `N` and will not transfer.
 
+### Permutation-aware conditioners (DeepSets, Transformer, GNN)
+
+The default `SplitCoupling.create(...)` uses an MLP, which does not
+exploit the particle structure. To plug in a permutation-invariant or
+-equivariant conditioner, construct `SplitCoupling` directly with
+`flatten_input=False` so the conditioner sees `(*batch, N_frozen, d)`
+instead of the flat `(*batch, N_frozen · d)` vector.
+
+```python
+from nflojax.nets import DeepSets
+from nflojax.transforms import SplitCoupling
+
+N, d, K = 8, 3, 8
+params_per_scalar = 3 * K - 1
+
+ds = DeepSets(
+    phi_hidden=(64, 64), rho_hidden=(64,),
+    out_dim=(N // 2) * d * params_per_scalar,
+)
+
+coupling = SplitCoupling(
+    event_shape=(N, d), split_axis=-2, split_index=N // 2,
+    event_ndims=2,
+    conditioner=ds,
+    num_bins=K, tail_bound=5.0,
+    flatten_input=False,        # <-- structured input path
+)
+params = coupling.init_params(key)
+```
+
+Swap `DeepSets` for `Transformer` or `GNN` to pick a different
+equivariance profile; all three satisfy the same
+`SplitCoupling.init_params` identity-init pipeline. See
+[REFERENCE.md#conditioners](REFERENCE.md#conditioners) for the constructor
+signatures.
+
 ## Particle bases
 
 For `(N, d)` particle events the base distribution lives on the particle

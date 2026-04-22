@@ -24,10 +24,11 @@
 - **Stage B fully closed** (`bc90993`). B1 (`UniformBox`), B4 (`utils/pbc.py`), B2 (`utils/lattice.py` — 5 generators), B3 (`LatticeBase` + 5 factories). New `nflojax/utils/` subdir.
 - **Stage C fully closed.** C1 (`circular_embed`), C2 (`positional_embed`). New `nflojax/embeddings.py` (stateless feature transforms for conditioner inputs).
 - Test infrastructure: `pytest-xdist` adopted as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`); AGENTS.md rewritten as a one-command "Testing Strategy". Landed `9ef1141`.
-- Full test suite (parallel): **527 passed / 6 skipped under float32 (~90s); 533 passed under `JAX_ENABLE_X64=1` (~99s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
+- **Stage D fully closed.** `SplitCoupling.flatten_input` hatch unlocks structured-input conditioners. D1 (`DeepSets`, permutation-invariant), D2 (`Transformer`, pre-norm, permutation-equivariant per-token), D3 (`GNN` with top-K neighbours under PBC, `num_neighbours=12`), D4 (shared contract fixture `tests/test_conditioner_protocol.py`). §10.4 and §10.5 resolved (see decision log). Top-level `Dense(..., name="dense_out")` convention across all four conditioners; `SplitCoupling._patch_dense_out` infers the bias size from the conditioner so flat-output and per-token-output modules plug in the same way.
+- Full test suite (parallel): **592 passed / 6 skipped under float32 (~95s); 598 passed under `JAX_ENABLE_X64=1` (~95s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
 - DESIGN.md checked in; `AGENTS.md` updated to point at it.
 
-**Next up — Stage D** (reference conditioners: `DeepSets`, `Transformer`, `GNN`). D1 (`DeepSets`) is unblocked. D2 / D3 require resolving §10.4 (Transformer pre-norm vs post-norm) and §10.5 (GNN default `num_neighbours`).
+**Next up — Stage E** (particle-flow builder `build_particle_flow`). All Stage-D primitives are in place; E1/E2 can compose them directly.
 
 Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
 
@@ -159,24 +160,21 @@ Permutation-{invariant, equivariant} conditioners in `nflojax/nets.py`. All sati
 
 ### Tasks
 
-- [ ] **D1. `DeepSets(phi_hidden, rho_hidden, out_per_particle)`** permutation-invariant.
-  - `phi` per-particle MLP → sum-pool → `rho` MLP → reshape.
-  - Zero-init final layer for identity-at-init.
-  - Tests: permutation invariance under input shuffle, required output shape for `SplitCoupling`, identity at init, jit.
-- [ ] **D2. `Transformer(num_layers, num_heads, embed_dim)`** minimal self-attention stack.
-  - Budget: ≤ 150 LOC. Pure Flax `linen`.
-  - Post-norm or pre-norm explicit in code; no masked attention (particles are fully connected).
-  - Zero-init final layer.
-  - Tests: permutation equivariance (output indices track input permutation), required output shape, identity at init, jit.
-- [ ] **D3. `GNN(num_layers, hidden, num_neighbours, cutoff=None)`** reference MPNN.
-  - Edge index built per-forward by top-`num_neighbours` under PBC (or fixed cutoff if provided).
-  - Message = MLP over `[node_i, node_j, edge_feature]`; aggregate with `segment_sum`; node update = residual MLP.
+- [x] **D1. `DeepSets(phi_hidden, rho_hidden, out_dim)`** permutation-invariant.
+  - `phi` per-particle MLP → sum-pool → `rho` MLP → `dense_out`.
+  - `SplitCoupling.init_params` zeroes `dense_out` kernel and patches bias via `identity_spline_bias` for identity-at-init.
+  - **Landed**: consumes `(*batch, N_frozen, d)` via `SplitCoupling(flatten_input=False)`. Standalone init via the generic `init_conditioner(key, module, dummy_x)` helper. 10 new tests in `tests/test_nets.py::TestDeepSets` (shape, permutation invariance, context broadcasting, per-sample context, jit, identity-at-init via SplitCoupling).
+- [x] **D2. `Transformer(num_layers, num_heads, embed_dim, out_per_particle)`** minimal self-attention stack.
+  - Pre-norm residual blocks: `h = h + attn(LN(h)); h = h + ffn(LN(h))`. Flax `nn.SelfAttention` and `nn.LayerNorm`; no masked attention. Per-token `dense_out`.
+  - `set_output_layer` is the trivial dict-update (same as `DeepSets`). `SplitCoupling._patch_dense_out` reads the bias length from the conditioner and sizes `identity_spline_bias` to match, so flat and per-token `dense_out` plug in the same way.
+  - **Landed**: 9 new tests in `tests/test_nets.py::TestTransformer` (permutation equivariance per-token, SplitCoupling round-trip + identity-at-init, jit, context handling).
+- [x] **D3. `GNN(num_layers, hidden, out_per_particle, num_neighbours=12, cutoff=None, geometry=None)`** reference MPNN.
+  - Edge index built per-forward via `jax.lax.top_k` on `-d_sq` from `nflojax.utils.pbc.pairwise_distance_sq(x, geometry)` (self-edge pinned to +∞ via `jnp.where`). Messages = Dense-act-Dense over `[h_i, h_j, d_ij]`; aggregate = `jnp.sum` over the neighbour axis; node update = residual MLP. Optional `cutoff` zero-weights distant messages.
   - Permutation-equivariant, **not** SE(3).
-  - Budget: ≤ 250 LOC.
-  - Tests: permutation equivariance, neighbour-list stability under small perturbation, required output shape, jit.
-- [ ] **D4. Shared conditioner contract test fixture** `tests/test_conditioner_protocol.py`.
-  - Parametrised over `DeepSets`, `Transformer`, `GNN` (and `MLP` for the non-equivariant baseline).
-  - Asserts each conditioner: produces correct `out_dim` for both `SplineCoupling` and `SplitCoupling`, init produces identity at init via the same `identity_spline_bias` helper, jits.
+  - **Landed**: 10 new tests in `tests/test_nets.py::TestGNN` including permutation equivariance, neighbour-list stability, Euclidean fallback, cutoff behaviour, SplitCoupling round-trip.
+- [x] **D4. Shared conditioner contract test fixture** `tests/test_conditioner_protocol.py`.
+  - Parametrised over `MLP`, `DeepSets`, `Transformer`, `GNN`. Each asserts: `validate_conditioner` accepts; `apply` returns the `SplitCoupling.required_out_dim` total size; `get_output_layer`/`set_output_layer` round-trip; `SplitCoupling(flatten_input=...)` identity-at-init and jit. `MLP` additionally tested with `SplineCoupling` (flat-mask path).
+  - **Landed**: 21 tests (5 contract checks × 4 conditioners + 1 MLP-SplineCoupling).
 
 ### Acceptance
 
@@ -291,6 +289,16 @@ Stage C checklist (2026-04-22):
 - [x] Total nflojax LOC (excluding tests) ≤ 5000.
 - [x] Every public name in `REFERENCE.md` (`circular_embed`, `positional_embed` under `nflojax.embeddings`).
 
+Stage D checklist (2026-04-22):
+
+- [x] `pytest tests/ -q` green under default float32 (592 passed / 6 skipped).
+- [x] `JAX_ENABLE_X64=1 pytest tests/ -q` green (598 passed).
+- [x] Every new conditioner satisfies identity-at-init: `DeepSets`, `Transformer`, `GNN` each pass their SplitCoupling round-trip at init. Covered in `tests/test_conditioner_protocol.py::test_split_coupling_identity_at_init` (parametrized).
+- [x] No new energy / training / observable term (DESIGN.md §11 greps). Docstring mentions of "training" / "energy" (in `CoMProjection`) are pre-existing.
+- [x] No new heavy dependency. All three conditioners use `flax.linen` primitives already in scope.
+- [!] Total `nflojax/` LOC excluding tests: **6653**. Exceeds the §11 item 10 ballpark of 5000 — needs review. Breakdown: `transforms.py` 2819, `nets.py` 924 (+~640 from Stage D), `builders.py` ~(not counted here), `distributions.py`, `flows.py`, `splines.py`, `embeddings.py`, `geometry.py`, `utils/pbc.py`, `utils/lattice.py`. Per DESIGN.md §2.1 amendment, catalogue files (`transforms.py`, `nets.py`) are allowed to grow; each *concept* within must still fit ≤ 500 LOC. Revisit before Stage E if this drifts further.
+- [x] Every public name in `REFERENCE.md` (`DeepSets`, `Transformer`, `GNN`, `init_conditioner`, new `SplitCoupling.flatten_input` field).
+
 ---
 
 ## 8b. Long-term trajectory
@@ -367,8 +375,8 @@ Items that need a decision before the relevant stage can close.
 - [ ] Branch strategy for Stages A–F. One branch `feature/particle-flow-framework`, or stage-per-branch? (Default: one long-lived branch, stage-per-commit.)
 - [x] `ShiftCenterOfMass` log-det convention: document as "zero on the (N−1)d subspace; caller is responsible for the embedding-space correction" vs. "constant $-d \log(N)/2$ correction baked in"? Pick when writing A2. **Resolved 2026-04-21: Convention (1) — zero log-det on the subspace; caller applies `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)` when an ambient density is needed. Rationale + full derivation in §11 decision log and `INTERNALS.md` "CoM Projection and the Volume Correction".**
 - [x] `LatticeBase.hex_ice` unit-cell parameters: follow DM's convention (8 atoms per cell) or bgmat's (re-derive)? Likely DM. **Resolved 2026-04-22: DM convention. 8 atoms per orthorhombic cell with `cell_aspect = (1, sqrt(3), sqrt(8/3))` and the puckering parameter `6 * 0.0625` baked in (matches `flows_for_atomic_solids/models/particle_models.py:HexagonalIceLattice`). Atom positions reproduced inline in `nflojax/utils/lattice.py` so the test suite is hermetic.**
-- [ ] `Transformer` attention norm placement: pre-norm (more stable for deeper stacks) vs. post-norm (closer to DM's original). Default: pre-norm; record the choice in INTERNALS.md.
-- [ ] GNN default `num_neighbours`: 12 (common) vs. 18 (bgmat). Ship 12; let apps override.
+- [x] `Transformer` attention norm placement: pre-norm (more stable for deeper stacks) vs. post-norm (closer to DM's original). **Resolved 2026-04-22: pre-norm.** `h = h + attn(LN(h)); h = h + ffn(LN(h))` per block + a final `LN` before `dense_out`. Rationale + background in `INTERNALS.md` "Transformer conditioner: pre-norm choice".
+- [x] GNN default `num_neighbours`: 12 (common) vs. 18 (bgmat). **Resolved 2026-04-22: `num_neighbours=12`.** Apps override (bgmat's 18 is app-side, not library default).
 
 ---
 
@@ -381,3 +389,6 @@ Items that need a decision before the relevant stage can close.
 - *2026-04-21* — Stage A2 closed; Stage A fully done. `CoMProjection` ships with **Convention (1)** log-det: the bijection is a relabelling between two `(N-1)d`-dim spaces (reduced Euclidean and zero-CoM subspace of `R^(Nd)`), so `log_det = 0` both directions. The volume-element constant relating the two embeddings is `(d/2)·log(N)` (derived from `det(I + 11^T) = N` for the parameterisation `x_N = -Σy_i`), exposed as `CoMProjection.ambient_correction(N, d)`. Convention (2) — baking the constant into the log-det — was rejected: it silently double-counts in the augmented-coupling composition (bgmat's pattern), where translation invariance is handled separately and densities are already ambient-valid. Explicit caller-applied correction keeps the two patterns cleanly separable. Heavy documentation placed at six contact points to prevent silent misuse: class docstring, REFERENCE.md decision box, USAGE.md recipe, EXTENDING.md "CoM handling" (with do-not-stack warning), INTERNALS.md derivation, AGENTS.md Gotcha.
 - *2026-04-22* — **Stage B closed.** Four tasks landing in one session: `UniformBox` (B1, per-axis uniform base on a `Geometry`), `utils/pbc.py` (B4, `nearest_image` + `pairwise_distance(_sq)` consuming `Geometry`), `utils/lattice.py` (B2, pure functions for `fcc / diamond / bcc / hcp / hex_ice` returning `(N, 3)` numpy positions), `LatticeBase` + 5 factories (B3). All consume the Stage-0 `Geometry` value object — no raw `lower/upper` alternatives. `LatticeBase.permute=True` shuffles particle order per-batch via `jax.vmap(jax.random.permutation)` and subtracts `log(N!)` from `log_prob`; the constant has the same caveats as `CoMProjection.ambient_correction` (no gradient effect, matters for absolute densities / ESS / `logZ`). §10.3 resolved with the DM `hex_ice` convention. New `nflojax/utils/` subdir; AGENTS.md dependency graph extended. 84 new tests, 5 minutes total session wall-clock for the Stage. Spherical truncation in `LatticeBase` deferred — no concrete trigger in v1.0 scope.
 - *2026-04-22* — **Stage C closed.** Two stateless feature transforms in new `nflojax/embeddings.py`: `circular_embed(x, geometry, n_freq)` (per-coord Fourier features on a periodic box, lowest harmonic tiles `geometry.box`) and `positional_embed(t, n_freq, base=10_000)` (sinusoidal scalar embedding, transformer-style). Both raise `ValueError` on `n_freq=0` to avoid silent zero-width outputs that would break downstream `jnp.concatenate`. **API change vs. PLAN.md spec**: `circular_embed` takes `Geometry` (not raw `(lower, upper)`) to match the Stage-0 retrofit pattern — one path, no overload. Non-periodic axes are not gated; documented as caller's responsibility. 15 new tests; ~80 LOC. Unblocks Stage D conditioners (Transformer, GNN) which both consume these features.
+- *2026-04-22* — **Stage D closed.** One preparatory change + three reference conditioners + one shared fixture. The preparatory change: `SplitCoupling.flatten_input: bool = True` hatch (default preserves the flat-`(B, N*d)` contract MLP expects; `False` passes the structured `(B, N_frozen, d)` slice through to permutation-aware conditioners). Four new public names in `nflojax.nets`: `DeepSets` (permutation-invariant aggregator), `Transformer` (pre-norm multi-head self-attention, permutation-equivariant per-token), `GNN` (top-K PBC-aware message passing, `num_neighbours=12` default). All three satisfy the existing conditioner contract (`context_dim` attribute + `apply` + `get_output_layer`/`set_output_layer`) and use a top-level `Dense(..., name="dense_out")` to stay compatible with `SplitCoupling._patch_dense_out`. §10.4 resolved (pre-norm), §10.5 resolved (12 neighbours). New `tests/test_conditioner_protocol.py` locks the contract at 5 checks × 4 conditioners; per-conditioner detail in `tests/test_nets.py`. Two subtle-bug fixes during implementation: (1) self-mask computed via `jnp.where(eye_bool, inf, d_sq)` to avoid `0 * inf = NaN` off-diagonal; (2) test N bumped to 8 particles so `num_neighbours=3` stays < N_frozen=4 at init.
+- *2026-04-22* — **Post-close refactor (P1).** Dropped the `set_output_layer` slicing magic from `Transformer` and `GNN`. Instead, `SplitCoupling._patch_dense_out` (and `SplineCoupling._patch_dense_out` for symmetry) now reads the conditioner's current `dense_out` bias length and sizes `identity_spline_bias(num_scalars = bias_size // params_per_scalar, …)` to match. Works for flat and per-token dense_out uniformly because `identity_spline_bias` is a per-scalar pattern tiled across scalars. Net: `Transformer.set_output_layer` / `GNN.set_output_layer` collapsed to the trivial dict-update form (same as `DeepSets`); one Gotcha removed from AGENTS.md; one "library-private convention" line struck; a bias-shape divisibility check added in both `_patch_dense_out` sites. Reason: the slicing hack was a hidden coupling between conditioners and `SplitCoupling`'s internals; inferring from the conditioner keeps the contract local and easier to extend.
+- *2026-04-22* — **Post-close hardening.** Four audit items landed as separate changes: (1) `Transformer` uses `nn.MultiHeadDotProductAttention` instead of the now-deprecated `nn.SelfAttention`; (5) `SplitCoupling.init_params` runs a one-sample dummy apply after `_patch_dense_out` and raises a clear, diagnostic `ValueError` when the conditioner's output total-trailing size doesn't match `transformed_flat · params_per_scalar` — catches per-token `Transformer`/`GNN` misconfigured for asymmetric splits at init rather than as a cryptic reshape error at forward time; (4) removed per-conditioner factories `init_deepsets`/`init_transformer`/`init_gnn` (~75 LOC) in favour of a single generic `init_conditioner(key, conditioner, dummy_x, dummy_context=None)` helper (5 LOC) — shrinks the public API, removes three redundant public names, and keeps all init paths uniform; (3) new `tests/test_particle_integration.py` parametrised over `DeepSets`/`Transformer`/`GNN` composing four alternating-swap `SplitCoupling` layers through `CompositeTransform` — asserts identity-at-init, jit round-trip, and non-zero gradient. Reason: each item brings surface down or failure-mode clarity up; together they move Stage D from "works" to "robust + discoverable".

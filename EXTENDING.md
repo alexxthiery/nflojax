@@ -245,33 +245,65 @@ SplitCoupling.required_out_dim(transformed_flat, num_bins)  # transformed_flat *
 ### Input Shape Contract (Flat vs. Structured)
 
 `AffineCoupling` and `SplineCoupling` pass `x * mask` to the conditioner,
-shape `(..., dim)` — the flat mask contract. `SplitCoupling` instead
-flattens the structured frozen slice before calling the conditioner:
+shape `(..., dim)` — the flat mask contract. `SplitCoupling` can hand
+the frozen slice to the conditioner in either shape, controlled by the
+`flatten_input` field:
 
 ```python
 # Inside SplitCoupling._forward_or_inverse
-batch_shape = frozen.shape[: -self.event_ndims]
-frozen_flat = frozen.reshape(batch_shape + (-1,))
-theta = self.conditioner.apply({"params": mlp_params}, frozen_flat, context)
+cond_input = frozen.reshape(batch_shape + (-1,)) if self.flatten_input else frozen
+theta = self.conditioner.apply({"params": mlp_params}, cond_input, context)
 ```
 
-So by default the conditioner receives a **flat** vector even when the
-coupling's event is structured. The default `MLP` works unchanged.
+- `flatten_input=True` (default): conditioner receives a flat
+  `(*batch, frozen_flat)` vector. Matches the `MLP` contract.
+- `flatten_input=False`: conditioner receives the structured
+  `(*batch, *frozen_shape)` tensor directly. Preferred for
+  permutation-aware conditioners — the three built-in examples
+  (`DeepSets`, `Transformer`, `GNN`) all use this path.
 
-If you want a conditioner that exploits the structure (e.g. a GNN over
-particle neighborhoods), write a custom Flax module that accepts the
-structured shape and handles the reshape itself. Two options:
+The output-side reshape only depends on total element count. The
+conditioner may emit either a flat `(*batch, transformed_flat · (3K − 1))`
+or a structured `(*batch, *transformed_shape, 3K − 1)` tensor of the
+same total size — both unflatten correctly.
 
-1. **Reshape inside the conditioner.** Accept `x` of shape `(..., N*d)`,
-   reshape to `(..., N, d)` inside `__call__`, and produce output of shape
-   `(..., transformed_flat * (3K - 1))` to match `SplitCoupling`'s
-   expectation. No changes to `SplitCoupling` needed.
-2. **Bypass the default flattening.** Subclass `SplitCoupling` and override
-   `_forward_or_inverse` to pass the structured slice directly. This is a
-   deeper customization and should be a last resort.
+**Recipe for a custom structured-input conditioner:**
 
-Option 1 is the library default path; most GNN integrations fit it with a
-single `x.reshape(*x.shape[:-1], N, d)` at the top of the conditioner.
+```python
+import flax.linen as nn
+import jax.numpy as jnp
+from nflojax.transforms import SplitCoupling
+
+class MyConditioner(nn.Module):
+    out_per_particle: int
+    context_dim: int = 0
+
+    @nn.compact
+    def __call__(self, x, context=None):       # x: (*batch, N, d)
+        # ... permutation-aware processing ...
+        return nn.Dense(self.out_per_particle, name="dense_out")(h)
+
+    def get_output_layer(self, params):
+        return params["dense_out"]
+
+    def set_output_layer(self, params, kernel, bias):
+        return {**params, "dense_out": {"kernel": kernel, "bias": bias}}
+
+coupling = SplitCoupling(
+    event_shape=(N, d), split_axis=-2, split_index=N // 2,
+    event_ndims=2, conditioner=MyConditioner(out_per_particle=d * (3*K - 1)),
+    num_bins=K, flatten_input=False,
+)
+params = coupling.init_params(key)
+```
+
+`SplitCoupling._patch_dense_out` reads the conditioner's current
+`dense_out` bias length and sizes `identity_spline_bias` to match
+(as long as the bias length is a multiple of `params_per_scalar =
+3K − 1` for linear-tails splines). So a per-token `dense_out` of width
+`d · params_per_scalar` and a flat `dense_out` of width
+`transformed_flat · params_per_scalar` both initialise to identity with
+no extra plumbing on the conditioner.
 
 ### Template
 

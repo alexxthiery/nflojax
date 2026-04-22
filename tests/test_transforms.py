@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import jax
 import jax.numpy as jnp
+import flax.linen as nn
 
 from nflojax.transforms import (
     LinearTransform,
@@ -1681,6 +1682,173 @@ class TestSplitCoupling:
         x_low = jax.random.uniform(key, (N * d,), minval=-3.0, maxval=3.0)
         with pytest.raises(ValueError, match="event_ndims"):
             coupling.forward(params, x_low)
+
+
+# ============================================================================
+# SplitCoupling.flatten_input hatch (structured-input conditioners)
+# ============================================================================
+#
+# When flatten_input=False, SplitCoupling passes the frozen slice with its
+# particle axis intact — the path DeepSets / Transformer / GNN need. Verify
+# that a structured-input conditioner round-trips and initialises to identity
+# exactly like the flat-input MLP path, with dense_out patched via the usual
+# identity_spline_bias mechanism.
+class _StructuredConditioner(nn.Module):
+    """Stub: sees frozen (..., N_frozen, d), pools, emits flat dense_out."""
+    n_transformed: int
+    out_per_particle: int
+    context_dim: int = 0
+
+    @nn.compact
+    def __call__(self, x, context=None):
+        # x shape: (..., N_frozen, d). Sum-pool over the particle axis.
+        h = nn.Dense(8, name="phi")(x)
+        h = nn.relu(h)
+        h = jnp.sum(h, axis=-2)
+        out = nn.Dense(self.n_transformed * self.out_per_particle, name="dense_out")(h)
+        return out
+
+    def get_output_layer(self, params):
+        return {
+            "kernel": params["dense_out"]["kernel"],
+            "bias": params["dense_out"]["bias"],
+        }
+
+    def set_output_layer(self, params, kernel, bias):
+        return {
+            **params,
+            "dense_out": {"kernel": kernel, "bias": bias},
+        }
+
+
+class TestSplitCouplingFlattenInputHatch:
+    """flatten_input=False delivers structured (..., N_frozen, d) to the conditioner."""
+
+    def test_structured_conditioner_sees_unflattened_input(self, key):
+        """The conditioner receives a rank-3 frozen slice, not a flattened vector."""
+        N, d = 6, 3
+        K = 4
+        params_per_scalar = 3 * K - 1
+        cond = _StructuredConditioner(
+            n_transformed=N // 2,
+            out_per_particle=d * params_per_scalar,
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=N // 2,
+            event_ndims=2,
+            conditioner=cond,
+            num_bins=K,
+            flatten_input=False,
+        )
+        params = coupling.init_params(key)
+        # Check the conditioner parameters are sized for rank-3 input:
+        # phi kernel input-dim must equal d (the coord axis), not N_frozen*d.
+        assert params["mlp"]["phi"]["kernel"].shape[0] == d
+
+    def test_round_trip(self, key):
+        """forward / inverse round-trip holds with a structured conditioner."""
+        N, d = 6, 3
+        K = 4
+        params_per_scalar = 3 * K - 1
+        cond = _StructuredConditioner(
+            n_transformed=N // 2,
+            out_per_particle=d * params_per_scalar,
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=N // 2,
+            event_ndims=2,
+            conditioner=cond,
+            num_bins=K,
+            flatten_input=False,
+        )
+        params = coupling.init_params(key)
+        x = jax.random.uniform(key, (5, N, d), minval=-3.0, maxval=3.0)
+        y, ld_f = coupling.forward(params, x)
+        x_back, ld_i = coupling.inverse(params, y)
+        assert y.shape == x.shape
+        assert jnp.allclose(x_back, x, atol=1e-4)
+
+    def test_identity_at_init(self, key):
+        """With dense_out zeroed via identity_spline_bias, the coupling is identity."""
+        N, d = 4, 2
+        K = 4
+        params_per_scalar = 3 * K - 1
+        cond = _StructuredConditioner(
+            n_transformed=N // 2,
+            out_per_particle=d * params_per_scalar,
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=N // 2,
+            event_ndims=2,
+            conditioner=cond,
+            num_bins=K,
+            flatten_input=False,
+            tail_bound=5.0,
+        )
+        params = coupling.init_params(key)
+        # Inside the tail bound: output ≈ input, log_det ≈ 0.
+        x = jax.random.uniform(key, (3, N, d), minval=-2.0, maxval=2.0)
+        y, log_det = coupling.forward(params, x)
+        assert jnp.allclose(y, x, atol=1e-5)
+        assert jnp.allclose(log_det, 0.0, atol=1e-5)
+
+    def test_jit(self, key):
+        """forward and inverse are jit-compatible with structured input."""
+        N, d = 4, 2
+        K = 4
+        params_per_scalar = 3 * K - 1
+        cond = _StructuredConditioner(
+            n_transformed=N // 2,
+            out_per_particle=d * params_per_scalar,
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=N // 2,
+            event_ndims=2,
+            conditioner=cond,
+            num_bins=K,
+            flatten_input=False,
+        )
+        params = coupling.init_params(key)
+        fwd = jax.jit(lambda p, x: coupling.forward(p, x))
+        inv = jax.jit(lambda p, y: coupling.inverse(p, y))
+        x = jax.random.uniform(key, (4, N, d), minval=-2.0, maxval=2.0)
+        y, ld_f = fwd(params, x)
+        x_back, ld_i = inv(params, y)
+        assert y.shape == x.shape
+        assert jnp.allclose(x_back, x, atol=1e-4)
+
+    def test_per_token_conditioner_asymmetric_split_raises(self, key):
+        """A per-token conditioner (out_per_particle sized for a symmetric
+        split) used with an asymmetric split_index raises a clear error at
+        init — not a cryptic reshape error at forward time."""
+        from nflojax.nets import Transformer
+        N, d, K = 6, 3, 4
+        params_per_scalar = 3 * K - 1
+        # out_per_particle sized as if N_frozen == N_transformed (half-half);
+        # but split_index=2 gives N_frozen=2, N_transformed=4 — asymmetric.
+        cond = Transformer(
+            num_layers=1, num_heads=2, embed_dim=8,
+            out_per_particle=d * params_per_scalar,
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=2,
+            event_ndims=2,
+            conditioner=cond,
+            num_bins=K,
+            flatten_input=False,
+        )
+        with pytest.raises(ValueError, match="total trailing size"):
+            coupling.init_params(key)
 
 
 # ============================================================================
