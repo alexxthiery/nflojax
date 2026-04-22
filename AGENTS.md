@@ -44,6 +44,7 @@ nflojax/
   splines.py           Rational-quadratic spline primitives
   scalar_function.py   LOFT forward/inverse scalar functions
   geometry.py          Geometry value object (box bounds + per-axis periodicity)
+  embeddings.py        circular_embed, positional_embed (stateless feature transforms)
   utils/
     __init__.py        empty
     pbc.py             nearest_image, pairwise_distance(_sq) under PBC
@@ -57,6 +58,7 @@ tests/
   test_splines.py
   test_distributions.py
   test_nets.py
+  test_embeddings.py
   test_utils_pbc.py
   test_utils_lattice.py
 ```
@@ -67,7 +69,8 @@ tests/
 builders     -> flows, transforms, distributions, nets
 flows        -> transforms (gate), nets (types)
 transforms   -> nets (MLP), splines, scalar_function, geometry
-distributions -> geometry (UniformBox), nets (types)
+distributions -> geometry (UniformBox), utils.lattice (LatticeBase factories), nets (types)
+embeddings   -> geometry (circular_embed), nets (types)
 utils.pbc    -> geometry, nets (types)
 utils.lattice -> numpy (no JAX / Flax — static lattice positions)
 geometry     -> numpy (no JAX / Flax — configuration values only)

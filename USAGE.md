@@ -369,6 +369,55 @@ log_p   = lb.log_prob(None, samples)               # (batch,); incl. -log(N!)
 geom    = lb.geometry                              # box [0, 2]^3 ready for Rescale
 ```
 
+## Conditioner features (embeddings)
+
+Stateless feature transforms for the input side of a custom conditioner:
+
+- `nflojax.embeddings.circular_embed(x, geometry, n_freq)` — per-coord
+  Fourier features on a periodic box; lowest harmonic tiles `geometry.box`
+  exactly. Last axis grows from `d` to `d * 2 * n_freq`.
+- `nflojax.embeddings.positional_embed(t, n_freq, base=10_000)` —
+  sinusoidal scalar embedding for context like temperature, density, or
+  MD step. Last axis grows from `()` to `2 * n_freq`.
+
+See [REFERENCE.md#nflojaxembeddings](REFERENCE.md#nflojaxembeddings) for
+the full math + shape contracts.
+
+```python
+import flax.linen as nn
+import jax.numpy as jnp
+from nflojax.embeddings import circular_embed, positional_embed
+from nflojax.geometry import Geometry
+
+class FourierMLPConditioner(nn.Module):
+    """Custom conditioner: Fourier features over particle coords + scalar T."""
+    geometry: Geometry
+    n_freq_x: int = 4
+    n_freq_t: int = 8
+    context_dim: int = 0  # for validate_conditioner; not used here
+    out_dim: int = 1
+
+    @nn.compact
+    def __call__(self, x, context=None):
+        # Particle Fourier features: (..., d) -> (..., d * 2 * n_freq_x).
+        feat_x = circular_embed(x, self.geometry, self.n_freq_x)
+        if context is not None:
+            # Sinusoidal temperature embedding.
+            feat_t = positional_embed(context, self.n_freq_t)
+            feat_t = jnp.broadcast_to(
+                feat_t[..., None, :], feat_x.shape[:-1] + feat_t.shape[-1:]
+            )
+            inp = jnp.concatenate([feat_x, feat_t], axis=-1)
+        else:
+            inp = feat_x
+        return nn.Dense(self.out_dim, kernel_init=nn.initializers.zeros)(inp)
+```
+
+This is the canonical "user-supplied conditioner" pattern referenced in
+DESIGN.md §5.2 — flows pass any PyTree context through, so a custom
+conditioner can choose its own embedding strategy without changes
+elsewhere in the stack.
+
 ## Periodic boxes and the torus
 
 For flows on a periodic box, two pieces cooperate:

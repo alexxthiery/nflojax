@@ -1052,6 +1052,75 @@ generator following the `_make_lattice` recipe in `nflojax/utils/lattice.py`.
 **Not for:** lattice-specific physics (Madelung sums, defect generation),
 non-orthorhombic cells (DESIGN.md §4.8).
 
+### nflojax.embeddings
+
+```python
+from nflojax.embeddings import circular_embed, positional_embed
+```
+
+Stateless feature transforms used by Stage D conditioners (Transformer,
+GNN) and any user-supplied conditioner that wants ready-made periodic /
+scalar features. No learnable parameters; no random state.
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `circular_embed(x, geometry, n_freq)` | `(..., d), Geometry, int -> (..., d * 2 * n_freq)` | Per-coord Fourier features on a periodic box. The lowest harmonic exactly tiles `geometry.box`. |
+| `positional_embed(t, n_freq, base=10_000)` | `(...,), int, float -> (..., 2 * n_freq)` | Sinusoidal scalar embedding (transformer-style, continuous `t`). For temperature, density, MD step. |
+
+`n_freq` must be `>= 1` for both (zero-frequency would silently produce a
+zero-width last axis and break downstream `jnp.concatenate`).
+
+```python
+import jax.numpy as jnp
+from nflojax.geometry import Geometry
+from nflojax.embeddings import circular_embed, positional_embed
+
+# Periodic-box features: 32 atoms in a [-1, 1]^3 cubic box, 4 harmonics.
+geom = Geometry.cubic(d=3, side=2.0, lower=-1.0)
+x    = jax.random.uniform(key, (B, 32, 3), minval=-1, maxval=1)
+feat = circular_embed(x, geom, n_freq=4)             # (B, 32, 24)
+
+# Scalar context features: temperature ~ U(0.5, 2.0).
+t    = jax.random.uniform(key, (B,), minval=0.5, maxval=2.0)
+ctx  = positional_embed(t, n_freq=8)                  # (B, 16)
+
+# Concatenate to form a custom conditioner input.
+inp = jnp.concatenate(
+    [feat, jnp.broadcast_to(ctx[:, None, :], feat.shape[:-1] + ctx.shape[-1:])],
+    axis=-1,
+)                                                      # (B, 32, 40)
+```
+
+**Math** — `circular_embed`:
+
+```
+phase[..., j, k] = 2 * pi * (k + 1) * (x[..., j] - lower[j]) / box[j]
+out[..., j, 2k]     = cos(phase[..., j, k])
+out[..., j, 2k + 1] = sin(phase[..., j, k])
+```
+
+then flatten the trailing `(d, 2 * n_freq)` axes. Periodic in each coord
+axis with period `geometry.box[j]`.
+
+**Math** — `positional_embed` (matches "Attention Is All You Need" with
+continuous `t`):
+
+```
+freq[k]            = base ** (-k / n_freq)         # k in [0, n_freq)
+out[..., 2k]       = cos(t * freq[k])
+out[..., 2k + 1]   = sin(t * freq[k])
+```
+
+**Non-periodic axes.** `circular_embed` does not gate on
+`geometry.periodic`. The math is well-defined for any `box[j]`, but using
+`circular_embed` on an axis that's *not* periodic in your physical setup
+is the caller's mistake — no warning is raised. (This may grow a
+`mask_non_periodic` knob post-v1 if a real use case appears.)
+
+**Not for:** learnable embeddings (those go into a Flax `nn.Module` in
+`nets.py` per DESIGN.md §8); graph / edge features (the GNN computes
+those directly).
+
 ## Parameter Structure
 
 ### Flow params
