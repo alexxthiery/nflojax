@@ -427,7 +427,9 @@ class TestPermutation:
         # Particles are re-ordered; coordinates within each particle unchanged.
         for i in range(N):
             assert jnp.allclose(y[:, i, :], x[:, int(perm[i]), :])
-        assert log_det.shape == (5, d)
+        # Batch-shape-only log-det per DESIGN.md §5.5: event_axis=-2 means
+        # axes [-2, -1] are event axes, so log-det shape is x.shape[:-2]=(5,).
+        assert log_det.shape == (5,)
         assert jnp.all(log_det == 0.0)
 
     def test_event_axis_roundtrip(self, key):
