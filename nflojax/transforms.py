@@ -2037,10 +2037,16 @@ class Permutation:
             )
 
     def _zero_logdet(self, x: Array) -> Array:
-        """Return a zero log-det matching the shape of `x` minus the permuted axis."""
-        remaining = list(x.shape)
-        remaining.pop(self.event_axis)
-        return jnp.zeros(tuple(remaining), dtype=x.dtype)
+        """Return a zero log-det with batch shape = `x.shape[:event_axis]`.
+
+        Per DESIGN.md §5.5, log-det carries batch shape only (all axes at or
+        after ``event_axis`` are event axes). ``event_axis`` is negative, so
+        ``x.shape[:event_axis]`` drops the permuted axis *and* every axis to
+        its right. For rank-1 ``(B, dim)`` with ``event_axis=-1`` this is
+        ``(B,)``; for rank-2 ``(B, N, d)`` with ``event_axis=-2`` this is
+        also ``(B,)``.
+        """
+        return jnp.zeros(x.shape[: self.event_axis], dtype=x.dtype)
 
     def forward(
         self, params: Any, x: Array, context: Array | None = None

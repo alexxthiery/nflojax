@@ -326,27 +326,51 @@ still flows, so the symptoms are subtle.
 
 ### Pattern A: `CoMProjection`
 
-Base distribution lives on the `(N−1, d)` reduced space. The last bijection
-before ambient coordinates is `CoMProjection.inverse`, which embeds into
-the zero-CoM subspace of `R^(Nd)`.
+Base distribution lives on the `(N−1, d)` reduced space. The last
+bijection before ambient coordinates embeds into the zero-CoM subspace of
+`R^(Nd)` via `CoMProjection.inverse`.
+
+**Canonical path — use the builder.**
+[`build_particle_flow(use_com_shift=True)`](REFERENCE.md#build_particle_flow)
+assembles the full chain with the correct direction semantics. Pass a
+base distribution on `(N-1, d)` (e.g. `UniformBox(geometry,
+event_shape=(N-1, d))`) and the builder handles the CoM embedding.
+
+**Manual assembly.** `CompositeTransform.forward` applies `block.forward`
+sequentially, so every block's `.forward` must match the base → data
+direction. `CoMProjection.forward` *reduces* `(N, d) → (N-1, d)` (by
+convention — see [REFERENCE.md#comprojection](REFERENCE.md#comprojection)),
+which is the data → base direction. To use it at the tail of a
+`CompositeTransform`, wrap it in a small direction-flipping shim whose
+`.forward` calls `CoMProjection.inverse` and vice versa:
 
 ```python
+from dataclasses import dataclass
 from nflojax.distributions import DiagNormal
-from nflojax.transforms import CoMProjection, CompositeTransform
 from nflojax.flows import Flow
+from nflojax.transforms import CoMProjection, CompositeTransform
 
-# Inner flow operates on (N-1, d).
-inner = CompositeTransform(blocks=[...])
-proj, proj_params = CoMProjection.create(key)
+@dataclass
+class CoMEmbed:
+    """Direction-flipped CoMProjection: forward expands (N-1, d) -> (N, d)."""
+    event_axis: int = -2
+    def __post_init__(self):
+        self._proj = CoMProjection(event_axis=self.event_axis)
+    def forward(self, params, x, context=None):
+        return self._proj.inverse(params, x, context)
+    def inverse(self, params, y, context=None):
+        return self._proj.forward(params, y, context)
+    def init_params(self, key, context_dim=0):
+        return {}
 
-# Composite: inner first, then CoMProjection.inverse at sampling time.
-# (Remember composition is T_n o ... o T_1 — place CoMProjection last.)
+# Inner flow operates on (N-1, d); CoMEmbed expands to (N, d) at the tail.
+inner = CompositeTransform(blocks=[...])         # your inner stack on (N-1, d)
 flow = Flow(
     base_dist=DiagNormal(event_shape=(N - 1, d)),
-    transform=CompositeTransform(blocks=[inner, proj]),
+    transform=CompositeTransform(blocks=[inner, CoMEmbed(event_axis=-2)]),
 )
 
-# Sampling: base (N-1, d) -> inner -> CoMProjection.inverse -> x in ambient
+# Sampling: base (N-1, d) -> inner -> CoMEmbed.forward -> x in ambient
 # zero-CoM subspace.
 samples = flow.sample(params, key, (batch_size,))
 
@@ -355,16 +379,15 @@ log_q_reduced = flow.log_prob(params, samples)
 
 # To compare against an ambient energy E(x), add the correction:
 log_q_ambient = log_q_reduced + CoMProjection.ambient_correction(N, d)
-
-# For gradient-based training, the constant is irrelevant — either form
-# gives the same gradient. Keep the form that matches the downstream
-# quantity you measure.
 ```
+
+The shim is ~12 lines of user code; `build_particle_flow` uses the same
+pattern internally (search for `_CoMEmbed` in `nflojax/builders.py`).
 
 **When to apply the correction**: see the decision box in
 [REFERENCE.md#comprojection](REFERENCE.md#comprojection). Short version —
 *yes* for importance weights / ESS / `logZ` / absolute density, *no* for
-training-loss gradients.
+training-loss gradients (the constant has zero gradient).
 
 ### Pattern B: Augmented coupling (bgmat-style)
 
