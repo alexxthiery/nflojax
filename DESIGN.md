@@ -105,11 +105,11 @@ Each exclusion is a deliberate boundary. If a contributor proposes moving one of
 
 6. **No marginal inference, no free-energy integration, no phase-diagram machinery.** Research-layer utilities stay with the research.
 
-7. **No SE(3) or E(3) equivariant architectures.** Permutation equivariance is in; rotation / reflection equivariance is out. Implementing a good E(3) MPNN is a research product in its own right (EGNN, NequIP, MACE, PaiNN) and each has opinions we do not want to relitigate. If a user needs E(3), they bring their own conditioner.
+7. **No SE(3) or E(3) equivariant architectures (v1.0).** Permutation equivariance is in; rotation / reflection equivariance is out. Implementing a good E(3) MPNN is a research product in its own right (EGNN, NequIP, MACE, PaiNN) and each has opinions we do not want to relitigate. If a user needs E(3) at the *conditioner* level, they bring their own. E(3)-equivariance at the *coupling* level (i.e. a full-flow density with SO(3) symmetry) is the post-v1 "E(3) / SE(3) bijections" item in `PLAN.md §8b`; trigger wording there was sharpened after bgmat-clean MS2g surfaced concrete evidence that `SplitCoupling` + axis-splines cannot match highly symmetric targets like LJ13. Note that Pattern B (augmented coupling, item 9 below) is ordered *before* this: it recovers `S_N` on its own and is cheap; only if it still misses the bar specifically because of SO(d) does E(n)-equivariant coupling land.
 
 8. **No triclinic / non-orthogonal boxes** — yet. bgmat's in-progress support stays there until someone lands a clean orthogonal / triclinic abstraction that is provably bug-free on the orthogonal path. Adding broken triclinic support to nflojax is worse than no triclinic support.
 
-9. **No augmented-coupling "framework".** Augmented coupling is a *composition pattern*: double the base dimension, run a flow over the augmented state, marginalize. This is expressible today with `UniformBox` / `DiagNormal` + `SplitCoupling`. It stays documented in `EXTENDING.md`, not added as a dedicated class. Patterns live in docs; primitives live in code.
+9. **No augmented-coupling "framework" (v1.0).** Augmented coupling is a *composition pattern*: double the base dimension, run a flow over the augmented state, marginalize. This is expressible today with `UniformBox` / `DiagNormal` + `SplitCoupling`, and documented in `EXTENDING.md` as Pattern B. Patterns live in docs; primitives live in code. **Post-v1 trigger update (2026-04-23)**: bgmat-clean MS2g established that axis-split `SplitCoupling` cannot match `S_N`-invariant Boltzmann targets like LJ13's, and Pattern B is the documented escape route. `PLAN.md §8b` now lists "Pattern B promoted to a primitive" as a trigger-gated post-v1 item (second external consumer fires it), ordered strictly *before* the E(n)-equivariant-coupling work in item 7 above. Promotion would add a `build_augmented_flow(...)` builder and a `marginalise_aux_half(...)` inference-time helper; the underlying `SplitCoupling` stays unchanged.
 
 10. **No heavy dependency surface.** Current deps: JAX, Flax (for `linen` modules). We do not adopt Distrax, Haiku, TFP-bijectors, e3nn, Jraph, or Equinox. Any new dep must replace substantial home-grown code and survive review by the "lean and hackable" rule.
 
@@ -200,10 +200,10 @@ Choose `DeepSets` when the per-particle update depends only on aggregate statist
 
 ### 7.3 Groups beyond Sn
 
-E(3) / SE(3) equivariance is out of scope by design (see §4). If a future application needs it, the design handles it via:
+E(3) / SE(3) equivariance is out of scope for v1.0 by design (see §4). If a future application needs it, the design handles it via:
 
-- A user-supplied conditioner that is E(3) equivariant (EGNN, NequIP, MACE, PaiNN — these exist as libraries; we depend on none of them).
-- Flow layers that are equivariant under the relevant group: for E(3), this means coupling layers that transform invariant features (distances, angles) rather than raw coordinates. This is expressible with the current machinery but is a user-level construction.
+- A user-supplied conditioner that is E(3) equivariant (EGNN, NequIP, MACE, PaiNN — these exist as libraries; we depend on none of them). This works at the *conditioner* level — full-flow SO(d) equivariance additionally requires the coupling transformation itself to be equivariant (per-scalar spline couplings are not).
+- Flow layers that are equivariant under the relevant group: for E(3), this means coupling layers that transform invariant features (distances, angles) rather than raw coordinates. This is expressible with the current machinery but is a user-level construction. A library-level lift is the `PLAN.md §8b` "E(3) / SE(3) bijections" trigger (post-v1, ordered after Pattern B promotion).
 
 ### 7.4 Boundaries
 

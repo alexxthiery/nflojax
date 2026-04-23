@@ -342,7 +342,8 @@ Each post-v1 item lands only if a named trigger fires. No speculative extensions
 
 - **Transformer / GNN reference conditioners** — if a third-party application other than DM / bgmat asks for one of them, ship it. Otherwise stay at `DeepSets`. Audit §12.3.
 - **Triclinic boxes** — if bgmat stabilises its triclinic path and a downstream app asks, generalise `Geometry` to carry an optional `cell: Array | None` field and retrofit every consumer. Audit §4 item 8.
-- **E(3) / SE(3) bijections** — if a molecular downstream application lands, introduce `transforms/equivariant.py` with EGNN-style couplings. Audit §7.3 documents why this is non-trivial.
+- **Pattern B promoted to a primitive** — *trigger is now partially fired* (bgmat-clean MS2g showed axis-split `SplitCoupling` can't match LJ13-type targets; `EXTENDING.md` Pattern B is the documented escape route and already has one consumer in bgmat). The promotion is: a `build_augmented_flow(*, base, num_layers, conditioner, ...)` builder in `nflojax.builders`, a `marginalise_aux_half(...)` inference-time helper, and the private `_CoMEmbed` shim kept as-is (augmented flows don't need it). Full trigger fires when a **second external consumer** requests augmented coupling — expected to be bgmat-clean MS2h.Variant-D on LJ13 or MS3 mW if `SplitCoupling` + GNN alone under-performs. Estimated scope: 2–3 days. Strictly precedes the E(n)-equivariant-coupling item below: Pattern B fixes `S_N` without touching `SO(d)`, and is far cheaper.
+- **E(3) / SE(3) bijections** — *trigger is not yet fired*. Requires (a) Pattern B primitive landed; (b) a downstream application that still misses its success criteria **specifically** because of broken `SO(d)` equivariance, not because of `S_N` (Pattern B should close `S_N` on its own). bgmat-clean LJ13 and DW4 do not yet establish this — LJ13 is blocked on Pattern B first; DW4's reverse-KL mode-ratio gap is objective-bias, not rotation. If triggered, introduce `transforms/equivariant.py` with EGNN-style couplings (requires splitting `transforms.py` into a `transforms/` subdir per Stage-0 deferred task). Estimated scope: multi-week; DESIGN.md §4 item 7 and §7.3 document why this is non-trivial.
 - **Block permutation / heteronuclear lattices** — if a multi-species materials application lands, generalise `Permutation` and `LatticeBase`. Audit §7.5.
 - **Flow matching / diffusion** — **not** shipped in nflojax; a sibling library. Audit §12.17.
 
@@ -373,10 +374,10 @@ A concrete, falsifiable success criterion: **a graduate student who has never us
 Things explicitly deferred. Each entry has a one-line reason.
 
 - **Triclinic / non-orthogonal boxes.** Lands only once orthogonal + triclinic share a clean API and bgmat's WIP settles. See DESIGN.md §4 item 8.
-- **SE(3) / E(3) equivariant conditioner.** Out by design; user brings EGNN / NequIP / MACE when needed. DESIGN.md §4 item 7.
+- **SE(3) / E(3) equivariant conditioner.** User brings EGNN / NequIP / MACE when needed at the *conditioner* level. The *coupling*-level equivalent is §8b "E(3) / SE(3) bijections" (trigger-gated, needs Pattern B promoted first). DESIGN.md §4 item 7.
 - **Block permutation (multi-species).** Waits for a concrete multi-species application. DESIGN.md §7.5.
 - **Heteronuclear lattices.** Same. DESIGN.md §7.5.
-- **Augmented-coupling primitive.** Stays a pattern in `EXTENDING.md`, not a class. DESIGN.md §4 item 9.
+- **Augmented-coupling primitive (Pattern B).** *Trigger partially fired by bgmat-clean MS2g*; promotion path documented in §8b. Today it stays a recipe in `EXTENDING.md`; full promotion waits on a second external consumer (expected at bgmat-clean MS2h.Variant-D or MS3). DESIGN.md §4 item 9.
 - **Long-range energy support (Ewald / PPPM).** Energy-side; not flow-side. DESIGN.md §7.6.
 
 ---
