@@ -840,6 +840,8 @@ ds_params = init_conditioner(key, ds, jnp.zeros((1, N_frozen, d)))
 
 **Architecture:** per-particle `phi` MLP → sum-pool over the particle axis → `rho` MLP → `dense_out`. Permutation-invariant because sum is symmetric.
 
+**Scope of the symmetry:** `DeepSets` makes the **conditioner** `S_N`-invariant with respect to the particles it sees. Full-flow invariance additionally requires the coupling's partition to respect the symmetry group — and `SplitCoupling`'s index-based partition does *not*: a coupling that freezes atoms `[0, …, split_index)` and transforms `[split_index, …, N)` is at most `S_{N_frozen} × S_{N_transformed}`-equivariant, not `S_N`. For true `S_N`-equivariance with `SplitCoupling`, use the augmented-coupling pattern (`EXTENDING.md` Pattern B) where the split is along a physical / auxiliary boundary rather than an atom index. See `EXTENDING.md` "When axis-split coupling isn't enough" for the detailed story.
+
 | Field | Type | Meaning |
 |-------|------|---------|
 | `phi_hidden` | tuple of int | Hidden widths for the shared per-particle stack |
@@ -869,6 +871,8 @@ params = coupling.init_params(key)
 ```
 
 **Architecture (pre-norm, resolved in PLAN.md §10.4):** per-particle `input_proj` → `L × [attn(LN(h)) + ffn(LN(h))]` with residual connections → final `LN` → per-token `dense_out`. Output shape `(*batch, N, out_per_particle)`. Equivariance holds per-token.
+
+**Scope of the symmetry:** same two-level story as `DeepSets` — the Transformer conditioner is `S_N`-equivariant *per token*, but the full-flow invariance under particle permutations still depends on the coupling's partition. `SplitCoupling` with `split_axis=-2` and a fixed `split_index` is only `S_{N_frozen} × S_{N_transformed}`-equivariant. Pattern B (augmented coupling, see `EXTENDING.md`) is the way to get true `S_N`-equivariance.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -913,6 +917,8 @@ params = coupling.init_params(key)
 | `activation` | callable | `nn.silu` | Activation inside message and update MLPs |
 
 Note: not SE(3)-equivariant — only permutation-equivariant. For E(3)/SE(3), supply a user-side EGNN / NequIP / MACE conditioner (see [DESIGN.md §4 item 7](DESIGN.md)).
+
+**Scope of the symmetry:** same story as the other particle-aware conditioners — `GNN` is `S_N`-equivariant *per token* in its output, but the full-flow particle-permutation invariance still depends on `SplitCoupling`'s partition, which is only `S_{N_frozen} × S_{N_transformed}`-equivariant for an index split. Use Pattern B from `EXTENDING.md` for true `S_N`-equivariance. Rotation equivariance is a separate issue and requires an architecture outside nflojax v1.0 (e.g. EGNN-style coupling; DESIGN.md §8b item 7 is the post-v1 trigger).
 
 ## Geometry
 

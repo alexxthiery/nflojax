@@ -477,3 +477,56 @@ pieces (`CoMProjection`, the standard coupling/spline bijections, the
 structured `SplitCoupling` used inside augmented flows) but does not ship
 an "augmented coupling" class — the pattern lives here as documentation.
 See DESIGN.md §4 item 9 for why.
+
+### When axis-split coupling isn't enough
+
+`SplitCoupling` with `split_axis=-2` and a fixed `split_index` partitions
+atoms by their index: atoms `[0, …, split_index)` are frozen, atoms
+`[split_index, …, N)` are transformed (or vice versa with `swap=True`).
+A conditioner that is `S_N`-invariant over its input — `DeepSets` sum-pool,
+`Transformer` with attention, `GNN` with permutation-equivariant message
+passing — makes that **piece** symmetric, but the **overall coupling is
+only `S_{N_frozen} × S_{N_transformed}`-equivariant**, not `S_N`. A
+permutation that moves atom 2 into the transformed partition and atom
+`split_index` into the frozen one gets a different output.
+
+This bites any target whose density is strictly `S_N`-invariant. A
+`SplitCoupling` stack composed with a symmetric conditioner will find the
+"best S_N-invariant approximation within its parametric class", which for
+multimodal targets (e.g. DW4 with its `2^{C(N,2)}` combinatorial modes)
+can cover the bulk of the reference distribution on first-moment
+observables but leaves the symmetry orbits empirically "stitched" rather
+than structurally equivalent. For sharply-basin-dominated targets (e.g.
+the LJ13 icosahedral minimum) the gap is typically much worse — the flow
+collapses into one chart-aligned basin and the symmetry diagnostic
+(`var(log q)` under random `S_N` permutations of a fixed config) stays
+non-zero even after long training.
+
+Three escape routes, in order of how far they take you from nflojax's
+coupling-flow primitives:
+
+1. **Pattern B (augmented coupling), as described above.** The split is
+   along the physical / auxiliary boundary, not along an atom index —
+   each half is fully `S_N`-equivariant when its conditioner is. This
+   is the approach bgmat uses; it stays entirely within nflojax v1.0
+   primitives.
+
+2. **E(n)-equivariant coupling layers** — message-passing couplings where
+   the bijection is `S_N × E(d)`-equivariant by construction. See
+   Köhler, Klein, Noé (2020) *Equivariant Flows*; Satorras, Hoogeboom,
+   Welling (2021) *E(n) Equivariant Normalizing Flows*. These are the
+   canonical fix when rotation invariance also matters and reverse-KL
+   training on a symmetric target is the goal. **Not in nflojax v1.0;**
+   DESIGN.md §4 item 7 is the post-v1 trigger.
+
+3. **Continuous normalising flow or flow matching with an equivariant
+   vector field** — abandon coupling flows entirely. See Köhler-Klein-Noé
+   2020 and Klein-Krämer-Noé (2023) *Equivariant Flow Matching*. Out of
+   nflojax's scope; a sibling library.
+
+Take-away: when a downstream application reports mode collapse, ESS ≈ 0,
+or a large symmetry diagnostic on a particle-system target, the first
+question is "does the coupling partition respect the target's symmetry?"
+If the answer is no, no amount of hyperparameter tuning on `SplitCoupling`
+will close the gap. Pattern B is the first-line fix; the other two are
+post-v1 architectural work.
