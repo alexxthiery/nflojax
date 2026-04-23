@@ -22,10 +22,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nflojax.builders import build_particle_flow
-from nflojax.distributions import UniformBox
+from nflojax.builders import assemble_flow, build_particle_flow
+from nflojax.distributions import DiagNormal, UniformBox
 from nflojax.geometry import Geometry
 from nflojax.nets import DeepSets, GNN, Transformer
+from nflojax.transforms import SplitCoupling
 from conftest import requires_x64
 
 
@@ -140,6 +141,90 @@ class TestParticleFlowBuilderSmoke:
             g_out = block.conditioner.get_output_layer(grads["transform"][i]["mlp"])
             total += float(jnp.sum(jnp.abs(g_out["kernel"])))
         assert total > 0.0
+
+
+def test_free_cluster_assemble(key):
+    """Non-periodic `(B, N=13, d=3)` pipeline composes end-to-end.
+
+    Validates the path bgmat-clean MS2 (LJ13) depends on: `Geometry` with
+    `periodic=[False]*d`, `DiagNormal` base on `(N, d)`, a stack of
+    `SplitCoupling(boundary_slopes='linear_tails', flatten_input=False)`
+    with `DeepSets` conditioners, assembled via `assemble_flow`. Bypasses
+    `build_particle_flow` (which hard-wires `CircularShift`) because a
+    free cluster has no box to wrap around.
+
+    Asserts identity-at-init (linear tails are identity inside
+    `[-tail_bound, tail_bound]^d`), jit-trip at init, and non-zero
+    gradient through every `dense_out`.
+    """
+    N, d = 13, 3
+    num_bins, num_layers = 8, 4
+    split_index = N // 2  # asymmetric 6/7 split; swap flips the sizing.
+    tail_bound = 5.0
+
+    # Type-level check that the non-periodic Geometry path works at all;
+    # the flow below does not consume the geometry (no PBC, no Rescale).
+    g = Geometry(
+        lower=[-2.0] * d, upper=[2.0] * d, periodic=[False] * d,
+    )
+    assert not g.is_periodic()
+
+    base = DiagNormal(event_shape=(N, d))
+
+    keys = jax.random.split(key, num_layers)
+    blocks_and_params = []
+    for i, k in enumerate(keys):
+        swap = bool(i % 2)
+        n_frozen = N - split_index if swap else split_index
+        n_transformed = N - n_frozen
+        out_dim = SplitCoupling.required_out_dim(
+            n_transformed * d, num_bins, boundary_slopes="linear_tails",
+        )
+        cond = DeepSets(
+            phi_hidden=(16, 16), rho_hidden=(16,), out_dim=out_dim,
+        )
+        coupling = SplitCoupling(
+            event_shape=(N, d),
+            split_axis=-2,
+            split_index=split_index,
+            event_ndims=2,
+            conditioner=cond,
+            swap=swap,
+            num_bins=num_bins,
+            tail_bound=tail_bound,
+            boundary_slopes="linear_tails",
+            flatten_input=False,
+        )
+        blocks_and_params.append((coupling, coupling.init_params(k)))
+
+    # validate=False because analyze_mask_coverage only understands flat masks
+    # (SplitCoupling has no `mask` attribute; alternating swap covers
+    # particles geometrically).
+    flow, params = assemble_flow(blocks_and_params, base=base, validate=False)
+
+    # Identity-at-init: linear-tail splines are identity inside the active
+    # region at zero-kernel dense_out + identity-spline bias.
+    x = jax.random.uniform(key, (3, N, d), minval=-0.9, maxval=0.9)
+    y, log_det = flow.forward(params, x)
+    assert jnp.allclose(y, x, atol=1e-5)
+    assert jnp.allclose(log_det, 0.0, atol=1e-4)
+
+    # Jit round-trip at init: the full pipeline traces and inverts cleanly.
+    fwd = jax.jit(lambda p, z: flow.forward(p, z))
+    inv = jax.jit(lambda p, z: flow.inverse(p, z))
+    y_jit, _ = fwd(params, x)
+    x_back, _ = inv(params, y_jit)
+    assert jnp.allclose(x_back, x, atol=1e-5)
+
+    # Non-zero gradient on every conditioner's dense_out kernel from a
+    # trivial NLL loss -- proves gradient actually flows through the stack.
+    def loss(p):
+        return -jnp.mean(flow.log_prob(p, x))
+
+    grads = jax.grad(loss)(params)
+    for i, block in enumerate(flow.transform.blocks):
+        g_out = block.conditioner.get_output_layer(grads["transform"][i]["mlp"])
+        assert float(jnp.sum(jnp.abs(g_out["kernel"]))) > 0.0
 
 
 class TestParticleFlowBuilderCoMShift:
