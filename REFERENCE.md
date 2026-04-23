@@ -782,6 +782,40 @@ Importable names: `MLP`, `ResNet`, `DeepSets`, `Transformer`, `GNN` (modules); `
 | `Transformer` | permutation-**equivariant** (per-token output) | structured `(*batch, N, in_dim)` | `SplitCoupling(flatten_input=False)`; the per-token output lines up with the transformed particles only when `N_frozen == N_transformed` (the default half-half split). Asymmetric splits still work, but coupling-level equivariance is lost. |
 | `GNN` | permutation-**equivariant** (per-token output) | structured `(*batch, N, in_dim)` | `SplitCoupling(flatten_input=False)` |
 
+### MLP
+
+```python
+from nflojax.nets import MLP
+
+mlp = MLP(
+    x_dim=frozen_dim,           # required — flat input size
+    context_dim=0,              # 0 for unconditional
+    hidden_dim=64,
+    n_hidden_layers=2,
+    out_dim=required_out_dim,   # e.g. transformed_dim * (3K - 1) for spline couplings
+)
+```
+
+**What:** Residual-block MLP (wraps `ResNet` under `"net"`). The default flat-path conditioner for `AffineCoupling` / `SplineCoupling` / `SplitCoupling(flatten_input=True)`. The coupling's `.create()` constructs it for you; use `MLP(...)` directly when writing a custom coupling or assembling one via `assemble_flow`.
+
+**Context:** must be a single JAX `Array` (or `None`), shape `(context_dim,)` for shared or `(*batch, context_dim)` for per-sample. PyTree contexts require a custom conditioner (see DESIGN.md §5.2).
+
+**Params:** `{"net": {...}}` — a nested dict produced by `init_mlp(key, …)` or `MLP(...).init(key, dummy_x, dummy_context)["params"]`. Zero-initialised `net/dense_out` keeps the flow at identity on init.
+
+**ResNet.** Underlying building block (`nflojax.nets.ResNet`) — rarely constructed directly. Same fields as `MLP` minus `x_dim` / `context_dim` (no context handling, no concatenation). Useful as a head inside a custom equivariant conditioner.
+
+### init_conditioner
+
+```python
+from nflojax.nets import init_conditioner
+
+params = init_conditioner(key, conditioner, dummy_x, dummy_context=None)
+```
+
+Generic helper: runs `conditioner.init(key, dummy_x, dummy_context)` and zeroes `dense_out`'s kernel + bias. Use for standalone conditioners (no `SplitCoupling` wrapping); inside a coupling, `init_params` already handles init + identity patching so you do not need this.
+
+**Works with any module satisfying the optional half of the conditioner contract** (`get_output_layer` / `set_output_layer`). For the full-featured flat-MLP path there are also `init_mlp` and `init_resnet` that accept `hidden_dim` / `n_hidden_layers` / etc. directly and return `(module, params)` pairs; use those when you want the pre-Stage-D builder ergonomics.
+
 ### DeepSets
 
 ```python
