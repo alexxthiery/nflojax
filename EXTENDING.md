@@ -393,24 +393,77 @@ training-loss gradients (the constant has zero gradient).
 
 Double the degrees of freedom with auxiliary Gaussian variables, train the
 inner flow on the `(2N, d)` augmented state, and marginalise the auxiliary
-half at inference. Translation invariance is handled *inside* the augmented
-flow by centring both halves symmetrically — no `CoMProjection` needed.
+half at inference. Translation invariance is handled *inside* the
+augmented flow by centring both halves symmetrically — no `CoMProjection`
+needed.
 
-Sketch (full implementation lives in the bgmat application, not in
-nflojax):
+The full pattern — base, `SplitCoupling` across the physical / auxiliary
+boundary, inference-time marginalisation — is expressible with primitives
+that ship in nflojax:
 
 ```python
-# Base: Gaussian on (2N, d); inner flow: SplitCoupling acting across the
-# physical/auxiliary split_axis. At sampling time, drop the auxiliary half.
-# At log-prob time, integrate over auxiliaries via closed-form or MC.
-# No CoMProjection in the chain.
+import jax, jax.numpy as jnp
+from nflojax.distributions import DiagNormal
+from nflojax.flows import Flow
+from nflojax.nets import MLP
+from nflojax.transforms import CompositeTransform, SplitCoupling
+
+key = jax.random.PRNGKey(0)
+N, d, K = 32, 3, 8
+params_per_scalar = 3 * K - 1
+
+# SplitCoupling across the physical (first N) / auxiliary (last N) boundary.
+# The augmented event shape is (2N, d); split_axis=-2, split_index=N.
+mlp = MLP(
+    x_dim=N * d, context_dim=0, hidden_dim=64, n_hidden_layers=2,
+    out_dim=N * d * params_per_scalar,
+)
+coupling = SplitCoupling(
+    event_shape=(2 * N, d), split_axis=-2, split_index=N, event_ndims=2,
+    conditioner=mlp, swap=False, num_bins=K,
+    flatten_input=True,            # MLP contract; swap to False for DeepSets/...
+)
+coupling_params = coupling.init_params(key)
+
+flow = Flow(
+    base_dist=DiagNormal(event_shape=(2 * N, d)),   # both halves zero-centred
+    transform=CompositeTransform(blocks=[coupling]),
+)
+params = {"base": flow.base_dist.init_params(), "transform": [coupling_params]}
+
+# Sampling: draw (x_physical, x_aux) jointly, drop the auxiliary half.
+joint = flow.sample(params, key, (batch_size,))         # (batch, 2N, d)
+physical = joint[..., :N, :]                             # (batch, N, d)
+
+# Log-prob on the augmented state. For a physical-only density you marginalise
+# over x_aux: the application computes this via closed-form for Gaussian aux
+# bases or Monte Carlo / importance sampling for general aux bases.
+log_q_joint = flow.log_prob(params, joint)               # (batch,)
 ```
 
-The augmented pattern encodes translation invariance via the symmetric
-Gaussian base (both halves zero-centred) rather than explicitly removing a
-DoF. The `(d/2) · log(N)` factor is *not* applicable here — doubling the
-degrees of freedom keeps the ambient dimension intact, and the auxiliary
-marginalisation absorbs the bookkeeping.
+Stack multiple `SplitCoupling` layers (alternate `swap` so both halves get
+transformed) and optionally a `Permutation` within each half for coverage.
+The `MLP` above is shown for simplicity; any conditioner in
+[REFERENCE.md § Conditioners](REFERENCE.md#conditioners) works — drop
+`flatten_input=True` and use `DeepSets` / `Transformer` / `GNN` for
+permutation-aware variants.
+
+**Translation invariance.** Both halves of the base are zero-centred
+Gaussian, so the joint distribution is invariant under simultaneous
+translation `(x, x_aux) → (x + c, x_aux + c)`. The `SplitCoupling` layers
+preserve this because they only couple the two halves to each other; no
+layer independently shifts one half. No `CoMProjection` is needed.
+
+**Do not add the `(d/2) · log(N)` correction here.** Doubling the degrees
+of freedom keeps the ambient dimension intact; the auxiliary
+marginalisation absorbs the bookkeeping. Adding `CoMProjection.ambient_correction`
+on top of Pattern B double-counts.
+
+The full bgmat flow ships additional application-side logic:
+deterministic aux-half construction, a species-aware GNN conditioner,
+marginal-inference for physical observables. None of that belongs in
+nflojax — the shared scaffolding above is all this library should
+contribute.
 
 > ⚠️  **Do not stack Pattern A and Pattern B.** If the flow already uses
 > augmented coupling, do not also wrap it with `CoMProjection`, and do not

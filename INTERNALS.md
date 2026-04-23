@@ -517,6 +517,112 @@ warning.
 - **Relative density within one flow** (ratios, conditional quantities):
   cancels; no correction needed.
 
+## Conditioner protocol
+
+A *conditioner* is the neural module inside a coupling layer that maps the
+frozen half of the input to per-scalar bijection parameters. nflojax treats
+the conditioner as a plug-in: the library ships five reference
+implementations (`MLP`, `DeepSets`, `Transformer`, `GNN`, plus `ResNet` as
+a building block), but nothing in the coupling code depends on those
+specific classes. Any Flax module that satisfies the protocol works.
+
+### The minimal contract
+
+A conditioner is a Flax `nn.Module` with:
+
+1. A `context_dim: int` attribute (`0` for unconditional), used by
+   `validate_conditioner` at `SplitCoupling.__post_init__` time.
+2. A `__call__(x, context=None)` returning a tensor whose **total trailing
+   size equals `required_out_dim`** for the coupling it feeds:
+
+   | Coupling | `required_out_dim` |
+   |----------|---------------------|
+   | `AffineCoupling` | `2 * dim` (shift + log-scale) |
+   | `SplineCoupling` | `dim * (3K - 1)` for `linear_tails`, `dim * 3K` for `circular` |
+   | `SplitCoupling` | `transformed_flat * params_per_scalar` |
+
+   The output can be **flat** (`(*batch, required_out_dim)` — the `MLP` /
+   `DeepSets` shape) or **structured** (`(*batch, *transformed_shape,
+   params_per_scalar)` — the `Transformer` / `GNN` per-token shape). The
+   coupling reshapes based on total element count, so it doesn't care
+   which shape you emit.
+
+That is the full contract for a working conditioner. Everything below is
+opt-in — it makes the coupling's identity-at-init path work without
+manual intervention.
+
+### The optional half (identity-at-init)
+
+Couplings call two helper methods to zero-patch `dense_out` at init:
+
+```python
+cond.get_output_layer(params) -> {"kernel": Array, "bias": Array}
+cond.set_output_layer(params, kernel, bias) -> params
+```
+
+The canonical implementation is three lines — store the last `Dense` as
+`name="dense_out"` and return the sub-dict:
+
+```python
+def get_output_layer(self, params):
+    return params["dense_out"]
+
+def set_output_layer(self, params, kernel, bias):
+    new = dict(params)
+    new["dense_out"] = {"kernel": kernel, "bias": bias}
+    return new
+```
+
+Conditioners that skip these methods still work with `AffineCoupling` (it
+silently falls back to no zero-init, and the flow starts non-identity);
+the spline couplings *raise* because identity-at-init is part of their
+correctness argument. See `nets.py` docstring and the `AffineCoupling.init_params`
+/ `SplineCoupling.init_params` branches for the exact behaviour.
+
+### Bias-size auto-inference
+
+`SplitCoupling._patch_dense_out` reads the conditioner's `dense_out` bias
+length from `get_output_layer(params)["bias"].shape[0]` and sizes
+`identity_spline_bias` to match:
+
+```python
+bias_size         = params["dense_out"]["bias"].shape[0]
+num_scalars       = bias_size // params_per_scalar     # divisibility check
+identity_bias     = identity_spline_bias(num_scalars, ...)  # tiled pattern
+```
+
+The tiled-per-scalar structure of `identity_spline_bias` means the same
+code works for flat output (`num_scalars = N_transformed * d`) and for
+per-token output (`num_scalars = d`, tiled across the particle axis at
+forward time). Adding a conditioner that emits some third shape — say
+per-particle-pair — is a matter of making sure the bias size divides
+`params_per_scalar`; no change to `_patch_dense_out` is needed.
+
+### Reference conditioners are examples, not authoritative
+
+`MLP`, `DeepSets`, `Transformer`, `GNN` are the minimum useful set for a
+v1.0 particle-flow library — a flat baseline + three common equivariance
+profiles. They are *not* research contributions, and no part of the
+library treats them specially. In particular:
+
+- **`nets.py` has no plugin registry.** A conditioner is not registered;
+  it is a Flax module that the user hands to the coupling they construct.
+- **No internal code branches on `isinstance(..., MLP)` or similar.**
+  `SplitCoupling._patch_dense_out` asks the conditioner for its output
+  layer shape and sizes the bias accordingly; `validate_conditioner` only
+  checks the attribute / method interface.
+- **Downstream applications are expected to bring their own.** bgmat
+  ships a species-aware GNN; DM ships a domain-specific Transformer stack.
+  Both plug in through `SplitCoupling(conditioner=...)` or the
+  `conditioner` factory kwarg of `build_particle_flow`, without
+  modifying nflojax.
+
+This inversion — the library owns the coupling and the contract, the
+application owns the conditioner — is what keeps nflojax thin. Adding a
+fifth reference conditioner is reasonable if a second non-DM /
+non-bgmat application wants one; adding conditioner-specific code paths
+inside couplings is the failure mode the protocol is designed to prevent.
+
 ## Transformer conditioner: pre-norm choice
 
 `nflojax.nets.Transformer` uses the pre-norm residual layout
