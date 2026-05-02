@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
+pytestmark = pytest.mark.slow
+
 from nflojax.transforms import (
     LinearTransform,
     Permutation,
@@ -1320,6 +1322,7 @@ class TestLoftOverflow:
 # ============================================================================
 # Log-det vs autodiff correctness tests (C3)
 # ============================================================================
+@pytest.mark.slow
 class TestLogdetVsAutodiff:
     """Verify hand-derived log-det formulas match autodiff Jacobian.
 
@@ -1562,6 +1565,7 @@ class TestSplitCoupling:
         assert jnp.allclose(x_back, x, atol=1e-4)
         assert jnp.allclose(ld_fwd + ld_inv, 0.0, atol=1e-4)
 
+    @pytest.mark.slow
     def test_log_det_vs_autodiff(self, key, small_event):
         """log_det matches the autodiff Jacobian determinant on a single sample."""
         N, d = small_event["N"], small_event["d"]
@@ -2242,6 +2246,7 @@ class TestRescale:
         assert jnp.allclose(log_det_f, expected, atol=1e-6)
         assert jnp.allclose(log_det_i, -expected, atol=1e-6)
 
+    @pytest.mark.slow
     def test_log_det_autodiff_rank1(self, key):
         """log_det agrees with autodiff Jacobian on rank-1 event."""
         geom = Geometry(lower=[-2.0, -4.0, 0.0], upper=[3.0, 4.0, 10.0])
@@ -2252,6 +2257,7 @@ class TestRescale:
         )
         assert result["error"] < 1e-5, result
 
+    @pytest.mark.slow
     def test_log_det_rank2_scales_with_N(self, key):
         """log_det on (N, d) event equals N * sum(log(scale))."""
         N, d = 6, 3

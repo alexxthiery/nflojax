@@ -11,6 +11,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+pytestmark = pytest.mark.slow
+
 import flax.linen as nn
 
 from nflojax.builders import build_realnvp, build_spline_realnvp

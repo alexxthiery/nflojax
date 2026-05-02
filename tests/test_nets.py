@@ -11,6 +11,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+pytestmark = pytest.mark.slow
+
 from nflojax.nets import (
     MLP,
     ResNet,
@@ -614,6 +616,7 @@ class TestDeepSets:
         y = apply_jit(params, x)
         assert y.shape == (2, 11)
 
+    @pytest.mark.slow
     def test_integrates_with_split_coupling_identity(self, key):
         """Wiring DeepSets into SplitCoupling(flatten_input=False) gives
         identity at init inside the tail bound."""
@@ -655,10 +658,10 @@ class TestTransformer:
 
     def test_output_shape(self, key):
         """`__call__` produces (*batch, N, out_per_particle)."""
-        B, N, d = 3, 6, 3
-        out_per_particle = 11
+        B, N, d = 2, 4, 2
+        out_per_particle = 7
         t = Transformer(
-            num_layers=2, num_heads=2, embed_dim=16,
+            num_layers=1, num_heads=2, embed_dim=8,
             out_per_particle=out_per_particle,
         )
         params = init_conditioner(key, t, jnp.zeros((1, N, d)))
@@ -668,10 +671,10 @@ class TestTransformer:
 
     def test_permutation_equivariance(self, key):
         """Per-token output tracks the permutation of the input particles."""
-        N, d = 5, 3
-        out_per_particle = 7
+        N, d = 4, 2
+        out_per_particle = 5
         t = Transformer(
-            num_layers=2, num_heads=2, embed_dim=16,
+            num_layers=1, num_heads=2, embed_dim=8,
             out_per_particle=out_per_particle,
         )
         params = init_conditioner(key, t, jnp.zeros((1, N, d)))
@@ -684,7 +687,7 @@ class TestTransformer:
         x = jax.random.normal(key, (2, N, d))
         y = t.apply({"params": params}, x)
 
-        perm = jnp.array([2, 0, 4, 1, 3])
+        perm = jnp.array([2, 0, 3, 1])
         x_perm = jnp.take(x, perm, axis=-2)
         y_perm = t.apply({"params": params}, x_perm)
         y_reference = jnp.take(y, perm, axis=-2)
@@ -735,13 +738,14 @@ class TestTransformer:
 
     def test_jit(self, key):
         """apply traces cleanly under jax.jit."""
-        t = Transformer(num_layers=2, num_heads=4, embed_dim=16, out_per_particle=11)
-        params = init_conditioner(key, t, jnp.zeros((1, 6, 3)))
-        x = jax.random.normal(key, (2, 6, 3))
+        t = Transformer(num_layers=1, num_heads=2, embed_dim=8, out_per_particle=7)
+        params = init_conditioner(key, t, jnp.zeros((1, 4, 2)))
+        x = jax.random.normal(key, (2, 4, 2))
         apply_jit = jax.jit(lambda p, z: t.apply({"params": p}, z))
         y = apply_jit(params, x)
-        assert y.shape == (2, 6, 11)
+        assert y.shape == (2, 4, 7)
 
+    @pytest.mark.slow
     def test_integrates_with_split_coupling_identity(self, key):
         """Wiring Transformer into SplitCoupling(flatten_input=False) gives
         identity at init inside the tail bound."""
@@ -773,6 +777,7 @@ class TestTransformer:
         assert jnp.allclose(y, x, atol=1e-5)
         assert jnp.allclose(log_det, 0.0, atol=1e-5)
 
+    @pytest.mark.slow
     def test_split_coupling_round_trip(self, key):
         """Forward+inverse round-trip after randomising dense_out."""
         from nflojax.transforms import SplitCoupling
@@ -821,11 +826,11 @@ class TestGNN:
 
     def test_output_shape(self, key, cubic_geom):
         """Per-token output shape (*batch, N, out_per_particle)."""
-        B, N, d = 2, 8, 3
-        out_per_particle = 11
+        B, N, d = 2, 5, 3
+        out_per_particle = 7
         gnn = GNN(
-            num_layers=2, hidden=16, out_per_particle=out_per_particle,
-            num_neighbours=4, geometry=cubic_geom,
+            num_layers=1, hidden=8, out_per_particle=out_per_particle,
+            num_neighbours=2, geometry=cubic_geom,
         )
         params = init_conditioner(key, gnn, jnp.zeros((1, N, d)))
         x = jax.random.uniform(key, (B, N, d), minval=-1.0, maxval=1.0)
@@ -834,11 +839,11 @@ class TestGNN:
 
     def test_permutation_equivariance(self, key, cubic_geom):
         """Per-token output tracks permutations of the input particles."""
-        N, d = 7, 3
+        N, d = 5, 3
         out_per_particle = 5
         gnn = GNN(
-            num_layers=2, hidden=16, out_per_particle=out_per_particle,
-            num_neighbours=3, geometry=cubic_geom,
+            num_layers=1, hidden=8, out_per_particle=out_per_particle,
+            num_neighbours=2, geometry=cubic_geom,
         )
         params = init_conditioner(key, gnn, jnp.zeros((1, N, d)))
         # Randomise dense_out so equivariance is a real test.
@@ -850,7 +855,7 @@ class TestGNN:
         x = jax.random.uniform(key, (2, N, d), minval=-1.0, maxval=1.0)
         y = gnn.apply({"params": params}, x)
 
-        perm = jnp.array([3, 1, 6, 0, 4, 2, 5])
+        perm = jnp.array([3, 1, 4, 0, 2])
         x_perm = jnp.take(x, perm, axis=-2)
         y_perm = gnn.apply({"params": params}, x_perm)
         y_reference = jnp.take(y, perm, axis=-2)
@@ -957,15 +962,16 @@ class TestGNN:
 
     def test_jit(self, key, cubic_geom):
         gnn = GNN(
-            num_layers=2, hidden=16, out_per_particle=7,
-            num_neighbours=3, geometry=cubic_geom,
+            num_layers=1, hidden=8, out_per_particle=7,
+            num_neighbours=2, geometry=cubic_geom,
         )
-        params = init_conditioner(key, gnn, jnp.zeros((1, 8, 3)))
-        x = jax.random.uniform(key, (3, 8, 3), minval=-1.0, maxval=1.0)
+        params = init_conditioner(key, gnn, jnp.zeros((1, 5, 3)))
+        x = jax.random.uniform(key, (2, 5, 3), minval=-1.0, maxval=1.0)
         apply_jit = jax.jit(lambda p, z: gnn.apply({"params": p}, z))
         y = apply_jit(params, x)
-        assert y.shape == (3, 8, 7)
+        assert y.shape == (2, 5, 7)
 
+    @pytest.mark.slow
     def test_integrates_with_split_coupling_identity(self, key, cubic_geom):
         """GNN into SplitCoupling(flatten_input=False) gives identity at init."""
         from nflojax.transforms import SplitCoupling

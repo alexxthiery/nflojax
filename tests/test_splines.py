@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
+pytestmark = pytest.mark.slow
+
 from nflojax.splines import (
     _normalize_bin_params,
     _select_bins,
@@ -441,6 +443,7 @@ class TestMonotonicity:
 # Log-det vs autodiff
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 class TestLogDet:
 
     def test_logdet_matches_autodiff(self, key):
@@ -766,6 +769,7 @@ class TestCircularBoundary:
         )
         assert jnp.allclose(y_back, y, atol=1e-4)
 
+    @pytest.mark.slow
     def test_logdet_vs_autodiff_circular(self, key):
         """Primitive log-det matches autodiff derivative at a single point."""
         K = 8

@@ -23,6 +23,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+pytestmark = pytest.mark.slow
+
 from nflojax.nets import (
     MLP,
     DeepSets,

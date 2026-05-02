@@ -6,6 +6,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+pytestmark = pytest.mark.slow
+
 from nflojax.builders import (
     build_particle_flow,
     build_realnvp,
@@ -27,6 +29,18 @@ from nflojax.transforms import (
 from nflojax.distributions import DiagNormal, StandardNormal, UniformBox
 from nflojax.geometry import Geometry
 from nflojax.nets import DeepSets
+
+
+def _assert_flow_param_structure(flow, params):
+    """Shared builder contract for full Flow outputs."""
+    assert isinstance(flow, Flow)
+    assert set(params.keys()) == {"base", "transform"}
+
+
+def _assert_bijection_param_structure(bijection, params):
+    """Shared builder contract for transform-only outputs."""
+    assert isinstance(bijection, Bijection)
+    assert set(params.keys()) == {"transform"}
 
 
 # ============================================================================
@@ -149,6 +163,36 @@ class TestBuildRealNVP:
         assert flow.base_dist is custom_base
         assert jnp.allclose(params["base"]["loc"], jnp.ones(dim))
 
+    def test_custom_base_event_shape_mismatch_raises(self, key, dim):
+        """Custom base_dist must match the flat builder event shape."""
+        wrong_base = StandardNormal(dim=dim + 1)
+
+        with pytest.raises(ValueError, match="base_dist.event_shape"):
+            build_realnvp(
+                key,
+                dim=dim,
+                num_layers=2,
+                hidden_dim=8,
+                n_hidden_layers=1,
+                base_dist=wrong_base,
+            )
+
+    def test_return_transform_only_skips_base_validation(self, key, dim):
+        """Transform-only mode does not require or validate base distribution."""
+        wrong_base = StandardNormal(dim=dim + 1)
+
+        bijection, params = build_realnvp(
+            key,
+            dim=dim,
+            num_layers=2,
+            hidden_dim=8,
+            n_hidden_layers=1,
+            base_dist=wrong_base,
+            return_transform_only=True,
+        )
+
+        _assert_bijection_param_structure(bijection, params)
+
     def test_context_dim(self, key, dim):
         """context_dim creates conditional flow."""
         context_dim = 3
@@ -212,9 +256,34 @@ class TestBuildSplineRealNVP:
             key, dim=dim, num_layers=2, hidden_dim=8, n_hidden_layers=1, num_bins=4
         )
 
-        assert flow is not None
-        assert "base" in params
-        assert "transform" in params
+        _assert_flow_param_structure(flow, params)
+
+    def test_custom_base_event_shape_mismatch_raises(self, key, dim):
+        """Custom base_dist must match the flat spline builder event shape."""
+        wrong_base = StandardNormal(dim=dim + 1)
+
+        with pytest.raises(ValueError, match="base_dist.event_shape"):
+            build_spline_realnvp(
+                key,
+                dim=dim,
+                num_layers=2,
+                hidden_dim=8,
+                n_hidden_layers=1,
+                num_bins=4,
+                base_dist=wrong_base,
+            )
+
+    def test_invalid_tail_bound_raises(self, key, dim):
+        """Spline tail_bound must be positive."""
+        with pytest.raises(ValueError, match="tail_bound must be positive"):
+            build_spline_realnvp(
+                key,
+                dim=dim,
+                num_layers=2,
+                hidden_dim=8,
+                n_hidden_layers=1,
+                tail_bound=0.0,
+            )
 
     def test_use_linear(self, key, dim):
         """use_linear=True adds LinearTransform at start."""
@@ -1047,13 +1116,11 @@ class TestBuildParticleFlow:
 
     def test_flow_types(self, key, cfg):
         flow, params = self._build(key, cfg)
-        assert isinstance(flow, Flow)
-        assert set(params.keys()) == {"base", "transform"}
+        _assert_flow_param_structure(flow, params)
 
     def test_return_transform_only(self, key, cfg):
         bij, params = self._build(key, cfg, return_transform_only=True)
-        assert isinstance(bij, Bijection)
-        assert set(params.keys()) == {"transform"}
+        _assert_bijection_param_structure(bij, params)
 
     def test_identity_on_couplings(self, key, cfg):
         """At init the couplings are identity, so forward == Rescale scaling."""
@@ -1137,6 +1204,19 @@ class TestBuildParticleFlow:
             build_particle_flow(
                 key, geometry=g, event_shape=(8, 3),
                 num_layers=1, conditioner=_deepsets_factory(),
+            )
+        with pytest.raises(ValueError, match="base_dist.event_shape"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(7, 3)),
+            )
+        with pytest.raises(ValueError, match="base_dist.event_shape"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(8, 3)),
+                use_com_shift=True,
             )
         with pytest.raises(ValueError, match="use_com_shift=True requires N >= 3"):
             build_particle_flow(

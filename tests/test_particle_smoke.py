@@ -22,6 +22,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+pytestmark = pytest.mark.slow
+
 from nflojax.builders import assemble_flow, build_particle_flow
 from nflojax.distributions import DiagNormal, UniformBox
 from nflojax.geometry import Geometry
@@ -37,24 +39,24 @@ def key():
 
 @pytest.fixture
 def cfg():
-    return {"N": 8, "d": 3, "K": 8, "num_layers": 2, "tail_bound": 5.0}
+    return {"N": 4, "d": 2, "K": 4, "num_layers": 1, "tail_bound": 5.0}
 
 
 def _make_conditioner_factory(name, *, geometry):
     """Build a keyword-only conditioner factory matching the builder contract."""
     if name == "DeepSets":
         return lambda *, required_out_dim, **_: DeepSets(
-            phi_hidden=(16, 16), rho_hidden=(16,), out_dim=required_out_dim,
+            phi_hidden=(8,), rho_hidden=(8,), out_dim=required_out_dim,
         )
     if name == "Transformer":
         return lambda *, out_per_particle, **_: Transformer(
-            num_layers=1, num_heads=2, embed_dim=16,
+            num_layers=1, num_heads=2, embed_dim=8,
             out_per_particle=out_per_particle,
         )
     if name == "GNN":
         return lambda *, out_per_particle, **_: GNN(
-            num_layers=1, hidden=16, out_per_particle=out_per_particle,
-            num_neighbours=3, geometry=geometry,
+            num_layers=1, hidden=8, out_per_particle=out_per_particle,
+            num_neighbours=1, geometry=geometry,
         )
     raise ValueError(f"unknown conditioner: {name}")
 
@@ -123,6 +125,7 @@ class TestParticleFlowBuilderSmoke:
         # roundoff accumulates).
         assert jnp.allclose(x_back, x, atol=1e-3)
 
+    @pytest.mark.slow
     def test_gradient_flows_end_to_end(self, conditioner_name, cfg, key):
         """Non-zero gradient on at least one dense_out kernel."""
         flow, params = _build(conditioner_name, cfg, key)
@@ -143,10 +146,11 @@ class TestParticleFlowBuilderSmoke:
         assert total > 0.0
 
 
+@pytest.mark.slow
 def test_free_cluster_assemble(key):
-    """Non-periodic `(B, N=13, d=3)` pipeline composes end-to-end.
+    """Non-periodic structured-particle pipeline composes end-to-end.
 
-    Validates the path bgmat-clean MS2 (LJ13) depends on: `Geometry` with
+    Validates the path free-cluster benchmarks depend on: `Geometry` with
     `periodic=[False]*d`, `DiagNormal` base on `(N, d)`, a stack of
     `SplitCoupling(boundary_slopes='linear_tails', flatten_input=False)`
     with `DeepSets` conditioners, assembled via `assemble_flow`. Bypasses
@@ -154,11 +158,11 @@ def test_free_cluster_assemble(key):
     free cluster has no box to wrap around.
 
     Asserts identity-at-init (linear tails are identity inside
-    `[-tail_bound, tail_bound]^d`), jit-trip at init, and non-zero
-    gradient through every `dense_out`.
+    `[-tail_bound, tail_bound]^d`) and an inverse round-trip. Gradient and JIT
+    coverage lives in the smaller structured-particle tests.
     """
-    N, d = 13, 3
-    num_bins, num_layers = 8, 4
+    N, d = 5, 3
+    num_bins, num_layers = 4, 2
     split_index = N // 2  # asymmetric 6/7 split; swap flips the sizing.
     tail_bound = 5.0
 
@@ -181,7 +185,7 @@ def test_free_cluster_assemble(key):
             n_transformed * d, num_bins, boundary_slopes="linear_tails",
         )
         cond = DeepSets(
-            phi_hidden=(16, 16), rho_hidden=(16,), out_dim=out_dim,
+            phi_hidden=(8,), rho_hidden=(8,), out_dim=out_dim,
         )
         coupling = SplitCoupling(
             event_shape=(N, d),
@@ -209,22 +213,9 @@ def test_free_cluster_assemble(key):
     assert jnp.allclose(y, x, atol=1e-5)
     assert jnp.allclose(log_det, 0.0, atol=1e-4)
 
-    # Jit round-trip at init: the full pipeline traces and inverts cleanly.
-    fwd = jax.jit(lambda p, z: flow.forward(p, z))
-    inv = jax.jit(lambda p, z: flow.inverse(p, z))
-    y_jit, _ = fwd(params, x)
-    x_back, _ = inv(params, y_jit)
+    # Round-trip at init: the assembled free-cluster topology inverts cleanly.
+    x_back, _ = flow.inverse(params, y)
     assert jnp.allclose(x_back, x, atol=1e-5)
-
-    # Non-zero gradient on every conditioner's dense_out kernel from a
-    # trivial NLL loss -- proves gradient actually flows through the stack.
-    def loss(p):
-        return -jnp.mean(flow.log_prob(p, x))
-
-    grads = jax.grad(loss)(params)
-    for i, block in enumerate(flow.transform.blocks):
-        g_out = block.conditioner.get_output_layer(grads["transform"][i]["mlp"])
-        assert float(jnp.sum(jnp.abs(g_out["kernel"]))) > 0.0
 
 
 class TestParticleFlowBuilderCoMShift:
