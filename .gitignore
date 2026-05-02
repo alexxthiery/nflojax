@@ -212,3 +212,6 @@ __marimo__/
 # Claude Code
 .claude/
 .claude/pipeline/
+
+# Local audit work products
+audit/
