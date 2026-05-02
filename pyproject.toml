@@ -23,7 +23,11 @@ Repository = "https://github.com/alexxthiery/nflojax"
 test = ["pytest", "pytest-xdist"]
 
 [tool.pytest.ini_options]
-addopts = "-n auto -q"
+addopts = "-q -m 'not slow'"
+markers = [
+    "slow: integration, full-Jacobian, or precision-proof tests excluded from the default fast suite",
+    "requires_x64: precision-proof tests that should run only with JAX_ENABLE_X64=1",
+]
 
 [tool.setuptools.packages.find]
 include = ["nflojax*"]
