@@ -2,13 +2,28 @@
 
 Recipes for adding custom Transforms, Distributions, and Conditioners, plus
 pattern-level guidance for composing library primitives.
+EXTENDING is the source of truth for extension paths. It distinguishes
+implemented primitives from documented patterns and downstream applications.
 
 **Contents:**
 
 - [Adding a Custom Transform](#adding-a-custom-transform)
 - [Adding a Custom Distribution](#adding-a-custom-distribution)
+- [Extending Product Domains](#extending-product-domains)
 - [Adding a Custom Conditioner](#adding-a-custom-conditioner)
 - [CoM handling: projection vs augmented coupling](#com-handling)
+
+---
+
+## Extension Labels
+
+- **Primitive**: implemented and tested library API.
+- **Builder**: opinionated composition of primitives.
+- **Pattern**: documented recipe, not a public abstraction.
+- **Application**: downstream code outside nflojax.
+
+Use these labels when adding or revising docs so users can tell whether they
+should import an API, call a builder, copy a recipe, or keep code downstream.
 
 ---
 
@@ -162,6 +177,32 @@ flow = Flow(base_dist=my_distribution, transform=my_transform)
 log_prob = flow.log_prob(params, x)
 samples = flow.sample(params, key, (batch_size,))
 ```
+
+---
+
+## Extending Product Domains
+
+`ProductDomain` is a **Primitive** for flat rank-1 events whose coordinates mix
+real, bounded interval, and circular topology. It is generic coordinate
+metadata. Do not add target, chemistry, molecular, or optimizer logic there.
+
+Use the smallest extension that matches the problem:
+
+- Add a new `ScalarDomain` kind only for a new coordinate topology with a clear
+  support convention and density semantics.
+- Add a transform when the topology is already representable, but the
+  diffeomorphism class is missing.
+- Add a distribution when the base measure changes, while the coordinate
+  topology remains the same.
+- Keep behavior downstream when it depends on a target, energy, observable,
+  training objective, or scientific application.
+
+`ProductDomain.conditioner_features` is the default feature map for the shipped
+MLP product-domain builder: real coordinates are raw, interval coordinates are
+normalized to `[-1, 1]`, and circular coordinates use sine/cosine features.
+Treat it as a default policy, not a universal embedding abstraction. If a
+second product-domain conditioner needs a different feature map, extract a
+separate feature-map helper then.
 
 ---
 
@@ -382,7 +423,7 @@ log_q_ambient = log_q_reduced + CoMProjection.ambient_correction(N, d)
 ```
 
 The shim is ~12 lines of user code; `build_particle_flow` uses the same
-pattern internally (search for `_CoMEmbed` in `nflojax/builders.py`).
+pattern internally (search for `_CoMEmbed` in `nflojax/builders/particle.py`).
 
 **When to apply the correction**: see the decision box in
 [REFERENCE.md#comprojection](REFERENCE.md#comprojection). Short version —
@@ -501,6 +542,12 @@ the LJ13 icosahedral minimum) the gap is typically much worse — the flow
 collapses into one chart-aligned basin and the symmetry diagnostic
 (`var(log q)` under random `S_N` permutations of a fixed config) stays
 non-zero even after long training.
+
+Do not try to repair this by evaluating `log q` at random particle
+permutations inside a reverse-KL objective. That permutation augmentation is a
+forward-KL-style trick; under reverse KL it can drive the model toward a point
+mass on whichever chart currently has the largest `log q`. Use a
+symmetry-respecting architecture instead.
 
 Three escape routes, in order of how far they take you from nflojax's
 coupling-flow primitives:

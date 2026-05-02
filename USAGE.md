@@ -2,6 +2,12 @@
 
 How-to cookbook for nflojax. Each section is self-contained with a copy-pasteable example.
 For API details, see [REFERENCE.md](REFERENCE.md). For math, see [INTERNALS.md](INTERNALS.md).
+USAGE is the source of truth for task recipes; keep detailed API tables in
+REFERENCE and derivations in INTERNALS.
+
+Recipe labels follow REFERENCE: **Builder** for constructors, **Primitive** for
+low-level APIs, **Pattern** for copyable compositions, and **Application** for
+downstream code.
 
 **Contents:**
 
@@ -11,6 +17,7 @@ For API details, see [REFERENCE.md](REFERENCE.md). For math, see [INTERNALS.md](
 - [Feature Extractor](#feature-extractor)
 - [Transform-Only Mode](#transform-only-mode-bijection)
 - [Identity Gating](#identity-gating)
+- [Product-Domain Flows](#product-domain-flows)
 - [Custom Architectures](#custom-architectures-assembly-api)
 - [Assembly with Context](#assembly-with-context-and-feature-extractor)
 - [Structured (rank-N) Flows](#structured-rank-n-flows)
@@ -242,6 +249,45 @@ raw_context = jax.random.normal(key, (100, raw_context_dim))
 y, log_det = bijection.forward(params, x, context=raw_context)
 ```
 
+## Product-Domain Flows
+
+Use a product-domain flow when a flat event mixes different scalar coordinate
+topologies. The example below builds a flow on
+`R × [-2, 3] × S^1 × R` without encoding any target-specific semantics.
+
+```python
+import jax
+import jax.numpy as jnp
+
+from nflojax.builders import build_product_spline_flow
+from nflojax.domains import ProductDomain, ScalarDomain
+
+domain = ProductDomain([
+    ScalarDomain.real(),
+    ScalarDomain.interval(-2.0, 3.0),
+    ScalarDomain.circular(-jnp.pi, jnp.pi),
+    ScalarDomain.real(),
+])
+
+key = jax.random.PRNGKey(0)
+flow, params = build_product_spline_flow(
+    key,
+    domain=domain,
+    num_layers=6,
+    hidden_dim=128,
+    n_hidden_layers=2,
+    num_bins=8,
+)
+
+samples = flow.sample(params, key, shape=(1024,))     # (1024, 4)
+log_prob = flow.log_prob(params, samples)             # (1024,)
+```
+
+The default `ProductBase` is standard normal on real coordinates and uniform
+on interval/circular coordinates. The builder alternates flat coupling masks
+and inserts circular shifts when the domain contains circular coordinates.
+Use `return_transform_only=True` if you want only the bijection.
+
 ## Structured (rank-N) Flows
 
 When the event has structure beyond a flat vector — for example a particle
@@ -446,6 +492,24 @@ The factory's kwargs are computed per-layer from `event_shape`, `d`,
 Absorb the unused kwargs with `**_`. For the full signature and the
 `use_com_shift` semantics, see
 [REFERENCE.md#build_particle_flow](REFERENCE.md#build_particle_flow).
+
+### Benchmark targets
+
+For a worked end-to-end training loop against real particle targets, see:
+
+- `../jax-pdf/` — standalone target log-densities. `LennardJones` and `DW4`
+  accept `(..., n_particles, spatial_dim)` events and plug directly into
+  flows built with `build_particle_flow`:
+
+    ```python
+    from jax_pdf import DW4
+    target = DW4()                                  # log_p: (..., 4, 2) -> (...,)
+    # reverse-KL loss: (log_q - target(x)).mean()
+    ```
+
+- `../bgmat-clean/lj13/` and `../bgmat-clean/dw4/` — full training loops
+  (Pattern A + CoM-spring variants), evaluation harnesses, and comparisons
+  against DEM reference samples. Use as the authoritative worked examples.
 
 ## Particle bases
 

@@ -17,44 +17,97 @@
 - Branch: `feature/particle-events` — merged work `86be470` landed:
   - `boundary_slopes='circular'` on rational-quadratic splines.
   - `CircularShift` rigid-rotation bijector.
-  - `_params_per_scalar` / `_validate_boundary_slopes` helpers de-duplicating 6 sites.
+  - Internal spline-parameter helpers de-duplicating 6 sites.
   - Gate + context tests on `SplineCoupling` in circular mode.
   - `@requires_x64` skip marker covering 5 pre-existing float32-only round-trip failures.
 - **Stage A fully closed** (`2c94d18`). A1 (`Rescale`, `28b735f`), A3 (`Permutation` event_axis, Stage-0), A4 (context-type story, §5.2 contract narrowed), A2 (`CoMProjection`, Convention (1) zero log-det + `ambient_correction` helper).
 - **Stage B fully closed** (`bc90993`). B1 (`UniformBox`), B4 (`utils/pbc.py`), B2 (`utils/lattice.py` — 5 generators), B3 (`LatticeBase` + 5 factories). New `nflojax/utils/` subdir.
 - **Stage C fully closed.** C1 (`circular_embed`), C2 (`positional_embed`). New `nflojax/embeddings.py` (stateless feature transforms for conditioner inputs).
-- Test infrastructure: `pytest-xdist` adopted as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`); AGENTS.md rewritten as a one-command "Testing Strategy". Landed `9ef1141`.
+- Test infrastructure: serial `pytest tests/` is the default fast contract
+  (`addopts = "-q -m 'not slow'"` in `pyproject.toml`); `pytest-xdist`
+  remains an optional speedup via `pytest -n auto tests/`. Slow integration and
+  full-Jacobian proof tests run only when explicitly selected. X64 precision
+  proofs are selectable via `JAX_ENABLE_X64=1 pytest -m requires_x64 tests/`;
+  full float32/x64 is reserved for stage-close/release checks.
 - **Stage D fully closed.** `SplitCoupling.flatten_input` hatch unlocks structured-input conditioners. D1 (`DeepSets`, permutation-invariant), D2 (`Transformer`, pre-norm, permutation-equivariant per-token), D3 (`GNN` with top-K neighbours under PBC, `num_neighbours=12`), D4 (shared contract fixture `tests/test_conditioner_protocol.py`). §10.4 and §10.5 resolved (see decision log). Top-level `Dense(..., name="dense_out")` convention across all four conditioners; `SplitCoupling._patch_dense_out` infers the bias size from the conditioner so flat-output and per-token-output modules plug in the same way.
-- Full test suite (parallel): **592 passed / 6 skipped under float32 (~95s); 598 passed under `JAX_ENABLE_X64=1` (~95s).** The 6 float32 skips carry `@requires_x64` (RQS-inverse + LinearTransform triangular-solve roundoff).
+- Current verification on the audit-remediation working tree:
+  **646 passed / 10 skipped** under float32 via
+  `/home/statah/miniconda3/envs/autodiff/bin/python -m pytest -o addopts='-q' tests/ -p no:cacheprovider`;
+  **9 passed / 647 deselected** under targeted x64 via
+  `JAX_ENABLE_X64=1 /home/statah/miniconda3/envs/autodiff/bin/python -m pytest -m requires_x64 tests/ -p no:cacheprovider`.
 - DESIGN.md checked in; `AGENTS.md` updated to point at it.
 
-- **Stage E fully closed.** E1 (`build_particle_flow`) + E2 (`tests/test_particle_smoke.py`). Topology deviates from the original spec by dropping the per-layer `Permutation` (alternating-swap on `SplitCoupling` already covers particles; `Permutation._zero_logdet` on rank-2 events returns `(B, d)` not batch-shape, which would poison `CompositeTransform`'s accumulator). The `use_com_shift=True` branch appends a private `_CoMEmbed` shim that swaps `CoMProjection.forward` / `.inverse` so `Flow.sample` hits the expansion direction (the EXTENDING.md "CoM handling" sketch is misleading on this point — flagged for a future docs fix). See the Stage-E decision-log entry for the factory contract and the three kwargs (`required_out_dim`, `out_per_particle`, `n_frozen`).
+- **Stage E fully closed.** E1 (`build_particle_flow`) + E2 (`tests/test_particle_smoke.py`). The builder uses alternating `SplitCoupling.swap` coverage rather than per-layer `Permutation`; `Permutation._zero_logdet` now returns batch shape only for rank-2 particle events, so the earlier accumulator-shape bug is resolved. The `use_com_shift=True` branch appends a private `_CoMEmbed` shim that swaps `CoMProjection.forward` / `.inverse` so `Flow.sample` hits the expansion direction; `EXTENDING.md` now documents that manual-assembly pattern. See the Stage-E decision-log entry for the factory contract and the three kwargs (`required_out_dim`, `out_per_particle`, `n_frozen`).
 
-**Next up — Stage G**, rescoped. Stage F is closed; the original "bgmat parity test" target is dropped in favour of **bgmat-clean** — a clean-room Boltzmann-generator rebuild at `../bgmat-clean/` built on top of nflojax. First milestone is **LJ13** (free-cluster Lennard-Jones, 13 atoms), chosen to stress-test the non-periodic path that v1.0 did not prioritise. See §7 for the new Stage-G layout and §11 for the rescope entry.
+**Next up — Audit remediation + Stage G.** Stage F is closed; the original "bgmat parity test" target is dropped in favour of **bgmat-clean** — a clean-room Boltzmann-generator rebuild at `../bgmat-clean/` built on top of nflojax. First milestone is **LJ13** (free-cluster Lennard-Jones, 13 atoms), chosen to stress-test the non-periodic path that v1.0 did not prioritise. Before broadening downstream validation, close the audit-remediation checklist below.
 
 Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
 
+### Audit remediation
+
+Local current-state audit notes live under ignored `audit/`; this checklist is
+the committed execution surface.
+
+- [x] **Development contract.** Default pytest no longer requires xdist;
+  source/editable install and submodule-only imports are documented; MIT
+  `LICENSE` exists.
+- [x] **Float32/x64 test policy.** GNN stacked-spline round-trip perturbation is
+  an explicit x64 precision proof; default precision has a finite/JIT smoke
+  test. X64-only proofs are selectable by pytest marker so agents do not run
+  full serial x64 for routine edits.
+- [x] **Product-domain hardening.** Added validation coverage for malformed
+  domains, masks, base event shape, context shape, dtype policy, circular
+  seam behavior, and interval-coordinate log-det autodiff. The default MLP
+  feature map remains on `ProductDomain.conditioner_features` for now, but is
+  documented as a builder default rather than intrinsic domain semantics.
+- [x] **Public-contract tests.** Added smoke tests for flat affine, flat spline,
+  product-domain, particle, transform-only, and custom-assembly entry points.
+- [x] **Documentation synchronization.** README/AGENTS/REFERENCE/USAGE/
+  INTERNALS/EXTENDING now state their source-of-truth roles; REFERENCE has a
+  builder decision table and option-support matrix. AGENTS has the same
+  builder decision table and option-support matrix; EXTENDING has
+  product-domain extension guidance and primitive/builder/pattern/application
+  labels. README is intentionally limited to install, quick start, and links.
+- [x] **Builder helper consolidation.** Shared the flat-base resolution,
+  base event-shape validation, context/gate checks, spline option validation,
+  feature-extractor pairing, and builder output packaging paths.
+- [x] **Transform catalogue split.** Split the former monolithic transforms
+  file into a `nflojax/transforms/` package facade with focused implementation
+  modules; public imports from `nflojax.transforms` are preserved for public
+  names.
+- [x] **F4 source surveyability.** Trimmed `LinearTransform` below 500 LOC,
+  split coupling implementations into `nflojax/transforms/couplings/`, and
+  split builders into `nflojax/builders/` while preserving facade imports.
+
 ### Stage-0 pre-work (landed in the same session, before Stage A)
 
-After the first + second-pass audits in `audit.md`, three "tensions" were lifted directly into the work:
+After the first + second-pass local audits, three "tensions" were lifted directly into the work:
 
-- [x] **Amend DESIGN.md §2.1 "500 LOC" rule** to distinguish single-concept files from catalogue files (`transforms.py`, `nets.py`). Each entry still ≤ 500 LOC; catalogue total can grow.
+- [x] **Amend DESIGN.md §2.1 "500 LOC" rule** to distinguish single-concept files from package facades/catalogue modules (`nflojax/transforms/`, `nets.py`). Each entry still targets ≤ 500 LOC; catalogue total can grow.
 - [x] **Introduce `nflojax/geometry.py`** with the `Geometry(lower, upper, periodic=None)` value object — numpy-backed configuration, not a PyTree. Factory `Geometry.cubic(d, side, lower)`. Derived `box`, `d`, `volume`, `is_periodic()`. Landed *before* Stage A so every upcoming geometry-consuming primitive (`Rescale`, `UniformBox`, `LatticeBase`, `utils/pbc`) targets a single type from day one.
 - [x] **Retrofit `CircularShift`** to carry a single `geometry: Geometry` field. `create(key, geometry)` factory; `from_scalar_box(coord_dim, lower, upper)` classmethod for legacy-ergonomic construction.
 - [x] **Generalise `Permutation`** with `event_axis: int = -1`. Default preserves historic last-axis behaviour; `event_axis=-2` unlocks particle-axis shuffles on `(B, N, d)`. This satisfies Stage A3 early (see §1 below).
 
 Verification: 401 passed / 5 skipped (float32); 406 passed (x64). Four new `event_axis` tests added.
 
-Deferred from the proposed Stage 0 (still open):
-- Split `transforms.py` into a `transforms/` subdir, *or* accept the amended rule and leave it as a catalogue file.
-- Context-type story (Array vs PyTree): §5.2 of DESIGN.md currently says PyTree; code still assumes Array (`_compute_gate_value.ndim`; `MLP` concat). Decide which wins and reconcile.
-- `LinearTransform` (515 LOC) — audit whether it earns its place in `transforms.py` for particle workloads or should extract.
+Deferred from the proposed Stage 0:
+- [x] Split `transforms.py` into a `transforms/` package facade with focused
+  implementation modules while preserving public imports from
+  `nflojax.transforms` for public names.
+- [x] Resolve the context-type story. DESIGN.md now uses a two-tier contract:
+  built-in MLP conditioners take array context, while custom conditioners may
+  use PyTree context through the lower-level flow path.
+- [ ] `LinearTransform` remains a single-concept module but is still slightly
+  above the 500-line target. Audit whether its long docstring and helper
+  structure can be tightened without changing behavior.
 
 ---
 
 ## 1. Stage A — bijection extensions
 
-Small, high-leverage bijections that every particle-system flow needs. All live in `nflojax/transforms.py`.
+Small, high-leverage bijections that every particle-system flow needs. Public
+imports live under `nflojax.transforms`; implementations now live in focused
+modules under `nflojax/transforms/`.
 
 ### Tasks
 
@@ -71,7 +124,7 @@ Small, high-leverage bijections that every particle-system flow needs. All live 
   - Tests: round-trip via the full `(N, d)` ambient space, autodiff-Jacobian determinant sanity on the subspace, jit.
   - **Resolved via Convention (1): log-det is zero on the `(N-1)d` subspace; the `(d/2)·log(N)` volume correction is a caller-applied constant exposed as `CoMProjection.ambient_correction(N, d)`.** Heavy documentation at six contact points: class docstring WARNING block, `REFERENCE.md` subsection with decision box, `USAGE.md` pointer + recipe, new `EXTENDING.md` §"CoM handling" with augmented-coupling alternative and a **do-not-stack** warning, `INTERNALS.md` full derivation (Gram matrix `I + 11^T`, `det = N`), `AGENTS.md` Gotcha one-liner. 12 tests green under both dtypes.
 - [x] **A3. `Permutation` generalised to non-last axes.** Landed in Stage-0. `event_axis: int = -1` default preserves last-axis behaviour; `event_axis=-2` shuffles particles on `(B, N, d)`. 4 new tests.
-- [x] **A4. Context-type story.** First-pass audit flagged DESIGN.md §5.2 ("context is PyTree") is not matched by `_compute_gate_value` (indexes `.ndim`) or `MLP` (concatenates). Decide: (a) narrow the doc claim to "Array for built-in conditioners, PyTree for custom"; (b) accept PyTree in the built-in path (flatten via `ravel_pytree` in MLP). Update docstrings + `validate_conditioner.validate=False` opt-out accordingly.
+- [x] **A4. Context-type story.** First-pass audit flagged DESIGN.md §5.2 ("context is PyTree") is not matched by the internal gate helper (indexes `.ndim`) or `MLP` (concatenates). Decide: (a) narrow the doc claim to "Array for built-in conditioners, PyTree for custom"; (b) accept PyTree in the built-in path (flatten via `ravel_pytree` in MLP). Update docstrings + `validate_conditioner.validate=False` opt-out accordingly.
   - Tests: if (b), pytree context (dict with two arrays) traces through an MLP conditioner without error; opt-out path covered by a custom-conditioner test.
   - **Resolved: option (a).** DESIGN.md §5.2 rewritten as a two-tier contract (PyTree at flow layer; Array for built-in MLP; PyTree for custom conditioners). `MLP.__call__` docstring tightened. `tests/test_conditional_flow.py::TestCustomConditionerPyTreeContext` locks in the custom-conditioner PyTree path (round-trip + jit).
 
@@ -192,7 +245,8 @@ One commit per conditioner (D1, D2, D3); D4 in its own commit so the shared fixt
 
 ## 5. Stage E — particle-flow builder
 
-A single entry-point that assembles the canonical DM / bgmat topology. File: `nflojax/builders.py`.
+A single entry-point that assembles the canonical DM / bgmat topology. Public
+facade: `nflojax.builders`; implementation: `nflojax/builders/particle.py`.
 
 ### Tasks
 
@@ -309,7 +363,12 @@ Stage D checklist (2026-04-22):
 - [x] Every new conditioner satisfies identity-at-init: `DeepSets`, `Transformer`, `GNN` each pass their SplitCoupling round-trip at init. Covered in `tests/test_conditioner_protocol.py::test_split_coupling_identity_at_init` (parametrized).
 - [x] No new energy / training / observable term (DESIGN.md §11 greps). Docstring mentions of "training" / "energy" (in `CoMProjection`) are pre-existing.
 - [x] No new heavy dependency. All three conditioners use `flax.linen` primitives already in scope.
-- [!] Total `nflojax/` LOC excluding tests: **6653**. Exceeds the §11 item 10 ballpark of 5000 — needs review. Breakdown: `transforms.py` 2819, `nets.py` 924 (+~640 from Stage D), `builders.py` ~(not counted here), `distributions.py`, `flows.py`, `splines.py`, `embeddings.py`, `geometry.py`, `utils/pbc.py`, `utils/lattice.py`. Per DESIGN.md §2.1 amendment, catalogue files (`transforms.py`, `nets.py`) are allowed to grow; each *concept* within must still fit ≤ 500 LOC. Revisit before Stage E if this drifts further.
+- [!] Total `nflojax/` LOC excluding tests: **6653**. Exceeds the §11 item 10
+  ballpark of 5000. This was later mitigated by splitting the former
+  monolithic transforms file into focused modules while preserving the
+  `nflojax.transforms` public facade. The later F4 pass split coupling
+  implementations and builders into focused submodules; `nets.py` remains the
+  main catalogue file to keep an eye on.
 - [x] Every public name in `REFERENCE.md` (`DeepSets`, `Transformer`, `GNN`, `init_conditioner`, new `SplitCoupling.flatten_input` field).
 
 ---
@@ -343,7 +402,7 @@ Each post-v1 item lands only if a named trigger fires. No speculative extensions
 - **Transformer / GNN reference conditioners** — if a third-party application other than DM / bgmat asks for one of them, ship it. Otherwise stay at `DeepSets`. Audit §12.3.
 - **Triclinic boxes** — if bgmat stabilises its triclinic path and a downstream app asks, generalise `Geometry` to carry an optional `cell: Array | None` field and retrofit every consumer. Audit §4 item 8.
 - **Pattern B promoted to a primitive** — *trigger is now partially fired* (bgmat-clean MS2g showed axis-split `SplitCoupling` can't match LJ13-type targets; `EXTENDING.md` Pattern B is the documented escape route and already has one consumer in bgmat). The promotion is: a `build_augmented_flow(*, base, num_layers, conditioner, ...)` builder in `nflojax.builders`, a `marginalise_aux_half(...)` inference-time helper, and the private `_CoMEmbed` shim kept as-is (augmented flows don't need it). Full trigger fires when a **second external consumer** requests augmented coupling — expected to be bgmat-clean MS2h.Variant-D on LJ13 or MS3 mW if `SplitCoupling` + GNN alone under-performs. Estimated scope: 2–3 days. Strictly precedes the E(n)-equivariant-coupling item below: Pattern B fixes `S_N` without touching `SO(d)`, and is far cheaper.
-- **E(3) / SE(3) bijections** — *trigger is not yet fired*. Requires (a) Pattern B primitive landed; (b) a downstream application that still misses its success criteria **specifically** because of broken `SO(d)` equivariance, not because of `S_N` (Pattern B should close `S_N` on its own). bgmat-clean LJ13 and DW4 do not yet establish this — LJ13 is blocked on Pattern B first; DW4's reverse-KL mode-ratio gap is objective-bias, not rotation. If triggered, introduce `transforms/equivariant.py` with EGNN-style couplings (requires splitting `transforms.py` into a `transforms/` subdir per Stage-0 deferred task). Estimated scope: multi-week; DESIGN.md §4 item 7 and §7.3 document why this is non-trivial.
+- **E(3) / SE(3) bijections** — *trigger is not yet fired*. Requires (a) Pattern B primitive landed; (b) a downstream application that still misses its success criteria **specifically** because of broken `SO(d)` equivariance, not because of `S_N` (Pattern B should close `S_N` on its own). bgmat-clean LJ13 and DW4 do not yet establish this — LJ13 is blocked on Pattern B first; DW4's reverse-KL mode-ratio gap is objective-bias, not rotation. If triggered, introduce `transforms/equivariant.py` with EGNN-style couplings under the existing `nflojax/transforms/` package. Estimated scope: multi-week; DESIGN.md §4 item 7 and §7.3 document why this is non-trivial.
 - **Block permutation / heteronuclear lattices** — if a multi-species materials application lands, generalise `Permutation` and `LatticeBase`. Audit §7.5.
 - **Flow matching / diffusion** — **not** shipped in nflojax; a sibling library. Audit §12.17.
 
@@ -399,19 +458,19 @@ Items that need a decision before the relevant stage can close.
 - *2026-04-21* — Plan drafted alongside DESIGN.md. Adopted: thick-on-flows / thin-on-physics scope; reference conditioner family is MLP + DeepSets + Transformer + MPNN; no energy or training helpers in nflojax.
 - *2026-04-21* — Stage A1 closed (`28b735f`). `Rescale` ships as a fixed, non-learnable geometry→canonical affine; `LinearTransform` retains the learnable-affine role. API: `Rescale(geometry, target=(-1, 1), event_shape=None)`; scalar or per-axis target; `event_shape` default `(geometry.d,)` with `event_factor = prod(event_shape[:-1])` so log-det accumulates correctly on rank-N particle events.
 - *2026-04-21* — Adopted `pytest-xdist` as default parallel runner (`addopts = "-n auto -q"` in `pyproject.toml`; `pytest-xdist` added to test extras). Rewrote AGENTS.md Dev Commands as a one-command "Testing Strategy" (`pytest tests/` after edits, x64 at stage close). Full suite wall-clock: float32 6:28 → 1:25 (4.5×), x64 12:11 → 1:34 (7.8×). Rationale: cheap full suite removes the agent triage problem; a file→tests mapping would push judgement onto the agent, and agents get that wrong.
-- *2026-04-21* — Stage A4 closed via option (a): narrow the built-in contract, keep PyTree at the flow layer. DESIGN.md §5.2 now a two-tier contract (PyTree through flows, Array for built-in `MLP` and `_compute_gate_value`, any PyTree for custom conditioners). Option (b) rejected because target apps (DM, bgmat) bring their own conditioner anyway, so `ravel_pytree` + PyTree-aware batching in the common path would add complexity for no one. A new `TestCustomConditionerPyTreeContext` test in `tests/test_conditional_flow.py` exercises a dict-context conditioner end-to-end (round-trip + jit).
+- *2026-04-21* — Stage A4 closed via option (a): narrow the built-in contract, keep PyTree at the flow layer. DESIGN.md §5.2 now a two-tier contract (PyTree through flows, Array for built-in `MLP` and the internal gate helper, any PyTree for custom conditioners). Option (b) rejected because target apps (DM, bgmat) bring their own conditioner anyway, so `ravel_pytree` + PyTree-aware batching in the common path would add complexity for no one. A new `TestCustomConditionerPyTreeContext` test in `tests/test_conditional_flow.py` exercises a dict-context conditioner end-to-end (round-trip + jit).
 - *2026-04-21* — Stage A2 closed; Stage A fully done. `CoMProjection` ships with **Convention (1)** log-det: the bijection is a relabelling between two `(N-1)d`-dim spaces (reduced Euclidean and zero-CoM subspace of `R^(Nd)`), so `log_det = 0` both directions. The volume-element constant relating the two embeddings is `(d/2)·log(N)` (derived from `det(I + 11^T) = N` for the parameterisation `x_N = -Σy_i`), exposed as `CoMProjection.ambient_correction(N, d)`. Convention (2) — baking the constant into the log-det — was rejected: it silently double-counts in the augmented-coupling composition (bgmat's pattern), where translation invariance is handled separately and densities are already ambient-valid. Explicit caller-applied correction keeps the two patterns cleanly separable. Heavy documentation placed at six contact points to prevent silent misuse: class docstring, REFERENCE.md decision box, USAGE.md recipe, EXTENDING.md "CoM handling" (with do-not-stack warning), INTERNALS.md derivation, AGENTS.md Gotcha.
 - *2026-04-22* — **Stage B closed.** Four tasks landing in one session: `UniformBox` (B1, per-axis uniform base on a `Geometry`), `utils/pbc.py` (B4, `nearest_image` + `pairwise_distance(_sq)` consuming `Geometry`), `utils/lattice.py` (B2, pure functions for `fcc / diamond / bcc / hcp / hex_ice` returning `(N, 3)` numpy positions), `LatticeBase` + 5 factories (B3). All consume the Stage-0 `Geometry` value object — no raw `lower/upper` alternatives. `LatticeBase.permute=True` shuffles particle order per-batch via `jax.vmap(jax.random.permutation)` and subtracts `log(N!)` from `log_prob`; the constant has the same caveats as `CoMProjection.ambient_correction` (no gradient effect, matters for absolute densities / ESS / `logZ`). §10.3 resolved with the DM `hex_ice` convention. New `nflojax/utils/` subdir; AGENTS.md dependency graph extended. 84 new tests, 5 minutes total session wall-clock for the Stage. Spherical truncation in `LatticeBase` deferred — no concrete trigger in v1.0 scope.
 - *2026-04-22* — **Stage C closed.** Two stateless feature transforms in new `nflojax/embeddings.py`: `circular_embed(x, geometry, n_freq)` (per-coord Fourier features on a periodic box, lowest harmonic tiles `geometry.box`) and `positional_embed(t, n_freq, base=10_000)` (sinusoidal scalar embedding, transformer-style). Both raise `ValueError` on `n_freq=0` to avoid silent zero-width outputs that would break downstream `jnp.concatenate`. **API change vs. PLAN.md spec**: `circular_embed` takes `Geometry` (not raw `(lower, upper)`) to match the Stage-0 retrofit pattern — one path, no overload. Non-periodic axes are not gated; documented as caller's responsibility. 15 new tests; ~80 LOC. Unblocks Stage D conditioners (Transformer, GNN) which both consume these features.
 - *2026-04-22* — **Stage D closed.** One preparatory change + three reference conditioners + one shared fixture. The preparatory change: `SplitCoupling.flatten_input: bool = True` hatch (default preserves the flat-`(B, N*d)` contract MLP expects; `False` passes the structured `(B, N_frozen, d)` slice through to permutation-aware conditioners). Four new public names in `nflojax.nets`: `DeepSets` (permutation-invariant aggregator), `Transformer` (pre-norm multi-head self-attention, permutation-equivariant per-token), `GNN` (top-K PBC-aware message passing, `num_neighbours=12` default). All three satisfy the existing conditioner contract (`context_dim` attribute + `apply` + `get_output_layer`/`set_output_layer`) and use a top-level `Dense(..., name="dense_out")` to stay compatible with `SplitCoupling._patch_dense_out`. §10.4 resolved (pre-norm), §10.5 resolved (12 neighbours). New `tests/test_conditioner_protocol.py` locks the contract at 5 checks × 4 conditioners; per-conditioner detail in `tests/test_nets.py`. Two subtle-bug fixes during implementation: (1) self-mask computed via `jnp.where(eye_bool, inf, d_sq)` to avoid `0 * inf = NaN` off-diagonal; (2) test N bumped to 8 particles so `num_neighbours=3` stays < N_frozen=4 at init.
 - *2026-04-22* — **Post-close refactor (P1).** Dropped the `set_output_layer` slicing magic from `Transformer` and `GNN`. Instead, `SplitCoupling._patch_dense_out` (and `SplineCoupling._patch_dense_out` for symmetry) now reads the conditioner's current `dense_out` bias length and sizes `identity_spline_bias(num_scalars = bias_size // params_per_scalar, …)` to match. Works for flat and per-token dense_out uniformly because `identity_spline_bias` is a per-scalar pattern tiled across scalars. Net: `Transformer.set_output_layer` / `GNN.set_output_layer` collapsed to the trivial dict-update form (same as `DeepSets`); one Gotcha removed from AGENTS.md; one "library-private convention" line struck; a bias-shape divisibility check added in both `_patch_dense_out` sites. Reason: the slicing hack was a hidden coupling between conditioners and `SplitCoupling`'s internals; inferring from the conditioner keeps the contract local and easier to extend.
 - *2026-04-22* — **Post-close hardening.** Four audit items landed as separate changes: (1) `Transformer` uses `nn.MultiHeadDotProductAttention` instead of the now-deprecated `nn.SelfAttention`; (5) `SplitCoupling.init_params` runs a one-sample dummy apply after `_patch_dense_out` and raises a clear, diagnostic `ValueError` when the conditioner's output total-trailing size doesn't match `transformed_flat · params_per_scalar` — catches per-token `Transformer`/`GNN` misconfigured for asymmetric splits at init rather than as a cryptic reshape error at forward time; (4) removed per-conditioner factories `init_deepsets`/`init_transformer`/`init_gnn` (~75 LOC) in favour of a single generic `init_conditioner(key, conditioner, dummy_x, dummy_context=None)` helper (5 LOC) — shrinks the public API, removes three redundant public names, and keeps all init paths uniform; (3) new `tests/test_particle_integration.py` parametrised over `DeepSets`/`Transformer`/`GNN` composing four alternating-swap `SplitCoupling` layers through `CompositeTransform` — asserts identity-at-init, jit round-trip, and non-zero gradient. Reason: each item brings surface down or failure-mode clarity up; together they move Stage D from "works" to "robust + discoverable".
-- *2026-04-22* — **Stage E closed.** `build_particle_flow` + cross-conditioner smoke tests landed. Two deviations from the original PLAN.md §5 spec, both forced by composition mechanics:
-  1. **Dropped the per-layer `Permutation`.** `Permutation._zero_logdet` on a rank-2 event `(B, N, d)` with `event_axis=-2` returns shape `(B, d)` (locked in by `test_transforms.py::test_event_axis_particle`), not batch-shape. Inside `CompositeTransform.forward` that broadcasts the accumulator to `(B, d)`, which corrupts `Flow.log_prob` (adds `base_log_prob:(B,)` to `(B, d)`). Alternating `swap` on `SplitCoupling` already covers all particles, so the per-layer `Permutation` was redundant coverage anyway. The `Permutation._zero_logdet` shape bug is flagged separately; fixing it means updating an existing test, which is out of Stage E scope.
-  2. **Added a private `_CoMEmbed` shim for `use_com_shift=True`.** `CompositeTransform.forward` applies `block.forward` sequentially; `CoMProjection.forward` reduces `(N, d) → (N-1, d)` (the wrong direction for `Flow.sample`, which goes base-reduced → data-ambient). `_CoMEmbed` flips `.forward`/`.inverse` so the expansion is what `transform.forward` sees at the tail, and the reduction is what `transform.inverse` sees at the head. `EXTENDING.md`'s "Pattern A: CoMProjection" sketch is misleading on this — uses `CompositeTransform(blocks=[inner, proj])` which *doesn't* work as drawn because of the same forward-direction issue. Flagged for a Stage-F docs fix.
-  **Conditioner factory contract**: keyword-only callable with three kwargs (`required_out_dim`, `out_per_particle`, `n_frozen`) computed per-layer by the builder. With asymmetric splits (odd `N_eff` under `use_com_shift=True`), `required_out_dim` differs between `swap=False` and `swap=True` layers, so the factory is called with different sizing per-layer — correctly handled by the per-layer recompute inside the swap loop. Per-token conditioners (`Transformer`, `GNN`) require even `N_eff` so `N_frozen == N_transformed`; the Stage-D `SplitCoupling.init_params` sizing check catches the mismatch with a clear diagnostic error. **Stage-E skip count**: 3 new `@requires_x64` skips on the jit round-trip test across the three conditioners (circular RQS-inverse through Rescale + 4 stacked couplings accumulates ~2.4e-3 float32 roundoff, above the 1e-3 round-trip atol). All pass under `JAX_ENABLE_X64=1`. Total Stage-E LOC: ~230 in `builders.py` (including the `_CoMEmbed` shim + the builder body + docstring), ~150 in `tests/test_builders.py::TestBuildParticleFlow`, ~140 in `tests/test_particle_smoke.py`. Unblocks Stage G bgmat-parity prototype — all nflojax-side v1.0 primitives are in place.
+- *2026-04-22* — **Stage E closed.** `build_particle_flow` + cross-conditioner smoke tests landed. Two composition decisions matter for future work:
+  1. **No per-layer `Permutation` in the builder.** Alternating `swap` on `SplitCoupling` already covers all particles, so the builder does not add a separate particle-axis permutation between layers. `Permutation._zero_logdet` now returns batch shape only for `(B, N, d)` events with `event_axis=-2`, so a future builder can reintroduce particle permutations if a concrete design calls for them.
+  2. **Added a private `_CoMEmbed` shim for `use_com_shift=True`.** `CompositeTransform.forward` applies `block.forward` sequentially; `CoMProjection.forward` reduces `(N, d) → (N-1, d)` (the wrong direction for `Flow.sample`, which goes base-reduced → data-ambient). `_CoMEmbed` flips `.forward`/`.inverse` so the expansion is what `transform.forward` sees at the tail, and the reduction is what `transform.inverse` sees at the head. `EXTENDING.md` now documents the same direction-flipping pattern for manual assembly; `_CoMEmbed` stays private until a second consumer needs a public helper.
+  **Conditioner factory contract**: keyword-only callable with three kwargs (`required_out_dim`, `out_per_particle`, `n_frozen`) computed per-layer by the builder. With asymmetric splits (odd `N_eff` under `use_com_shift=True`), `required_out_dim` differs between `swap=False` and `swap=True` layers, so the factory is called with different sizing per-layer — correctly handled by the per-layer recompute inside the swap loop. Per-token conditioners (`Transformer`, `GNN`) require even `N_eff` so `N_frozen == N_transformed`; the Stage-D `SplitCoupling.init_params` sizing check catches the mismatch with a clear diagnostic error. **Stage-E skip count**: 3 new `@requires_x64` skips on the jit round-trip test across the three conditioners (circular RQS-inverse through Rescale + 4 stacked couplings accumulates ~2.4e-3 float32 roundoff, above the 1e-3 round-trip atol). All pass under `JAX_ENABLE_X64=1`. Total Stage-E LOC: ~230 in the particle builder implementation (including the `_CoMEmbed` shim + the builder body + docstring), ~150 in `tests/test_builders.py::TestBuildParticleFlow`, ~140 in `tests/test_particle_smoke.py`. Unblocks Stage G bgmat-parity prototype — all nflojax-side v1.0 primitives are in place.
 - *2026-04-22* — **Stage-E pre-push cleanup.** Fixed two of the three audit follow-ups, deferred one:
-  1. **`EXTENDING.md` Pattern A** rewritten to a two-part recipe: canonical path points at `build_particle_flow(use_com_shift=True)`; manual-assembly path inlines a ~12-line `CoMEmbed` direction-flipping shim (same pattern as the private `_CoMEmbed` inside `builders.py`). `_CoMEmbed` deliberately *not* promoted to public API — one consumer today, copy-paste recipe covers manual-assembly users until a second asks. Recipe spot-executed end-to-end before landing.
+  1. **`EXTENDING.md` Pattern A** rewritten to a two-part recipe: canonical path points at `build_particle_flow(use_com_shift=True)`; manual-assembly path inlines a ~12-line `CoMEmbed` direction-flipping shim (same pattern as the private `_CoMEmbed` inside the particle builder). `_CoMEmbed` deliberately *not* promoted to public API — one consumer today, copy-paste recipe covers manual-assembly users until a second asks. Recipe spot-executed end-to-end before landing.
   2. **`Permutation._zero_logdet`** changed from `shape.pop(event_axis)` to `x.shape[:event_axis]`, so log-det carries batch shape only per DESIGN.md §5.5. Previous rank-2 behaviour (`(B, d)` on `(B, N, d)` with `event_axis=-2`) was locked in by `test_event_axis_particle`; assertion updated to `(B,)` with an explanatory comment. Side benefit: unblocks future reintroduction of a per-layer `Permutation` inside `build_particle_flow`, though alternating-swap already covers particles so that remains a separate design decision.
   3. **Deferred**: overlap between `test_particle_integration.py` (raw `SplitCoupling` + `CompositeTransform`) and `test_particle_smoke.py` (builder). Both kept as defense-in-depth at different abstraction layers; revisit once real-regression signal tells us which layer catches bugs first.
   Full suite green both dtypes after the fixes: **607 passed / 9 skipped** under float32, **616 passed** under x64 (unchanged vs. Stage-E close — the fixes don't add or remove tests, only update one assertion).
@@ -451,3 +510,4 @@ Items that need a decision before the relevant stage can close.
   - **`_fkl_batch` dimension-agnosticism fix.** Moving the CoM-noise helper to `bgmat_clean/train.py` surfaced that the LJ13 version hardcoded `spatial_dim=3`. Fixed to read `shape[-1]` from the reference; now works for DW4 (d=2) with no changes. No parallel fix needed in nflojax — this helper lives application-side.
   - **The L1 mode-ratio gap remains a research direction.** For a post-v1 milestone (or as bgmat-clean MS2.x): test whether α-divergence or FAB-style training closes the +9 / −7 pp ratio gap; if so, the same fix would apply to LJ13 with Pattern B.
   **MS2 verdict: closed as partial success.** DW4 demonstrates that nflojax's primitives compose into a working, useful density estimator for multimodal particle targets without any library-side changes. LJ13 remains parked as a post-v1 target. MS3 (mW water port) is unblocked and can proceed against the larger periodic architecture where `GNN` is designed to shine.
+- *2026-04-23* — **AGENTS.md + USAGE.md cross-reference sweep.** Added a "Sibling repos" section to AGENTS.md pointing at `../jax-pdf/` (benchmark target log-densities; `LennardJones` / `DW4` plug into `build_particle_flow`'s `(..., n, d)` events with no reshape) and `../bgmat-clean/` (Stage G application repo). Added a short "Benchmark targets" pointer in USAGE.md's `Build a particle flow` section linking to `bgmat-clean/lj13/` and `bgmat-clean/dw4/` as worked examples. Zero code changes; pure discoverability. Motivation: a fresh agent session found these repos only by reading PLAN.md's decision log, which is both too far down and too long. A top-level pointer in AGENTS.md plus one in USAGE.md means downstream users land on the right cross-references on the first read.

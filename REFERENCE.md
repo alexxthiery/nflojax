@@ -1,8 +1,17 @@
 # API Reference
 
+REFERENCE is the source of truth for public API facts: signatures, options,
+parameter structure, and shape contracts. Use USAGE for recipes and INTERNALS
+for math.
+
+Labels used below: **Primitive** means implemented low-level API; **Builder**
+means an opinionated constructor; **Pattern** means documented recipe; and
+**Application** means downstream code outside nflojax.
+
 **Contents:**
 
 - [Event Shape Convention](#event-shape-convention)
+- [Product Domains](#product-domains)
 - [Core Classes](#core-classes)
 - [Builders](#builders)
 - [Assembly API](#assembly-api)
@@ -44,6 +53,44 @@ Rank-1 and rank-N events use the same code paths. For flat events,
 For transforms that can act on rank > 1 events, see
 [`SplitCoupling`](#splitcoupling).
 
+## Product Domains
+
+Product domains describe flat events whose scalar coordinates have different
+topologies. They are generic coordinate metadata, not target or system objects.
+
+```python
+from nflojax.domains import ProductDomain, ScalarDomain
+
+domain = ProductDomain([
+    ScalarDomain.real(),
+    ScalarDomain.interval(-2.0, 3.0),
+    ScalarDomain.circular(-3.14159, 3.14159),
+])
+```
+
+| Object | Meaning |
+|--------|---------|
+| `ScalarDomain.real()` | Unconstrained real coordinate |
+| `ScalarDomain.interval(lower, upper)` | Bounded interval coordinate |
+| `ScalarDomain.circular(lower, upper)` | Circular coordinate with identified endpoints |
+| `ProductDomain([...])` | Flat rank-1 event domain, `event_shape == (dim,)` |
+
+Circular coordinates use half-open support `[lower, upper)` in `ProductBase`.
+Interval coordinates use `[lower, upper]`.
+
+`ProductDomain.conditioner_features(x, mask, circular_n_freq)` is the default
+MLP feature map used by `ProductSplineCoupling`; it is not intrinsic domain
+semantics.
+
+| Frozen coordinate kind | Default conditioner feature |
+|------------------------|-----------------------------|
+| `real` | Raw scalar value |
+| `interval` | Affine-normalized scalar in `[-1, 1]` |
+| `circular` | Sine/cosine pairs for frequencies `1, ..., circular_n_freq` |
+
+If another product-domain conditioner needs a different map, add a separate
+feature-map helper instead of expanding `ProductDomain` indefinitely.
+
 ## Core Classes
 
 ### Flow
@@ -83,6 +130,38 @@ bijection = Bijection(transform, feature_extractor=None, identity_gate=None)
 
 ## Builders
 
+Builder choice is intentionally explicit. These are the blessed user-facing
+construction paths:
+
+Import from `nflojax.builders` for normal use. Direct module paths such as
+`nflojax.builders.flat`, `nflojax.builders.product`,
+`nflojax.builders.particle`, and `nflojax.builders.assembly` are also supported
+when a contributor needs a narrower implementation entry point.
+
+| Builder | Event type | Domain | Base default | Conditioner style | Unsupported by design |
+|---------|------------|--------|--------------|-------------------|-----------------------|
+| `build_realnvp` | flat rank-1 | all real | `StandardNormal` or `DiagNormal` | MLP | product bounds, rank-N events |
+| `build_spline_realnvp` | flat rank-1 | all real | `StandardNormal` or `DiagNormal` | MLP | product bounds, rank-N events |
+| `build_product_spline_flow` | flat rank-1 | mixed real/interval/circular | `ProductBase` | MLP with default product feature map | LOFT, linear mixing, permutations |
+| `build_particle_flow` | structured rank-N | box/torus particle events | caller-provided | keyword-only conditioner factory | flat masks, feature extractor |
+| `assemble_bijection` / `assemble_flow` | custom | caller-defined | caller-provided | caller-defined | automatic topology decisions |
+
+Builder option sets are intentionally not identical. If an option is not in
+the table below, use the assembly API rather than copying the option to another
+builder.
+
+| Option family | Flat RealNVP builders | Product-domain builder | Particle builder | Assembly API |
+|---------------|-----------------------|------------------------|------------------|--------------|
+| Custom base | yes, flat `(dim,)` | yes, `domain.event_shape` | yes, `(N, d)` or `(N-1, d)` with CoM | caller-defined |
+| Context | yes | yes | no | caller-defined |
+| Context feature extractor | yes | no | no | yes |
+| Identity gate | yes, no permutations | yes | no | yes |
+| LOFT / linear mixing | yes | no | no | caller-defined |
+| Flat permutations | yes | no | no | caller-defined |
+| Circular coordinate shifts | no | yes | no | caller-defined |
+| Particle circular shifts | no | no | yes | caller-defined |
+| CoM embedding | no | no | yes | caller-defined |
+
 ### build_realnvp
 
 ```python
@@ -102,6 +181,49 @@ flow_or_bijection, params = build_spline_realnvp(
     key, dim, num_layers, hidden_dim, n_hidden_layers, **options
 )
 ```
+
+### build_product_spline_flow
+
+```python
+from nflojax.builders import build_product_spline_flow
+from nflojax.domains import ProductDomain, ScalarDomain
+
+domain = ProductDomain([
+    ScalarDomain.real(),
+    ScalarDomain.interval(-2.0, 3.0),
+    ScalarDomain.circular(-3.14159, 3.14159),
+])
+
+flow_or_bijection, params = build_product_spline_flow(
+    key,
+    domain=domain,
+    num_layers=4,
+    hidden_dim=128,
+    n_hidden_layers=2,
+    num_bins=8,
+)
+```
+
+**Architecture:**
+
+```
+for _ in range(num_layers):
+    [optional] CircularCoordinateShift      # only if domain has circular coords
+    ProductSplineCoupling                   # alternating flat masks
+```
+
+By default the builder uses `ProductBase(domain)`, which is standard normal
+on real coordinates and uniform on interval/circular coordinates.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `context_dim` | `0` | Conditioner context width |
+| `num_bins` | `8` | RQS bin count |
+| `tail_bound` | `5.0` | Canonical spline half-width |
+| `circular_n_freq` | `1` | Number of sine/cosine frequencies for frozen circular features |
+| `use_circular_shift` | `True` | Insert learnable circular coordinate shifts |
+| `return_transform_only` | `False` | Return `Bijection` instead of `Flow` |
+| `identity_gate` | `None` | Context gate; `0` makes the transform identity |
 
 ### build_particle_flow
 
@@ -284,14 +406,67 @@ Shapes: `x`, `y` are `(..., dim)`. `log_det` is `(...,)` (one scalar per sample)
 |-----------|---------|
 | `AffineCoupling` | RealNVP affine coupling layer |
 | `SplineCoupling` | Rational-quadratic spline coupling layer |
+| `ProductSplineCoupling` | Flat mixed-domain spline coupling |
 | `SplitCoupling` | Spline coupling for rank-N (particle-system) events |
 | `LinearTransform` | LU-parameterized invertible linear map |
 | `Permutation` | Fixed shuffle along any negative event axis |
 | `Rescale` | Fixed per-axis affine from `geometry.box` to a canonical target range |
 | `CoMProjection` | Translation-gauge bijection `(N, d) ↔ (N−1, d)`; zero log-det on subspace |
 | `CircularShift` | Rigid per-coord shift mod box (torus rotation) |
+| `CircularCoordinateShift` | Rigid shift on circular coordinates of a flat product domain |
 | `LoftTransform` | Log-soft tail compression |
 | `CompositeTransform` | Sequential composition of transforms |
+
+Import from `nflojax.transforms` for normal use. Coupling implementations also
+have supported direct paths under `nflojax.transforms.couplings.affine`,
+`nflojax.transforms.couplings.spline`, and
+`nflojax.transforms.couplings.split`.
+
+### ProductSplineCoupling
+
+**What:** Flat RealNVP-style spline coupling on a `ProductDomain`. Frozen
+coordinates become conditioner features; transformed coordinates use scalar RQS
+chunks selected by domain type.
+
+The shipped `create()` path uses an MLP conditioner and the default product
+feature map from [`Product Domains`](#product-domains).
+
+| Domain kind | Transform behavior |
+|-------------|--------------------|
+| `real` | Linear-tail RQS on the raw coordinate |
+| `interval` | Affine to canonical `[-tail_bound, tail_bound]`, linear-tail RQS, affine back |
+| `circular` | Affine to canonical range, circular-boundary RQS, affine back and wrap |
+
+```python
+from nflojax.transforms import ProductSplineCoupling
+
+coupling, params = ProductSplineCoupling.create(
+    key,
+    domain=domain,
+    mask=jnp.array([1.0, 0.0, 1.0]),
+    hidden_dim=64,
+    n_hidden_layers=2,
+    num_bins=8,
+)
+```
+
+`mask == 1` means frozen; `mask == 0` means transformed. The mask must freeze
+at least one coordinate and transform at least one coordinate. Parameters use
+the same dict convention as other MLP-backed couplings: `{"mlp": ...}`.
+
+### CircularCoordinateShift
+
+**What:** Zero-logdet rigid shift on only the circular coordinates of a flat
+`ProductDomain`. Non-circular coordinates are unchanged.
+
+```python
+from nflojax.transforms import CircularCoordinateShift
+
+shift, params = CircularCoordinateShift.create(key, domain)
+y, log_det = shift.forward(params, x)
+```
+
+Params: `{"shift": (domain.dim,)}`. Non-circular shift entries are ignored.
 
 ### AffineCoupling
 
@@ -971,7 +1146,7 @@ There is intentionally no `Geometry.box(...)` factory — it would shadow the `@
 ## Distributions
 
 ```python
-from nflojax.distributions import StandardNormal, DiagNormal, UniformBox
+from nflojax.distributions import StandardNormal, DiagNormal, UniformBox, ProductBase
 ```
 
 All distributions accept an event of arbitrary rank. See
@@ -982,6 +1157,7 @@ All distributions accept an event of arbitrary rank. See
 | `StandardNormal` | `(event_shape=(N, d))`, `(event_shape=N)`, `(dim=N)`, `(N)` | `None` | Isotropic `N(0, I)` on the event |
 | `DiagNormal` | same | `{"loc": event_shape, "log_scale": event_shape}` | Diagonal-covariance Gaussian on the event |
 | `UniformBox` | `(geometry=..., event_shape=(N, d))` | `None` | Per-axis uniform on `geometry.box`; i.i.d. over leading event axes |
+| `ProductBase` | `(domain=ProductDomain(...))` | `None` | Product base: normal on real coordinates, uniform on interval/circular coordinates |
 | `LatticeBase` | `.fcc / .diamond / .bcc / .hcp / .hex_ice(n_cells, a, noise_scale, permute=False)` | `None` | Gaussian-perturbed crystalline lattice |
 
 All provide: `log_prob(params, x)`, `sample(params, key, shape)`, `init_params()`. For `DiagNormal`, `init_params()` returns zero `loc` and `log_scale`, i.e. a standard Gaussian over the event. For `UniformBox` and `LatticeBase`, `init_params()` returns `None`.

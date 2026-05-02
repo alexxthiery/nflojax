@@ -1,6 +1,8 @@
 # Internals
 
 Mathematical foundations and design decisions behind nflojax.
+INTERNALS is the source of truth for math and conventions; use REFERENCE for
+API facts and USAGE for recipes.
 
 **Contents:**
 
@@ -385,6 +387,44 @@ Note the sign difference: `log_prob` uses `+ log_det_inv` while `sample_and_log_
 Both are correct because `log|det dz/dx| = -log|det dx/dz|`.
 
 See [REFERENCE.md](REFERENCE.md#forwardinverse-convention) for the full sign convention table.
+
+## Product-Domain Flows
+
+A `ProductDomain` is a flat event space with coordinate-wise topology:
+
+```
+X = X_1 × ... × X_d,
+X_i ∈ { R, [a_i, b_i], S^1[a_i, b_i) }.
+```
+
+`ProductSplineCoupling` keeps the usual RealNVP triangular structure. Frozen
+coordinates become conditioner features; transformed coordinates receive
+independent scalar RQS parameters. The log-det is still the sum of transformed
+scalar spline log-derivatives.
+
+Bounded and circular coordinates are temporarily mapped to the canonical
+spline range `[-B, B]`:
+
+```
+u = 2B * (x - lower) / (upper - lower) - B.
+```
+
+The affine scale into canonical coordinates and the affine scale back cancel
+in the coupling Jacobian, so the only non-constant contribution is the RQS
+log-det. Circular coordinates use `boundary_slopes="circular"` and are wrapped
+back to `[lower, upper)`.
+
+The shipped product-domain MLP conditioner uses a default feature map:
+
+- real: raw scalar value;
+- interval: normalized value in `[-1, 1]`;
+- circular: sine/cosine features so the conditioner has no artificial seam.
+
+This abstraction is generic coordinate topology. It must not contain target,
+energy, particle, molecule, or application-specific logic. The feature map is
+a default for `ProductSplineCoupling`, not an intrinsic semantic property of
+`ProductDomain`; if a future product-domain conditioner needs different
+features, put that policy in a separate helper.
 
 ## CoM Projection and the Volume Correction
 

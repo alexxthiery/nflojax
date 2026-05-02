@@ -4,7 +4,7 @@ Project context for coding agents (Claude Code, Cursor, Copilot, etc.).
 
 ## Project Summary
 
-Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Particle-system toolkit (Stages A + B): `Geometry` value object, `Rescale` / `CircularShift` / `CoMProjection` bijections, `UniformBox` / `LatticeBase` (5 crystal factories) base distributions, and `utils/pbc` + `utils/lattice` helpers. Reference conditioners (Stage D): `MLP` + `DeepSets` (invariant) + `Transformer` (pre-norm, equivariant) + `GNN` (KNN under PBC, equivariant); plug into `SplitCoupling(flatten_input=False)` for the structured-input path. Not a pip package; clone and import directly.
+Minimal normalizing flows library in JAX. Provides RealNVP and spline flow builders, product-domain flows for flat mixed real/interval/circular events, conditional flows, identity gating, structured rank-N couplings for particle-system events, and an assembly API for custom architectures. Particle-system toolkit (Stages A + B): `Geometry` value object, `Rescale` / `CircularShift` / `CoMProjection` bijections, `UniformBox` / `LatticeBase` (5 crystal factories) base distributions, and `utils/pbc` + `utils/lattice` helpers. Reference conditioners (Stage D): `MLP` + `DeepSets` (invariant) + `Transformer` (pre-norm, equivariant) + `GNN` (KNN under PBC, equivariant); plug into `SplitCoupling(flatten_input=False)` for the structured-input path. Use as an editable source package (`pip install -e ".[test]"`). There are no top-level `nflojax.__init__` exports; import from submodules.
 
 For current stage status and what's next, read [PLAN.md §0](PLAN.md). For
 the design philosophy and what nflojax refuses to build, read
@@ -15,7 +15,7 @@ checks.
 
 This is JAX scientific computing code. Every decision follows from that.
 
-- **Lean and hackable.** Small codebase a researcher can read in an afternoon. No framework magic, no plugin systems, no registries. A user who wants to add a new transform reads one file and follows the pattern.
+- **Lean and hackable.** Small codebase a researcher can read in an afternoon. No framework magic, no plugin systems, no registries. A user who wants to add a new transform reads the matching file under `nflojax/transforms/` and follows the pattern.
 - **Readable over clever.** Plain functions and dataclasses. If a piece of code needs a comment to explain what it does (not why), rewrite it.
 - **No unnecessary abstractions.** One level of indirection is fine; two needs justification. Don't wrap things that don't need wrapping. Three similar lines beat a premature helper.
 - **JIT-friendly throughout.** All numerical code must trace cleanly under `jax.jit`. No Python-level control flow on array values. No side effects in forward/inverse paths. Pure functions operating on explicit PyTree params.
@@ -29,17 +29,18 @@ This is JAX scientific computing code. Every decision follows from that.
 - **JAX** (core compute, JIT, vmap, autodiff)
 - **Flax** (conditioner MLPs via `linen`)
 - **Python 3.10+** (type unions with `|`)
-- No pip package, no `__init__.py` exports
+- Editable source package, no `__init__.py` exports
 
 ## Project Structure
 
 ```
 nflojax/
   __init__.py          empty
-  builders.py          High-level constructors + assembly API
+  builders/            Public builder facade plus assembly/flat/product/particle modules
   flows.py             Flow and Bijection classes
-  transforms.py        All transform types + CompositeTransform
+  transforms/          Public transform facade plus focused implementation modules
   distributions.py     StandardNormal, DiagNormal, UniformBox
+  domains.py           ScalarDomain, ProductDomain for flat mixed-domain flows
   nets.py              MLP conditioner, ResNet init
   splines.py           Rational-quadratic spline primitives
   scalar_function.py   LOFT forward/inverse scalar functions
@@ -66,10 +67,11 @@ tests/
 ## Module Dependency Graph
 
 ```
-builders     -> flows, transforms, distributions, nets
+builders     -> flows, transforms, distributions, domains, geometry, nets
 flows        -> transforms (gate), nets (types)
-transforms   -> nets (MLP), splines, scalar_function, geometry
-distributions -> geometry (UniformBox), utils.lattice (LatticeBase factories), nets (types)
+transforms   -> nets (MLP), splines, scalar_function, geometry, domains
+distributions -> geometry (UniformBox), domains (ProductBase), utils.lattice (LatticeBase factories), nets (types)
+domains      -> numpy, jax.numpy (flat coordinate topology metadata)
 embeddings   -> geometry (circular_embed), nets (types)
 utils.pbc    -> geometry, nets (types)
 utils.lattice -> numpy (no JAX / Flax — static lattice positions)
@@ -79,9 +81,33 @@ nets         -> flax.linen
 
 ## Entry Points
 
-- **User entry**: `build_realnvp()`, `build_spline_realnvp()` in `builders.py`
+- **User entry**: builder facade `nflojax.builders`; direct modules under
+  `nflojax.builders.{assembly,flat,product,particle}` are also supported.
 - **Low-level**: `TransformClass.create()` + `assemble_bijection()`/`assemble_flow()`
 - **Core types**: `Flow`, `Bijection` in `flows.py`
+
+Builder choice is explicit; do not copy options between rows unless the row
+already supports them.
+
+| Builder | Event type | Domain | Base default | Conditioner style | Unsupported by design |
+|---------|------------|--------|--------------|-------------------|-----------------------|
+| `build_realnvp` | flat rank-1 | all real | `StandardNormal` or `DiagNormal` | MLP | product bounds, rank-N events |
+| `build_spline_realnvp` | flat rank-1 | all real | `StandardNormal` or `DiagNormal` | MLP | product bounds, rank-N events |
+| `build_product_spline_flow` | flat rank-1 | mixed real/interval/circular | `ProductBase` | MLP with default product feature map | LOFT, linear mixing, permutations |
+| `build_particle_flow` | structured rank-N | box/torus particle events | caller-provided | keyword-only conditioner factory | flat masks, feature extractor |
+| `assemble_bijection` / `assemble_flow` | custom | caller-defined | caller-provided | caller-defined | automatic topology decisions |
+
+Builder option sets are intentionally different. Do not add an option to a
+builder just because another builder supports it.
+
+| Option family | Flat RealNVP builders | Product-domain builder | Particle builder | Assembly API |
+|---------------|-----------------------|------------------------|------------------|--------------|
+| Custom base | yes, flat `(dim,)` | yes, `domain.event_shape` | yes, `(N, d)` or `(N-1, d)` with CoM | caller-defined |
+| Context / identity gate | yes | yes | no | caller-defined |
+| Context feature extractor | yes | no | no | yes |
+| LOFT / linear / flat permutations | yes | no | no | caller-defined |
+| Circular coordinate shifts | no | yes | no | caller-defined |
+| Particle circular shifts / CoM | no | no | yes | caller-defined |
 
 ## Key Patterns
 
@@ -97,36 +123,63 @@ nets         -> flax.linen
 
 ## Testing Strategy
 
-**One rule: after any code edit, run `pytest tests/`.** The full suite is
-parallel by default (via `pytest-xdist`, configured in `pyproject.toml`) and
-runs in ~85s under float32, ~95s under x64 on a multicore machine. Do not
-pick a subset — the cost of a missed regression is larger than the minute
-you save.
+**Default rule: after any routine code edit, run only the fast suite with
+`pytest tests/`.** The default suite excludes tests marked `slow` and is meant
+to finish in under a minute. Do not run the full suite by habit while iterating:
+the slow tests are reserved for explicit user requests, serious commits,
+release/stage-close checks, or broad numerical refactors.
+
+When the user asks to commit, prepare a serious commit, or says the change is
+ready, remind them that running the full float32 suite, and full x64 if
+precision-sensitive code changed, is a good idea before committing. Only run
+those full suites when the user explicitly asks or confirms.
+
+`pytest-xdist` is an optional speedup, not a required test-runner dependency.
 
 ```bash
-# Default: run everything in parallel (~85s)
+# Default fast suite
 pytest tests/
 
-# At stage close (closing a PLAN.md task): also check float64 (~95s)
-JAX_ENABLE_X64=1 pytest tests/
+# Optional speedup if pytest-xdist is installed
+pytest -n auto tests/
 
-# Iterating on ONE failure you're debugging — narrow with -k, then re-run full
+# Slow integration and full-Jacobian proofs only
+pytest -o addopts='-q' -m slow tests/
+
+# Targeted x64 precision proofs
+JAX_ENABLE_X64=1 pytest -m requires_x64 tests/
+
+# If product-domain dtype/geometry changed, also check that focused suite
+JAX_ENABLE_X64=1 pytest -o addopts='-q' tests/test_product_domains.py
+
+# Full float32/x64 are release/stage-close checks, not routine edit gates
+pytest -o addopts='-q' tests/
+JAX_ENABLE_X64=1 pytest -o addopts='-q' tests/
+
+# Iterating on ONE fast-suite failure you're debugging
 pytest tests/ -k "Rescale and round_trip"
+
+# Iterating on ONE slow-suite failure you're debugging
+pytest -o addopts='-q' tests/ -k "log_det_vs_autodiff"
 ```
 
-Two commands total for the full float32+x64 check (~3 min combined). If you
-find yourself wanting "just this file", you're probably over-triaging; run
-the full suite unless you have a specific reason.
+For routine edits, run the default fast suite plus the targeted x64 command
+when precision-sensitive code changed. Full float32 and full x64 take several
+minutes serially; reserve them for stage close, release checks, or changes that
+touch shared numerical kernels.
 
 ### Float32 skips
 
-Six tests carry `@requires_x64` and skip under float32 (RQS-inverse and
+Several tests carry `@requires_x64` and skip under float32 (RQS-inverse and
 triangular-solve roundoff exceeds their `atol`); all pass under
-`JAX_ENABLE_X64=1`. Expect `pytest tests/` to report `... passed, 6 skipped`.
+`JAX_ENABLE_X64=1`. The GNN stacked-spline round-trip perturbation is also an
+x64 precision proof; default precision has a separate finite/JIT smoke check.
+Run only these proofs with `JAX_ENABLE_X64=1 pytest -m requires_x64 tests/`.
 
 ## Known Issues
 
-No critical or high-priority issues open.
+No critical or high-priority code issues open. Audit follow-ups are tracked in
+`PLAN.md` under "Audit remediation".
 
 Previously fixed:
 - **C1** (fixed `765a278`): LOFT inverse overflow, clamped exponent to 80.0
@@ -142,6 +195,17 @@ Previously fixed:
 - **`CoMProjection` log-det is zero by design** (Convention 1: density on the `(N−1, d)` reduced space). If you need an ambient log-density (reverse-KL with ambient `E(x)`, ESS, `logZ`), add `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)`. Do **not** stack `CoMProjection` with an augmented-coupling pattern — they double-count. See [REFERENCE.md — CoMProjection](REFERENCE.md#comprojection) and [EXTENDING.md — CoM handling](EXTENDING.md#com-handling).
 - **`SplitCoupling.flatten_input` is True by default.** The flat contract matches `MLP`. To plug in a permutation-aware conditioner (`DeepSets`, `Transformer`, `GNN`, or a user's own), construct `SplitCoupling(..., flatten_input=False)` so the conditioner sees `(*batch, N_frozen, d)`. `SplitCoupling.create()` always uses the MLP path and ignores this.
 - **`GNN` self-edge masking uses `jnp.where`, not multiplication.** `jnp.eye(N) * jnp.inf` gives `0 * inf = NaN` off-diagonal and silently poisons the neighbour list. Use `jnp.where(eye_bool, jnp.inf, d_sq)` instead.
+- **Product-domain feature maps are builder defaults.** `ProductDomain` is
+  coordinate-topology metadata; `conditioner_features` is only the default MLP
+  feature map for `ProductSplineCoupling`. See REFERENCE.md "Product Domains"
+  before changing it.
+
+## Sibling repos
+
+These live next to nflojax on disk and are load-bearing for testing particle flows end-to-end. They are **not** dependencies — nflojax has no runtime coupling to either.
+
+- **`../jax-pdf/`** — benchmark target log-densities. Provides 8 distributions with a unified `__call__(x) -> log_p` API. Particle targets (`LennardJones`, `DW4`) accept structured `(..., n_particles, spatial_dim)` input and plug directly into flows built with `build_particle_flow` — no reshape. Generic targets (`Banana2D`, `NealFunnel`, `LGCP`, `MullerBrown`, `PhiFour`, `DoubleWell`) take flat `(..., dim)` input. Top-level import: `from jax_pdf import LennardJones, DW4, ...`. Use for reverse-KL smoke tests, regression targets, and worked examples.
+- **`../bgmat-clean/`** — downstream application repo driving Stage G validation. Clean-room Boltzmann-generator rebuild on top of nflojax. MS2 (DW4) closed as partial success; MS3 (mW water, periodic) is next. If nflojax-side friction surfaces in bgmat-clean, file it as a PLAN.md §1–§5 follow-up before declaring the milestone closed (PLAN.md §7 acceptance).
 
 ## Documentation Map
 
@@ -150,11 +214,11 @@ Previously fixed:
 | Scientific context, Boltzmann-generator primer, vocabulary | [BACKGROUND.md](BACKGROUND.md) |
 | Vision, scope, what to build / refuse to build | [DESIGN.md](DESIGN.md) |
 | Implementation plan, stage status, long-term trajectory | [PLAN.md](PLAN.md) |
-| Design-rationale audit (advisory; not canonical) | [audit.md](audit.md) |
+| Local audit notes and remediation rationale | `audit/` (ignored) |
 | Quick start, install | [README.md](README.md) |
 | How to do X (examples) | [USAGE.md](USAGE.md) |
 | API signatures, options tables | [REFERENCE.md](REFERENCE.md) |
 | Math, design decisions | [INTERNALS.md](INTERNALS.md) |
 | Adding transforms/distributions | [EXTENDING.md](EXTENDING.md) |
 
-If you do not know what a Boltzmann generator is or what nflojax is *for*, start with `BACKGROUND.md`. Before adding any new code, read `DESIGN.md` §§1–4 (vision, philosophy, scope) and run the §9 heuristics. `PLAN.md` tells you what stage is in flight and what v1.0 means. `audit.md` is working opinion — see its "How to read this" preamble before treating anything there as canonical.
+If you do not know what a Boltzmann generator is or what nflojax is *for*, start with `BACKGROUND.md`. Before adding any new code, read `DESIGN.md` §§1–4 (vision, philosophy, scope) and run the §9 heuristics. `PLAN.md` tells you what stage is in flight and what v1.0 means. Local audit notes may exist under ignored `audit/`; if they conflict with DESIGN.md, update the canonical docs before changing code.
