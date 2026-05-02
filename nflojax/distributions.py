@@ -11,6 +11,7 @@ import numpy as np
 
 from .geometry import Geometry
 from .nets import Array, PRNGKey
+from .domains import ProductDomain
 from .utils import lattice as _lattice
 
 
@@ -251,6 +252,97 @@ class UniformBox:
 
     def init_params(self) -> None:
         """UniformBox has no learnable parameters."""
+        return None
+
+
+# ----------------------------------------------------------------------
+# ProductBase
+# ----------------------------------------------------------------------
+@dataclass
+class ProductBase:
+    """Default base distribution on a flat product domain.
+
+    Real coordinates use independent standard normals. Interval and circular
+    coordinates use independent uniforms on their configured bounds. The event
+    shape is always ``(domain.dim,)``.
+    """
+
+    domain: ProductDomain
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.domain, ProductDomain):
+            raise TypeError(
+                f"ProductBase: domain must be a ProductDomain, "
+                f"got {type(self.domain).__name__}."
+            )
+
+    @property
+    def event_shape(self) -> tuple[int, ...]:
+        """Rank-1 event shape."""
+
+        return self.domain.event_shape
+
+    @property
+    def dim(self) -> int:
+        """Event dimension."""
+
+        return self.domain.dim
+
+    def _check_event_shape(self, x: Array) -> None:
+        if x.shape[-1:] != self.event_shape:
+            raise ValueError(
+                f"ProductBase: expected trailing event_shape {self.event_shape}, "
+                f"got {x.shape[-1:]}."
+            )
+
+    def log_prob(self, params: Any, x: Array) -> Array:
+        """Evaluate product-base log density."""
+
+        del params
+        self._check_event_shape(x)
+        log_prob = jnp.zeros(x.shape[:-1], dtype=x.dtype)
+        in_domain = jnp.ones(x.shape[:-1], dtype=bool)
+        log_two_pi = jnp.log(jnp.asarray(2.0 * jnp.pi, dtype=x.dtype))
+        for i, domain in enumerate(self.domain.domains):
+            x_i = x[..., i]
+            if domain.kind == "real":
+                log_prob = log_prob - 0.5 * x_i * x_i - 0.5 * log_two_pi
+            else:
+                lower = jnp.asarray(domain.lower, dtype=x.dtype)
+                upper = jnp.asarray(domain.upper, dtype=x.dtype)
+                if domain.kind == "circular":
+                    in_i = (x_i >= lower) & (x_i < upper)
+                else:
+                    in_i = (x_i >= lower) & (x_i <= upper)
+                in_domain = in_domain & in_i
+                log_prob = log_prob - jnp.log(upper - lower)
+        neg_inf = jnp.asarray(-jnp.inf, dtype=x.dtype)
+        return jnp.where(in_domain, log_prob, neg_inf)
+
+    def sample(self, params: Any, key: PRNGKey, shape: Tuple[int, ...]) -> Array:
+        """Draw product-base samples with shape ``shape + (domain.dim,)``."""
+
+        del params
+        dtype = jnp.asarray(0.0).dtype
+        keys = jax.random.split(key, self.domain.dim)
+        samples = []
+        for i, domain in enumerate(self.domain.domains):
+            if domain.kind == "real":
+                sample_i = jax.random.normal(keys[i], shape=shape, dtype=dtype)
+            else:
+                sample_i = jax.random.uniform(
+                    keys[i],
+                    shape=shape,
+                    dtype=dtype,
+                    minval=jnp.asarray(domain.lower, dtype=dtype),
+                    maxval=jnp.asarray(domain.upper, dtype=dtype),
+                )
+            samples.append(sample_i)
+        return jnp.stack(samples, axis=-1)
+
+    def init_params(self) -> None:
+        """ProductBase has no learnable parameters."""
+
         return None
 
 
