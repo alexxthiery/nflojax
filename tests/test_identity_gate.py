@@ -4,15 +4,17 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+pytestmark = pytest.mark.slow
+
 from nflojax.transforms import (
     AffineCoupling,
     SplineCoupling,
     LinearTransform,
     LoftTransform,
     CompositeTransform,
-    _compute_gate_value,
     validate_identity_gate,
 )
+from nflojax.transforms.common import _compute_gate_value
 from conftest import requires_x64
 from nflojax.builders import build_realnvp, build_spline_realnvp, make_alternating_mask
 from nflojax.distributions import StandardNormal
@@ -243,6 +245,7 @@ class TestAffineCouplingGate:
 
         assert jnp.allclose(x_rec, x, atol=1e-5)
 
+    @pytest.mark.slow
     def test_gate_gradient_no_nan(self, coupling_and_params):
         """Gradients w.r.t. gated output don't produce NaN."""
         coupling, params, dim = coupling_and_params
@@ -334,6 +337,7 @@ class TestSplineCouplingGate:
 
         assert jnp.allclose(x_rec, x, atol=1e-4)
 
+    @pytest.mark.slow
     def test_gate_gradient_no_nan(self, coupling_and_params):
         """Gradients w.r.t. gated output don't produce NaN."""
         coupling, params, dim = coupling_and_params

@@ -12,9 +12,6 @@ from .common import (
     validate_identity_gate,
     stable_logit,
     identity_spline_bias,
-    _compute_gate_value,
-    _params_per_scalar,
-    _validate_boundary_slopes,
 )
 from .linear import LinearTransform
 from .couplings import AffineCoupling, SplineCoupling, SplitCoupling

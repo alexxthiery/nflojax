@@ -7,7 +7,7 @@ from typing import Any, Callable, Tuple
 import jax
 
 from .nets import Array, PRNGKey
-from .transforms import _compute_gate_value
+from .transforms.common import _compute_gate_value
 
 
 def _extract_context_features(
