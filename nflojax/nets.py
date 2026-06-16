@@ -772,7 +772,11 @@ class GNN(nn.Module):
         eye_bool = jnp.eye(N, dtype=bool)
         d_sq_no_self = jnp.where(eye_bool, jnp.inf, d_sq)
         neg_topk, idx_topk = jax.lax.top_k(-d_sq_no_self, K)  # (..., N, K)
-        d_nearest = jnp.sqrt(jnp.maximum(-neg_topk, 0.0))      # (..., N, K)
+        # The `+ eps` keeps the sqrt gradient finite when two particles coincide
+        # (`d_sq -> 0`): `sqrt(0)` has an infinite gradient, which NaNs reverse-KL
+        # training the moment the flow samples a close pair. eps is negligible vs
+        # physical distances (floor ~1e-6).
+        d_nearest = jnp.sqrt(jnp.maximum(-neg_topk, 0.0) + 1e-12)  # (..., N, K)
 
         for layer_idx in range(self.num_layers):
             neighbours = _gather_neighbours(h, idx_topk)            # (..., N, K, H)

@@ -862,6 +862,25 @@ class TestGNN:
 
         assert jnp.allclose(y_perm, y_reference, atol=1e-5)
 
+    def test_gradient_finite_with_coincident_particles(self, key, cubic_geom):
+        """GNN gradient stays finite when two particles coincide.
+
+        Regression: the neighbour distance `sqrt(d_sq)` has an infinite gradient
+        at `d_sq = 0`, so coincident particles NaN-ed reverse-KL training until a
+        small epsilon was added inside the sqrt (`nets.py`). Without the fix this
+        gradient is non-finite.
+        """
+        N, d = 5, 3
+        gnn = GNN(
+            num_layers=1, hidden=8, out_per_particle=4,
+            num_neighbours=3, geometry=cubic_geom,
+        )
+        params = init_conditioner(key, gnn, jnp.zeros((1, N, d)))
+        x = jax.random.uniform(key, (N, d), minval=-1.0, maxval=1.0)
+        x = x.at[1].set(x[0])               # particle 1 coincides with particle 0
+        grad = jax.grad(lambda z: jnp.sum(gnn.apply({"params": params}, z)))(x)
+        assert bool(jnp.all(jnp.isfinite(grad)))
+
     def test_zero_init_produces_zero_output(self, key, cubic_geom):
         gnn = GNN(
             num_layers=1, hidden=8, out_per_particle=5,
