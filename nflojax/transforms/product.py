@@ -168,20 +168,265 @@ class ProductSplineCoupling:
         validate_conditioner(self.conditioner, name="ProductSplineCoupling.conditioner")
         object.__setattr__(self, "mask", mask)
         object.__setattr__(self, "_mask_tuple", mask_tuple)
+
+        frozen_real_indices: list[int] = []
+        frozen_real_slots: list[int] = []
+        frozen_interval_indices: list[int] = []
+        frozen_interval_slots: list[int] = []
+        frozen_circular_indices: list[int] = []
+        frozen_circular_slots: list[int] = []
+        feature_slot = 0
+        for i, (frozen, domain) in enumerate(zip(mask_tuple, self.domain.domains)):
+            if not frozen:
+                continue
+            if domain.kind == "real":
+                frozen_real_indices.append(i)
+                frozen_real_slots.append(feature_slot)
+                feature_slot += 1
+            elif domain.kind == "interval":
+                frozen_interval_indices.append(i)
+                frozen_interval_slots.append(feature_slot)
+                feature_slot += 1
+            else:
+                frozen_circular_indices.append(i)
+                frozen_circular_slots.extend(
+                    range(feature_slot, feature_slot + 2 * self.circular_n_freq)
+                )
+                feature_slot += 2 * self.circular_n_freq
+
+        object.__setattr__(self, "_feature_dim", feature_slot)
+        object.__setattr__(
+            self,
+            "_frozen_real_indices",
+            tuple(frozen_real_indices),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_interval_indices",
+            tuple(frozen_interval_indices),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_indices",
+            tuple(frozen_circular_indices),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_real_index_array",
+            jnp.asarray(frozen_real_indices, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_real_slot_array",
+            jnp.asarray(frozen_real_slots, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_interval_index_array",
+            jnp.asarray(frozen_interval_indices, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_interval_slot_array",
+            jnp.asarray(frozen_interval_slots, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_index_array",
+            jnp.asarray(frozen_circular_indices, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_slot_array",
+            jnp.asarray(frozen_circular_slots, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_interval_lower",
+            jnp.asarray(
+                [self.domain.domains[i].lower for i in frozen_interval_indices],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_interval_width",
+            jnp.asarray(
+                [
+                    self.domain.domains[i].upper - self.domain.domains[i].lower
+                    for i in frozen_interval_indices
+                ],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_lower",
+            jnp.asarray(
+                [self.domain.domains[i].lower for i in frozen_circular_indices],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_width",
+            jnp.asarray(
+                [
+                    self.domain.domains[i].upper - self.domain.domains[i].lower
+                    for i in frozen_circular_indices
+                ],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_freqs",
+            jnp.arange(1, self.circular_n_freq + 1, dtype=jnp.float32),
+        )
+        object.__setattr__(
+            self,
+            "_frozen_circular_feature_count",
+            len(frozen_circular_indices) * 2 * self.circular_n_freq,
+        )
         object.__setattr__(
             self,
             "_transformed_indices",
             tuple(i for i, frozen in enumerate(mask_tuple) if not frozen),
         )
+        linear_indices = tuple(
+            i
+            for i in self._transformed_indices
+            if self.domain.domains[i].kind != "circular"
+        )
+        circular_indices = tuple(
+            i
+            for i in self._transformed_indices
+            if self.domain.domains[i].kind == "circular"
+        )
+        object.__setattr__(self, "_linear_indices", linear_indices)
+        object.__setattr__(self, "_circular_indices", circular_indices)
         object.__setattr__(
             self,
-            "_feature_dim",
-            self.domain.conditioner_feature_dim(mask, self.circular_n_freq),
+            "_linear_index_array",
+            jnp.asarray(linear_indices, dtype=jnp.int32),
         )
         object.__setattr__(
             self,
-            "_out_dim",
-            self.domain.required_out_dim(mask, self.num_bins),
+            "_circular_index_array",
+            jnp.asarray(circular_indices, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_linear_is_bounded",
+            jnp.asarray(
+                [
+                    self.domain.domains[i].kind != "real"
+                    for i in linear_indices
+                ],
+                dtype=bool,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_linear_lower",
+            jnp.asarray(
+                [
+                    0.0 if self.domain.domains[i].lower is None
+                    else self.domain.domains[i].lower
+                    for i in linear_indices
+                ],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_linear_width",
+            jnp.asarray(
+                [
+                    1.0 if self.domain.domains[i].upper is None
+                    else self.domain.domains[i].upper - self.domain.domains[i].lower
+                    for i in linear_indices
+                ],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_circular_lower",
+            jnp.asarray(
+                [self.domain.domains[i].lower for i in circular_indices],
+                dtype=jnp.float32,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_circular_width",
+            jnp.asarray(
+                [
+                    self.domain.domains[i].upper - self.domain.domains[i].lower
+                    for i in circular_indices
+                ],
+                dtype=jnp.float32,
+            ),
+        )
+        K = self.num_bins
+        linear_width_positions: list[list[int]] = []
+        linear_height_positions: list[list[int]] = []
+        linear_derivative_positions: list[list[int]] = []
+        circular_width_positions: list[list[int]] = []
+        circular_height_positions: list[list[int]] = []
+        circular_derivative_positions: list[list[int]] = []
+        offset = 0
+        for i in self._transformed_indices:
+            boundary = (
+                "circular"
+                if self.domain.domains[i].kind == "circular"
+                else "linear_tails"
+            )
+            size = _params_per_scalar(K, boundary)
+            if boundary == "circular":
+                circular_width_positions.append(list(range(offset, offset + K)))
+                circular_height_positions.append(list(range(offset + K, offset + 2 * K)))
+                circular_derivative_positions.append(
+                    list(range(offset + 2 * K, offset + size))
+                )
+            else:
+                linear_width_positions.append(list(range(offset, offset + K)))
+                linear_height_positions.append(list(range(offset + K, offset + 2 * K)))
+                linear_derivative_positions.append(
+                    list(range(offset + 2 * K, offset + size))
+                )
+            offset += size
+        object.__setattr__(self, "_out_dim", offset)
+        object.__setattr__(
+            self,
+            "_linear_width_positions",
+            jnp.asarray(linear_width_positions, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_linear_height_positions",
+            jnp.asarray(linear_height_positions, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_linear_derivative_positions",
+            jnp.asarray(linear_derivative_positions, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_circular_width_positions",
+            jnp.asarray(circular_width_positions, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_circular_height_positions",
+            jnp.asarray(circular_height_positions, dtype=jnp.int32),
+        )
+        object.__setattr__(
+            self,
+            "_circular_derivative_positions",
+            jnp.asarray(circular_derivative_positions, dtype=jnp.int32),
         )
         lo, hi = float(self.min_derivative), float(self.max_derivative)
         if not (lo < 1.0 < hi):
@@ -321,68 +566,114 @@ class ProductSplineCoupling:
         mlp_params = self._patch_dense_out(variables.get("params", {}))
         return {"mlp": mlp_params}
 
-    def _to_canonical(self, x_i: Array, domain: Any) -> Array:
-        if domain.kind == "real":
-            return x_i
-        lower = jnp.asarray(domain.lower, dtype=x_i.dtype)
-        upper = jnp.asarray(domain.upper, dtype=x_i.dtype)
-        return 2.0 * self.tail_bound * (x_i - lower) / (upper - lower) - self.tail_bound
+    def _to_linear_canonical(self, x_group: Array) -> Array:
+        lower = self._linear_lower.astype(x_group.dtype)
+        width = self._linear_width.astype(x_group.dtype)
+        bounded = self._linear_is_bounded
+        scaled = 2.0 * self.tail_bound * (x_group - lower) / width - self.tail_bound
+        return jnp.where(bounded, scaled, x_group)
 
-    def _from_canonical(self, u_i: Array, domain: Any) -> Array:
-        if domain.kind == "real":
-            return u_i
-        lower = jnp.asarray(domain.lower, dtype=u_i.dtype)
-        upper = jnp.asarray(domain.upper, dtype=u_i.dtype)
-        x_i = lower + (u_i + self.tail_bound) * (upper - lower) / (2.0 * self.tail_bound)
-        if domain.kind == "circular":
-            x_i = jnp.mod(x_i - lower, upper - lower) + lower
-        return x_i
+    def _from_linear_canonical(self, u_group: Array) -> Array:
+        lower = self._linear_lower.astype(u_group.dtype)
+        width = self._linear_width.astype(u_group.dtype)
+        bounded = self._linear_is_bounded
+        scaled = lower + (u_group + self.tail_bound) * width / (2.0 * self.tail_bound)
+        return jnp.where(bounded, scaled, u_group)
 
-    def _spline_chunks(
+    def _to_circular_canonical(self, x_group: Array) -> Array:
+        lower = self._circular_lower.astype(x_group.dtype)
+        width = self._circular_width.astype(x_group.dtype)
+        return 2.0 * self.tail_bound * (x_group - lower) / width - self.tail_bound
+
+    def _from_circular_canonical(self, u_group: Array) -> Array:
+        lower = self._circular_lower.astype(u_group.dtype)
+        width = self._circular_width.astype(u_group.dtype)
+        x_group = lower + (u_group + self.tail_bound) * width / (2.0 * self.tail_bound)
+        return jnp.mod(x_group - lower, width) + lower
+
+    def _conditioner_features(self, x: Array) -> Array:
+        features = jnp.zeros(x.shape[:-1] + (self._feature_dim,), dtype=x.dtype)
+
+        if self._frozen_real_indices:
+            values = jnp.take(x, self._frozen_real_index_array, axis=-1)
+            features = features.at[..., self._frozen_real_slot_array].set(values)
+
+        if self._frozen_interval_indices:
+            values = jnp.take(x, self._frozen_interval_index_array, axis=-1)
+            lower = self._frozen_interval_lower.astype(x.dtype)
+            width = self._frozen_interval_width.astype(x.dtype)
+            values = 2.0 * (values - lower) / width - 1.0
+            features = features.at[..., self._frozen_interval_slot_array].set(values)
+
+        if self._frozen_circular_indices:
+            values = jnp.take(x, self._frozen_circular_index_array, axis=-1)
+            lower = self._frozen_circular_lower.astype(x.dtype)
+            width = self._frozen_circular_width.astype(x.dtype)
+            freqs = self._frozen_circular_freqs.astype(x.dtype)
+            phase = 2.0 * jnp.pi * (values - lower) / width
+            angles = phase[..., :, None] * freqs
+            sin_cos = jnp.stack((jnp.sin(angles), jnp.cos(angles)), axis=-1)
+            values = sin_cos.reshape(
+                x.shape[:-1] + (self._frozen_circular_feature_count,)
+            )
+            features = features.at[..., self._frozen_circular_slot_array].set(values)
+
+        return features
+
+    def _theta_group(
+        self,
+        theta: Array,
+        boundary: str,
+        g_value: Array | None,
+    ) -> tuple[Array, Array, Array]:
+        K = self.num_bins
+        if boundary == "linear_tails":
+            count = len(self._linear_indices)
+            widths = jnp.take(theta, self._linear_width_positions, axis=-1)
+            heights = jnp.take(theta, self._linear_height_positions, axis=-1)
+            derivatives = jnp.take(theta, self._linear_derivative_positions, axis=-1)
+        else:
+            count = len(self._circular_indices)
+            widths = jnp.take(theta, self._circular_width_positions, axis=-1)
+            heights = jnp.take(theta, self._circular_height_positions, axis=-1)
+            derivatives = jnp.take(theta, self._circular_derivative_positions, axis=-1)
+
+        if g_value is not None:
+            g = g_value[..., None, None]
+            identity = identity_spline_bias(
+                count,
+                K,
+                self.min_derivative,
+                self.max_derivative,
+                dtype=theta.dtype,
+                boundary_slopes=boundary,
+            ).reshape((count, -1))
+            widths = g * widths
+            heights = g * heights
+            derivatives = (1.0 - g) * identity[:, 2 * K :] + g * derivatives
+
+        return widths, heights, derivatives
+
+    def _spline_groups(
         self,
         mlp_params: Any,
         x: Array,
         context: Array | None,
         g_value: Array | None,
-    ) -> list[tuple[Array, Array, Array]]:
-        features = self.domain.conditioner_features(
-            x,
-            self.mask,
-            circular_n_freq=self.circular_n_freq,
-        )
+    ) -> dict[str, tuple[Array, Array, Array]]:
+        features = self._conditioner_features(x)
         theta = self.conditioner.apply({"params": mlp_params}, features, context)
         if theta.shape[-1] != self._out_dim:
             raise ValueError(
                 f"ProductSplineCoupling: conditioner output has wrong size. "
                 f"Expected {self._out_dim}, got {theta.shape[-1]}."
             )
-        chunks = []
-        offset = 0
-        K = self.num_bins
-        for i in self._transformed_indices:
-            domain = self.domain.domains[i]
-            boundary = "circular" if domain.kind == "circular" else "linear_tails"
-            size = _params_per_scalar(K, boundary)
-            theta_i = theta[..., offset : offset + size]
-            offset += size
-            widths = theta_i[..., :K]
-            heights = theta_i[..., K : 2 * K]
-            derivatives = theta_i[..., 2 * K :]
-            if g_value is not None:
-                g = g_value[..., None]
-                identity = identity_spline_bias(
-                    1,
-                    K,
-                    self.min_derivative,
-                    self.max_derivative,
-                    dtype=theta_i.dtype,
-                    boundary_slopes=boundary,
-                )
-                widths = g * widths
-                heights = g * heights
-                derivatives = (1.0 - g) * identity[2 * K :] + g * derivatives
-            chunks.append((widths, heights, derivatives))
-        return chunks
+        result = {}
+        if self._linear_indices:
+            result["linear_tails"] = self._theta_group(theta, "linear_tails", g_value)
+        if self._circular_indices:
+            result["circular"] = self._theta_group(theta, "circular", g_value)
+        return result
 
     def _forward_or_inverse(
         self,
@@ -394,15 +685,16 @@ class ProductSplineCoupling:
     ) -> Tuple[Array, Array]:
         self._check_x(x)
         mlp_params = self._conditioner_params(params)
-        chunks = self._spline_chunks(mlp_params, x, context, g_value)
-        outputs = [x[..., i] for i in range(self.domain.dim)]
+        groups = self._spline_groups(mlp_params, x, context, g_value)
+        outputs = x
         log_det_total = jnp.zeros(x.shape[:-1], dtype=x.dtype)
-        for chunk, i in zip(chunks, self._transformed_indices):
-            domain = self.domain.domains[i]
-            boundary = "circular" if domain.kind == "circular" else "linear_tails"
-            u_i = self._to_canonical(x[..., i], domain)
-            y_i, ld_i = rational_quadratic_spline(
-                inputs=u_i,
+
+        if self._linear_indices:
+            chunk = groups["linear_tails"]
+            x_group = jnp.take(x, self._linear_index_array, axis=-1)
+            u_group = self._to_linear_canonical(x_group)
+            y_group, ld_group = rational_quadratic_spline(
+                inputs=u_group,
                 unnormalized_widths=chunk[0],
                 unnormalized_heights=chunk[1],
                 unnormalized_derivatives=chunk[2],
@@ -412,11 +704,36 @@ class ProductSplineCoupling:
                 min_derivative=self.min_derivative,
                 max_derivative=self.max_derivative,
                 inverse=inverse,
-                boundary_slopes=boundary,
+                boundary_slopes="linear_tails",
             )
-            outputs[i] = self._from_canonical(y_i, domain)
-            log_det_total = log_det_total + ld_i
-        return jnp.stack(outputs, axis=-1), log_det_total
+            outputs = outputs.at[..., self._linear_index_array].set(
+                self._from_linear_canonical(y_group)
+            )
+            log_det_total = log_det_total + jnp.sum(ld_group, axis=-1)
+
+        if self._circular_indices:
+            chunk = groups["circular"]
+            x_group = jnp.take(x, self._circular_index_array, axis=-1)
+            u_group = self._to_circular_canonical(x_group)
+            y_group, ld_group = rational_quadratic_spline(
+                inputs=u_group,
+                unnormalized_widths=chunk[0],
+                unnormalized_heights=chunk[1],
+                unnormalized_derivatives=chunk[2],
+                tail_bound=self.tail_bound,
+                min_bin_width=self.min_bin_width,
+                min_bin_height=self.min_bin_height,
+                min_derivative=self.min_derivative,
+                max_derivative=self.max_derivative,
+                inverse=inverse,
+                boundary_slopes="circular",
+            )
+            outputs = outputs.at[..., self._circular_index_array].set(
+                self._from_circular_canonical(y_group)
+            )
+            log_det_total = log_det_total + jnp.sum(ld_group, axis=-1)
+
+        return outputs, log_det_total
 
     def forward(
         self,

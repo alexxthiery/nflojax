@@ -162,6 +162,25 @@ class TestCircularCoordinateShift:
 class TestProductSplineCoupling:
     """Tests for mixed-domain spline coupling."""
 
+    def test_fast_feature_map_matches_domain_helper(self, key):
+        domain = mixed_domain()
+        mask = jnp.array([1.0, 1.0, 1.0, 0.0])
+        coupling, _ = ProductSplineCoupling.create(
+            key,
+            domain=domain,
+            mask=mask,
+            hidden_dim=8,
+            n_hidden_layers=1,
+            num_bins=4,
+            circular_n_freq=2,
+        )
+        x = jnp.array([[0.5, 0.5, 0.0, -1.0], [0.2, -0.5, 1.0, 0.3]])
+
+        expected = domain.conditioner_features(x, mask, circular_n_freq=2)
+        actual = coupling._conditioner_features(x)
+
+        assert jnp.allclose(actual, expected)
+
     def test_all_frozen_or_all_transformed_masks_raise(self, key):
         domain = mixed_domain()
         with pytest.raises(ValueError, match="freeze at least one"):
