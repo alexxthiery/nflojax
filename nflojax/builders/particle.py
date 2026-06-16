@@ -15,7 +15,7 @@ from ..transforms import (
     Rescale,
     SplitCoupling,
 )
-from ..transforms.common import _params_per_scalar
+from ..transforms.common import _params_per_scalar, _validate_boundary_slopes
 from .common import (
     _assemble_builder_output,
     _resolve_base,
@@ -96,6 +96,20 @@ def build_particle_flow(
     mixing, use ``LatticeBase(permute=True)`` as the base distribution or
     the augmented-coupling pattern (see ``EXTENDING.md``).
 
+    Periodicity (correctness constraint, not a style choice)
+    --------------------------------------------------------
+    If ``geometry`` has any periodic axis (the default ``periodic=None`` is
+    all-periodic), the configuration space is a torus and you MUST keep
+    ``boundary_slopes='circular'`` (the default). A periodic target on
+    non-circular (``'linear_tails'``) coordinates is *improper*: its density
+    is invariant under per-particle box translations ``x_i -> x_i + L``, so
+    it has infinitely many identical copies over the unbounded spline tails,
+    and reverse-KL training diverges to infinite entropy. This builder
+    **raises** ``ValueError`` if a periodic ``geometry`` is paired with
+    ``'linear_tails'``. Use ``'linear_tails'`` only for open/free systems
+    (e.g. free clusters like LJ13 / DW4); for a bounded but non-periodic
+    box, construct the ``Geometry`` with ``periodic=[False, ...]``.
+
     Conditioner contract
     --------------------
     ``conditioner`` is a **keyword-only factory**, called once per
@@ -149,7 +163,10 @@ def build_particle_flow(
     base_params: Optional; defaults to ``base_dist.init_params()``.
     num_bins: Spline bin count K. Default 8.
     tail_bound: Spline canonical half-width. Default 5.0.
-    boundary_slopes: ``'circular'`` (default) or ``'linear_tails'``.
+    boundary_slopes: ``'circular'`` (default; **required** for periodic/torus
+        geometries) or ``'linear_tails'`` (open/free systems only). See the
+        "Periodicity" note above -- pairing a periodic ``geometry`` with
+        ``'linear_tails'`` raises ``ValueError``.
     use_com_shift: If True, appends a ``_CoMEmbed`` shim so the flow
         acts on the zero-CoM subspace.
     return_transform_only: If True, return ``(Bijection,
@@ -184,6 +201,22 @@ def build_particle_flow(
     if tail_bound <= 0:
         raise ValueError(
             f"build_particle_flow: tail_bound must be positive, got {tail_bound}."
+        )
+    _validate_boundary_slopes(boundary_slopes, where="build_particle_flow")
+    if boundary_slopes != "circular" and any(
+        geometry.is_periodic(axis) for axis in range(geometry.d)
+    ):
+        raise ValueError(
+            "build_particle_flow: geometry has one or more periodic axes but "
+            f"boundary_slopes={boundary_slopes!r}. A periodic target on "
+            "non-circular (linear-tail) coordinates is improper: its density "
+            "is invariant under per-particle box translations (x_i -> x_i + L), "
+            "so it has infinitely many identical copies over the unbounded "
+            "spline tails and reverse-KL training diverges to infinite entropy. "
+            "Use boundary_slopes='circular' (the default) for periodic/torus "
+            "geometries; 'linear_tails' is only for open/free systems (e.g. free "
+            "clusters). For a bounded but non-periodic box, construct the "
+            "Geometry with periodic=[False, ...]."
         )
     if N < 2:
         raise ValueError(f"build_particle_flow: N must be >= 2, got {N}.")

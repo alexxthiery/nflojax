@@ -1225,3 +1225,46 @@ class TestBuildParticleFlow:
                 base_dist=UniformBox(geometry=g, event_shape=(1, 3)),
                 use_com_shift=True,
             )
+
+    def test_periodic_geometry_rejects_linear_tails(self, key, cfg):
+        """A periodic geometry + 'linear_tails' is an improper-target error.
+
+        Guards the failure mode where reverse-KL diverges to infinite entropy
+        because the periodic density has infinitely many copies over the
+        unbounded linear tails.
+        """
+        g = cfg["geometry"]
+        assert g.is_periodic()  # Geometry.cubic defaults to periodic=None (all).
+        with pytest.raises(ValueError, match="periodic"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(8, 3)),
+                boundary_slopes="linear_tails",
+            )
+
+    def test_nonperiodic_geometry_allows_linear_tails(self, key, cfg):
+        """A non-periodic geometry may use 'linear_tails' (open/free system)."""
+        d = cfg["d"]
+        g_open = Geometry(lower=[-1.0] * d, upper=[1.0] * d, periodic=[False] * d)
+        assert not g_open.is_periodic()
+        flow, params = build_particle_flow(
+            key, geometry=g_open, event_shape=(8, d),
+            num_layers=1, conditioner=_deepsets_factory(),
+            base_dist=UniformBox(geometry=g_open, event_shape=(8, d)),
+            boundary_slopes="linear_tails",
+        )
+        x = jax.random.uniform(key, (3, 8, d), minval=-0.9, maxval=0.9)
+        y, _ = flow.forward(params, x)
+        assert bool(jnp.all(jnp.isfinite(y)))
+
+    def test_invalid_boundary_slopes_rejected(self, key, cfg):
+        """Unknown boundary_slopes raises a clear mode error, not the periodic one."""
+        g = cfg["geometry"]
+        with pytest.raises(ValueError, match="boundary_slopes must be one of"):
+            build_particle_flow(
+                key, geometry=g, event_shape=(8, 3),
+                num_layers=1, conditioner=_deepsets_factory(),
+                base_dist=UniformBox(geometry=g, event_shape=(8, 3)),
+                boundary_slopes="nope",
+            )
