@@ -99,7 +99,7 @@ A failure mode we are actively avoiding: nflojax becomes a Boltzmann-generator f
 - **Circular spline** — rational-quadratic spline with matching boundary slopes at both ends of `[-B, B]`. Makes the flow C¹ on the torus; pairs with `CircularShift`.
 - **Augmented coupling flow** — a flow architecture where the state is doubled with auxiliary Gaussian degrees of freedom; the inner flow acts on the augmented state and the auxiliary axes are marginalised at inference. Used in bgmat.
 - **CoM projection** — removing the translation-invariant degree of freedom by projecting `(N, d)` onto the `(N-1)·d`-dimensional subspace of zero-centre-of-mass configurations.
-- **Boundary slopes (circular vs linear_tails)** — two modes for RQ splines. `linear_tails` pins both boundary derivatives to 1 (identity outside the box). `circular` ties them to one shared learnable value (C¹ wraparound). See `nflojax/splines.py`.
+- **Boundary slopes (circular vs linear_tails)** — two modes for RQ splines. `linear_tails` pins both boundary derivatives to 1 (identity outside the box). `circular` ties them to one shared learnable value (C¹ wraparound). This is a correctness choice, not just smoothness: `linear_tails` is improper on a periodic domain (the density gets infinitely many copies over the unbounded tails and reverse-KL diverges), so periodic/torus targets require `circular`. See `nflojax/splines.py`.
 
 ## Papers to read (in priority order for this codebase)
 

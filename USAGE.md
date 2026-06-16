@@ -470,6 +470,16 @@ flow, params = build_particle_flow(
 samples = flow.sample(params, key, (16,))           # (16, N, 3)
 ```
 
+**Periodicity (important).** `build_particle_flow` is a *torus* flow:
+`boundary_slopes='circular'` (the default) is **required** for a periodic
+target. `'linear_tails'` makes the density improper and reverse-KL diverges
+(the builder raises if you pair a periodic `Geometry` with `'linear_tails'`;
+use `periodic=[False, ...]` for a genuinely non-periodic box). Score samples
+with the **forward `log_q`** from `flow.sample_and_log_prob`, not
+`flow.log_prob(x)`: with a Gaussian `LatticeBase` on a torus the inverse path
+is unreliable for samples that wrap across the box seam. For a worked periodic
+LJ-solid flow + training loop, see `../bgmat-clean/bgmat_clean/lj_solid/`.
+
 For a zero-CoM subspace flow (translation-invariant target), set
 `use_com_shift=True` and provide a base on `(N-1, d)`. The simplest
 `(N-1, d)` base is `UniformBox(geometry, event_shape=(N-1, d))`; shipping
@@ -507,9 +517,12 @@ For a worked end-to-end training loop against real particle targets, see:
     # reverse-KL loss: (log_q - target(x)).mean()
     ```
 
-- `../bgmat-clean/lj13/` and `../bgmat-clean/dw4/` — full training loops
-  (Pattern A + CoM-spring variants), evaluation harnesses, and comparisons
-  against DEM reference samples. Use as the authoritative worked examples.
+- `../bgmat-clean/lj13/` and `../bgmat-clean/dw4/` — **free-cluster** (open
+  boundary, `linear_tails` + CoM trap) training loops and evaluation harnesses.
+  Worked examples for the *non-periodic* path; do **not** copy their
+  `linear_tails` pattern to a periodic box. For the periodic/torus path use
+  `build_particle_flow` with `circular` splines, as in
+  `../bgmat-clean/bgmat_clean/lj_solid/`.
 
 ## Particle bases
 

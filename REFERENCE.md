@@ -284,7 +284,7 @@ The factory returns a fresh `flax.linen.Module`. Absorb unused kwargs with `**_`
 |--------|------|---------|-------------|
 | `num_bins` | int | 8 | Spline bins K |
 | `tail_bound` | float | 5.0 | Spline canonical half-width |
-| `boundary_slopes` | str | `'circular'` | Or `'linear_tails'` |
+| `boundary_slopes` | str | `'circular'` | **Required** for periodic/torus geometries; `'linear_tails'` is for open/free systems only. Pairing a periodic `Geometry` with `'linear_tails'` raises `ValueError` (it makes the target improper and reverse-KL diverges). |
 | `use_com_shift` | bool | False | Append `_CoMEmbed` for zero-CoM subspace flows |
 | `base_params` | PyTree or None | None | Defaults to `base_dist.init_params()` |
 | `return_transform_only` | bool | False | Return `Bijection` instead of `Flow` |
@@ -1289,17 +1289,27 @@ x    = positions + noise_scale * eps
 
 **Pairing for a Boltzmann generator on a crystalline solid:**
 
+Use `build_particle_flow`, which assembles the torus-correct topology:
+
 ```
-LatticeBase  ->  Rescale (lattice box -> [-1, 1])  ->  inner couplings  ->  CoMProjection.inverse  ->  ambient
+Rescale (lattice box -> [-tail_bound, tail_bound])  ->  [circular SplitCoupling x2 -> CircularShift] x num_layers  ->  [optional _CoMEmbed]
 ```
 
-- The lattice base lives on `(N, d)` reduced coordinates (no CoM removal yet).
-- `Rescale` puts coords into the canonical spline range.
-- Couplings learn the residual deformation.
-- `CoMProjection.inverse` (Stage A) embeds back into the zero-CoM ambient
-  subspace, ready to score against an ambient `E(x)`.
+- For a **periodic** crystal (a box/torus, the usual case), keep the default
+  `boundary_slopes='circular'`. The `CircularShift` blocks confine coordinates
+  to the box. A non-circular (`'linear_tails'`) flow is *improper* on a periodic
+  target and diverges under reverse-KL; `build_particle_flow` raises if you try.
+- `LatticeBase.fcc(...)` carries a consistent `.geometry`; pass that same
+  `geometry` to `build_particle_flow` (do not build a second, mismatched box).
+  Setting `tail_bound = box_side / 2` makes `Rescale` a pure recentring so the
+  target's length scale (sigma, cutoff) stays physical.
+- For a **free cluster** (open boundary, no box) this is a different problem:
+  use a non-periodic `Geometry(periodic=[False, ...])` with
+  `boundary_slopes='linear_tails'` and, for `T(d)`-invariant targets,
+  `use_com_shift=True` so a `_CoMEmbed` / `CoMProjection` tail maps to the
+  zero-CoM ambient subspace.
 
-For `T(d)`-invariant targets you typically want `permute=True`; for
+For `T(d)`-invariant targets you typically want `LatticeBase(permute=True)`; for
 distinguishable-particle targets (toy benchmarks) leave it `False`.
 
 ## Bookkeeping constants

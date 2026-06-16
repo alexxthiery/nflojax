@@ -1,6 +1,8 @@
 # AGENTS.md
 
 Project context for coding agents (Claude Code, Cursor, Copilot, etc.).
+**This file is the single, provider-agnostic source of truth.** `CLAUDE.md` and
+`.github/copilot-instructions.md` only route here — put all guidance in this file.
 
 ## Project Summary
 
@@ -195,10 +197,25 @@ Previously fixed:
 - **`CoMProjection` log-det is zero by design** (Convention 1: density on the `(N−1, d)` reduced space). If you need an ambient log-density (reverse-KL with ambient `E(x)`, ESS, `logZ`), add `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)`. Do **not** stack `CoMProjection` with an augmented-coupling pattern — they double-count. See [REFERENCE.md — CoMProjection](REFERENCE.md#comprojection) and [EXTENDING.md — CoM handling](EXTENDING.md#com-handling).
 - **`SplitCoupling.flatten_input` is True by default.** The flat contract matches `MLP`. To plug in a permutation-aware conditioner (`DeepSets`, `Transformer`, `GNN`, or a user's own), construct `SplitCoupling(..., flatten_input=False)` so the conditioner sees `(*batch, N_frozen, d)`. `SplitCoupling.create()` always uses the MLP path and ignores this.
 - **`GNN` self-edge masking uses `jnp.where`, not multiplication.** `jnp.eye(N) * jnp.inf` gives `0 * inf = NaN` off-diagonal and silently poisons the neighbour list. Use `jnp.where(eye_bool, jnp.inf, d_sq)` instead.
+- **`GNN` neighbour distance uses `sqrt(d_sq + eps)`, not `sqrt(d_sq)`.** `sqrt` has an infinite gradient at 0, so two coincident particles NaN the *gradient* while the forward stays finite (so it hides until you backprop) — this silently breaks reverse-KL training the moment the flow samples a close pair. The `+1e-12` floor keeps it finite; regression at `tests/test_nets.py::TestGNN::test_gradient_finite_with_coincident_particles`.
 - **Product-domain feature maps are builder defaults.** `ProductDomain` is
   coordinate-topology metadata; `conditioner_features` is only the default MLP
   feature map for `ProductSplineCoupling`. See REFERENCE.md "Product Domains"
   before changing it.
+- **Periodic target means circular splines, not an option.** If a particle
+  target is periodic (a box/torus), the flow density must be periodic too.
+  Use `build_particle_flow` with its default `boundary_slopes='circular'`
+  (plus the built-in `CircularShift`). `boundary_slopes='linear_tails'` puts
+  unbounded tails on a periodic target: the density is invariant under
+  per-particle box translations (`x_i -> x_i + L`), so it has infinitely many
+  identical copies over the tails and reverse-KL diverges to infinite entropy.
+  `build_particle_flow` now **raises** if a periodic `Geometry` is paired with
+  `linear_tails`. Use `linear_tails` only for open/free systems (free clusters
+  like LJ13 / DW4); for a bounded non-periodic box, build the `Geometry` with
+  `periodic=[False, ...]`. Also: when a torus flow uses a (non-periodic)
+  Gaussian `LatticeBase`, score samples with the forward `log_q` from
+  `sample_and_log_prob`, not `log_prob(x)` — the inverse path is unreliable for
+  samples that wrap across the box seam.
 
 ## Sibling repos
 
