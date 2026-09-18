@@ -184,10 +184,10 @@ No critical or high-priority code issues open. Audit follow-ups are tracked in
 `PLAN.md` under "Audit remediation".
 
 Previously fixed:
-- **C1** (fixed `765a278`): LOFT inverse overflow, clamped exponent to 80.0
-- **C2** (fixed `765a278`): LoftTransform now supports `g_value` gating
-- **C3** (fixed `765a278`): `TestLogdetVsAutodiff` in `test_transforms.py` + spline autodiff tests
-- **H2** (fixed `d8446f2`): `max_log_scale` aligned to 5.0 across dataclass, `.create()`, and builders
+- **C1** (fixed `6351357`): LOFT inverse overflow, clamped exponent to 80.0
+- **C2** (fixed `6351357`): LoftTransform now supports `g_value` gating
+- **C3** (fixed `6351357`): `TestLogdetVsAutodiff` in `test_transforms.py` + spline autodiff tests
+- **H2** (fixed `c025b24`): `max_log_scale` aligned to 5.0 across dataclass, `.create()`, and builders
 
 ## Gotchas
 
@@ -221,8 +221,8 @@ Previously fixed:
 
 These live next to nflojax on disk and are load-bearing for testing particle flows end-to-end. They are **not** dependencies — nflojax has no runtime coupling to either.
 
-- **`../jax-pdf/`** — benchmark target log-densities. Provides 8 distributions with a unified `__call__(x) -> log_p` API. Particle targets (`LennardJones`, `DW4`) accept structured `(..., n_particles, spatial_dim)` input and plug directly into flows built with `build_particle_flow` — no reshape. Generic targets (`Banana2D`, `NealFunnel`, `LGCP`, `MullerBrown`, `PhiFour`, `DoubleWell`) take flat `(..., dim)` input. Top-level import: `from jax_pdf import LennardJones, DW4, ...`. Use for reverse-KL smoke tests, regression targets, and worked examples.
-- **`../bgmat-clean/`** — downstream application repo driving Stage G validation. Clean-room Boltzmann-generator rebuild on top of nflojax. MS2 (DW4) closed as partial success; MS3 (mW water, periodic) is next. If nflojax-side friction surfaces in bgmat-clean, file it as a PLAN.md §1–§5 follow-up before declaring the milestone closed (PLAN.md §7 acceptance).
+- **`../jax-pdf/`** — benchmark target log-densities. Provides 11 distributions with a unified `__call__(x) -> log_p` API (on its `feature/periodic-lj-target` branch; `main` has 8). Particle targets (free-cluster `LennardJones`, `DW4`; periodic `PeriodicLennardJones`, `MonatomicWater`, `HarmonicCrystal`) accept structured `(..., n_particles, spatial_dim)` input and plug directly into flows built with `build_particle_flow` — no reshape. Generic targets (`Banana2D`, `NealFunnel`, `LGCP`, `MullerBrown`, `PhiFour`, `DoubleWell`) take flat `(..., dim)` input. Top-level import: `from jax_pdf import LennardJones, DW4, ...`. Use for reverse-KL smoke tests, regression targets, and worked examples.
+- **`../bgmat-clean/`** — downstream application repo driving Stage G validation. Clean-room Boltzmann-generator rebuild on top of nflojax. MS2 (DW4) closed as partial success; periodic LJ solid closed 2026-09-18; MS3 (mW water, periodic) is active, with north stars in bgmat-clean's `AGENTS.md` and PLAN.md §7. If nflojax-side friction surfaces in bgmat-clean, file it as a PLAN.md §1–§5 follow-up before declaring the milestone closed (PLAN.md §7 acceptance).
 
 ## Documentation Map
 
