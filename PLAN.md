@@ -47,7 +47,7 @@
 
 See the §11 entry of 2026-09-18.
 
-Known pending: no branch strategy chosen yet for Stages A–F (see §10.1).
+Branch strategy resolved (§10): `feature/particle-events` was fast-forwarded into `main` on 2026-09-18. New work branches from `main`.
 
 ### Audit remediation
 
@@ -455,7 +455,7 @@ Things explicitly deferred. Each entry has a one-line reason.
 
 Items that need a decision before the relevant stage can close.
 
-- [ ] Branch strategy for Stages A–F. One branch `feature/particle-flow-framework`, or stage-per-branch? (Default: one long-lived branch, stage-per-commit.)
+- [x] Branch strategy for Stages A–F. One branch `feature/particle-flow-framework`, or stage-per-branch? (Default: one long-lived branch, stage-per-commit.) **Resolved 2026-09-18: the default.** One long-lived branch (`feature/particle-events`), stage-per-commit, fast-forwarded into `main` after the Stage-G periodic closure with the full float32 and float64 suites green. Later work uses short branches off `main`.
 - [x] `ShiftCenterOfMass` log-det convention: document as "zero on the (N−1)d subspace; caller is responsible for the embedding-space correction" vs. "constant $-d \log(N)/2$ correction baked in"? Pick when writing A2. **Resolved 2026-04-21: Convention (1) — zero log-det on the subspace; caller applies `CoMProjection.ambient_correction(N, d) = (d/2)·log(N)` when an ambient density is needed. Rationale + full derivation in §11 decision log and `INTERNALS.md` "CoM Projection and the Volume Correction".**
 - [x] `LatticeBase.hex_ice` unit-cell parameters: follow DM's convention (8 atoms per cell) or bgmat's (re-derive)? Likely DM. **Resolved 2026-04-22: DM convention. 8 atoms per orthorhombic cell with `cell_aspect = (1, sqrt(3), sqrt(8/3))` and the puckering parameter `6 * 0.0625` baked in (matches `flows_for_atomic_solids/models/particle_models.py:HexagonalIceLattice`). Atom positions reproduced inline in `nflojax/utils/lattice.py` so the test suite is hermetic.**
 - [x] `Transformer` attention norm placement: pre-norm (more stable for deeper stacks) vs. post-norm (closer to DM's original). **Resolved 2026-04-22: pre-norm.** `h = h + attn(LN(h)); h = h + ffn(LN(h))` per block + a final `LN` before `dense_out`. Rationale + background in `INTERNALS.md` "Transformer conditioner: pre-norm choice".
@@ -531,3 +531,4 @@ Items that need a decision before the relevant stage can close.
   - **Pattern B.** The decision now rests on the MS3 N=8 mW head-to-head (§8b). At N=8 a non-augmented split coupling transforms half the particles per layer, and its conditioner sees only the 4 frozen ones (GNN `num_neighbours` ≤ 3). bgmat's augmented coupling transforms every physical particle each layer, conditioned on the auxiliary half of a `(2N, d)` event. The head-to-head measures that gap.
   - **Known risk outside nflojax.** jax-pdf `MonatomicWater` builds the three-body term as a dense `(N, N, N)` tensor, about 5.2 GB per tensor at N=216 with batch 128. Training at N=216 needs a neighbour-list version on the jax-pdf side.
   - **Housekeeping.** The remote history of nflojax and jax-pdf was rewritten, changing author metadata only (trees and messages identical), so every commit hash changed. The six hashes cited in `PLAN.md` / `AGENTS.md` now point at the rewritten commits. Older hashes in notes and run manifests map via `../bgmat-clean/runs/commit-map-noreply.tsv` (local file).
+  - **Merged.** `feature/particle-events` was fast-forwarded into `main`, together with jax-pdf `feature/periodic-lj-target` and bgmat-clean `feature/lj-solid-flow`. Gate: nflojax 651 passed / 10 skipped in float32 and 661 passed in float64; bgmat-clean 201 passed / 2 skipped in float64; jax-pdf 176 passed.
