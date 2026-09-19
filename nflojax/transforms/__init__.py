@@ -13,7 +13,7 @@ from .common import (
     stable_logit,
     identity_spline_bias,
 )
-from .linear import LinearTransform
+from .linear import LinearTransform, OrthogonalTransform
 from .couplings import AffineCoupling, SplineCoupling, SplitCoupling
 from .geometry import Permutation, CircularShift, Rescale, CoMProjection
 from .product import CircularCoordinateShift, ProductSplineCoupling
@@ -25,6 +25,7 @@ __all__ = [
     "stable_logit",
     "identity_spline_bias",
     "LinearTransform",
+    "OrthogonalTransform",
     "AffineCoupling",
     "SplineCoupling",
     "SplitCoupling",

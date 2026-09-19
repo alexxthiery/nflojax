@@ -10,6 +10,7 @@ from nflojax.transforms import (
     AffineCoupling,
     SplineCoupling,
     LinearTransform,
+    OrthogonalTransform,
     LoftTransform,
     CompositeTransform,
     validate_identity_gate,
@@ -437,6 +438,84 @@ class TestLinearTransformGate:
             assert jnp.allclose(log_det_batch[i], log_det_i[0], atol=1e-6), (
                 f"Sample {i} with g={g_values[i]}: batched log_det differs from individual"
             )
+
+
+# ============================================================================
+# OrthogonalTransform gate tests
+# ============================================================================
+class TestOrthogonalTransformGate:
+    """Tests for OrthogonalTransform with identity gate: W(g) = expm(g A)."""
+
+    @pytest.fixture
+    def transform_and_params(self):
+        dim = 4
+        transform = OrthogonalTransform(dim=dim, scale=2.0)
+        params = {"u": jax.random.normal(jax.random.PRNGKey(3), (dim, dim))}
+        return transform, params, dim
+
+    def test_gate_zero_gives_identity(self, transform_and_params):
+        """g = 0 per sample: y = x exactly."""
+        transform, params, dim = transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+
+        y, log_det = transform.forward(params, x, g_value=jnp.zeros(10))
+
+        assert jnp.allclose(y, x, atol=1e-6)
+        assert jnp.array_equal(log_det, jnp.zeros(10))
+
+    def test_gate_one_gives_normal_transform(self, transform_and_params):
+        """g = 1 per sample matches the ungated transform."""
+        transform, params, dim = transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+
+        y_ungated, _ = transform.forward(params, x)
+        y_gated, _ = transform.forward(params, x, g_value=jnp.ones(10))
+
+        assert jnp.allclose(y_gated, y_ungated, atol=1e-5)
+
+    def test_scalar_gate_scales_the_generator(self, transform_and_params):
+        """A scalar g gives W(g) = expm(g A), the ungated matrix of the generator g u."""
+        transform, params, dim = transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        g = 0.35
+
+        y, _ = transform.forward(params, x, g_value=jnp.asarray(g))
+        w_expected = transform.matrix({"u": g * params["u"]})
+
+        assert jnp.allclose(y, x @ w_expected.T, atol=1e-5)
+
+    def test_gate_invertibility(self, transform_and_params):
+        """inverse(forward(x)) = x with a per-sample gate."""
+        transform, params, dim = transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (10, dim))
+        g_value = jnp.linspace(0.0, 1.0, 10)
+
+        y, _ = transform.forward(params, x, g_value=g_value)
+        x_rec, _ = transform.inverse(params, y, g_value=g_value)
+
+        assert jnp.allclose(x_rec, x, atol=1e-5)
+
+    def test_varying_gate_values_per_sample(self, transform_and_params):
+        """Each sample uses its own gate value: batched equals one call per sample."""
+        transform, params, dim = transform_and_params
+        x = jax.random.normal(jax.random.PRNGKey(0), (5, dim))
+        g_values = jnp.array([0.0, 0.25, 0.5, 0.75, 1.0])
+
+        y_batch, _ = transform.forward(params, x, g_value=g_values)
+
+        for i in range(5):
+            y_i, _ = transform.forward(params, x[i : i + 1], g_value=g_values[i : i + 1])
+            assert jnp.allclose(y_batch[i], y_i[0], atol=1e-6), f"sample {i}"
+
+    def test_composite_passes_gate(self, transform_and_params):
+        """CompositeTransform forwards g_value to the block (g = 0 gives the identity)."""
+        transform, params, dim = transform_and_params
+        composite = CompositeTransform(blocks=[transform])
+        x = jax.random.normal(jax.random.PRNGKey(0), (6, dim))
+
+        y, _ = composite.forward([params], x, g_value=jnp.zeros(6))
+
+        assert jnp.allclose(y, x, atol=1e-6)
 
 
 # ============================================================================

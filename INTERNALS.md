@@ -250,6 +250,26 @@ log|det W| = sum_{i=1}^{d} log_diag_i
 
 Initialized to identity (`L = I`, `T = I`) via zero initialization.
 
+### Orthogonal Transform
+
+Optional learnable rotation, parameterized by the matrix exponential of a skew-symmetric generator:
+
+```
+U = triu(u, k=1)
+A = scale * (U - U^T)
+W = expm(A)
+```
+
+`A^T = -A` gives `W^T W = expm(-A) expm(A) = I` and `det W = exp(tr A) = 1`, so `log|det W| = 0` and `W^{-1} = W^T`. The `d (d - 1) / 2` entries of `U` cover the whole rotation group `SO(d)`.
+
+**Why not the LU map for rotations.** The LU factorization without pivoting of a generic rotation is badly conditioned: a random `32 x 32` rotation needs pivots down to about `0.03` and factor entries up to about `300`. Starting from `W = I` the path is long, an Adam step (about the learning rate per raw entry) moves `W` by O(1) near such factors, and rounding in `L T x` is amplified (on GPU, TF32 matmuls cut the sampling ESS of an exact `32 x 32` rotation from 1.00 to 0.62). The exponential map has none of this: a step of size `lr` in `u` moves `W` by O(`scale * lr`), and `W` stays orthogonal to rounding.
+
+**Why a scale.** Under Adam the step in `u` is about the learning rate whatever the gradient's size, so `scale` multiplies the rotation's learning rate. It matters because learning a rotation from `W = I` can start on a plateau: when the data are independent non-Gaussian coordinates seen through a rotation, each coordinate at `W = I` mixes many of them and is nearly Gaussian (the central limit theorem, as in independent component analysis), so the gradient toward the rotation is weak. The builders default to `scale = 10`.
+
+**Reflections.** `det W = +1` excludes reflections. After elementwise monotone layers this costs nothing: for a target `x = Q y` with independent coordinates `y`, any `W = Q S` with `S = diag(+-1)` works (the monotone layers produce `S y`), and half of the sign patterns have `det(Q S) = +1`.
+
+**Complexity**: one `d x d` matrix exponential per call (Pade approximation with scaling and squaring), then `O(d^2)` per sample.
+
 ## Conditional Normalizing Flows
 
 Conditional flows model `p(x | c)` where `c` is a conditioning variable.
@@ -302,6 +322,7 @@ For affine coupling, this means `s -> g * s` and `t -> g * t`.
 For spline coupling, the raw spline parameters are scaled by `g`, pulling the spline toward identity.
 
 `LinearTransform` also supports gating via component-wise LU interpolation (see [REFERENCE.md](REFERENCE.md#lineartransform) for the exact formula).
+`OrthogonalTransform` gates its generator: `W(g) = expm(g A)`, a rotation for every `g`.
 In conditional mode, the conditioner MLP outputs both a diagonal scaling delta and a shift; both vanish at `g=0`.
 
 ### Raw Context vs Extracted Features

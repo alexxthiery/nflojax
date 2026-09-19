@@ -490,3 +490,107 @@ class LinearTransform:
         transform = cls(dim=dim, conditioner=conditioner, context_dim=context_dim)
         params = transform.init_params(key, context_dim=context_dim)
         return transform, params
+
+
+# ===================================================================
+# Orthogonal Transform: matrix exponential of a skew-symmetric generator
+# ===================================================================
+@dataclass
+class OrthogonalTransform:
+    """Global learnable rotation ``W = expm(A)``, ``A = scale * (U - U.T)``.
+
+    ``U = triu(params["u"], k=1)``, so ``W`` is exactly orthogonal with
+    ``det W = +1`` and every rotation is reachable. Forward ``y = x W.T``,
+    inverse ``x = y W``, log determinant 0. ``u = 0`` at initialization, so
+    ``W = I``. With ``g_value``, ``W(g) = expm(g A)``: a rotation for every
+    ``g``, identity at ``g=0``; a per-sample gate computes one matrix
+    exponential per sample. Unconditional: ``context`` is ignored.
+
+    Use it to rotate coordinate-wise structure (couplings, elementwise
+    splines) onto dependent coordinates. ``LinearTransform`` cannot learn a
+    generic rotation: without pivoting its LU factors are badly conditioned
+    (a random 32 x 32 rotation needs entries up to ~300), so Adam moves ``W``
+    by O(1) per step and float32 rounding in ``L T x`` is amplified.
+
+    ``scale`` multiplies the rotation's learning rate under Adam (whose steps
+    in ``u`` are about the learning rate). Learning a rotation from ``W = I``
+    can start on a plateau: through a rotation, each coordinate mixes many
+    independent ones and looks nearly Gaussian, so the gradient is weak.
+    Measured with a spline RealNVP at dim 32 and Adam at 1e-3: scale 1
+    stalled with the rotation half found; scale 10 found it in 2500 steps.
+    Reflections are not needed after elementwise monotone layers, which can
+    produce mirrored coordinates.
+    """
+    dim: int
+    scale: float = 1.0
+
+    def _generator(self, params: Any) -> Array:
+        """A = scale (U - U^T), with validation of params["u"]."""
+        try:
+            u_raw = jnp.asarray(params["u"])
+        except Exception as e:
+            raise KeyError("OrthogonalTransform: params must contain 'u'") from e
+        if u_raw.shape != (self.dim, self.dim):
+            raise ValueError(
+                f"OrthogonalTransform: u must have shape ({self.dim}, {self.dim}), "
+                f"got {u_raw.shape}"
+            )
+        u = jnp.triu(u_raw, k=1)
+        return self.scale * (u - u.T)
+
+    def matrix(self, params: Any) -> Array:
+        """The ungated matrix W = expm(A), shape (dim, dim)."""
+        return jsp.expm(self._generator(params))
+
+    def _apply(self, params: Any, v: Array, g_value: Array | None, transpose: bool) -> Array:
+        """v W^T (transpose=True, forward) or v W (inverse), with W = expm(g A)."""
+        if v.shape[-1] != self.dim:
+            raise ValueError(
+                f"OrthogonalTransform: expected input last dim {self.dim}, got {v.shape[-1]}"
+            )
+        a = self._generator(params)
+        if g_value is not None and g_value.ndim > 0:
+            # Per-sample gate: one rotation per sample.
+            v_flat = v.reshape((-1, self.dim))
+            w = jax.vmap(lambda g: jsp.expm(g * a))(g_value.reshape((-1,)))   # (B, dim, dim)
+            pattern = "bij,bj->bi" if transpose else "bji,bj->bi"
+            return jnp.einsum(pattern, w, v_flat).reshape(v.shape)
+        w = jsp.expm(a if g_value is None else g_value * a)
+        return v @ w.T if transpose else v @ w
+
+    def forward(
+        self,
+        params: Any,
+        x: Array,
+        context: Array | None = None,
+        g_value: Array | None = None,
+    ) -> Tuple[Array, Array]:
+        """y = x W^T with log_det = 0 of shape x.shape[:-1]; context is ignored."""
+        del context
+        return self._apply(params, x, g_value, transpose=True), jnp.zeros(x.shape[:-1], dtype=x.dtype)
+
+    def inverse(
+        self,
+        params: Any,
+        y: Array,
+        context: Array | None = None,
+        g_value: Array | None = None,
+    ) -> Tuple[Array, Array]:
+        """x = y W (W^{-1} = W^T) with log_det = 0 of shape y.shape[:-1]; context is ignored."""
+        del context
+        return self._apply(params, y, g_value, transpose=False), jnp.zeros(y.shape[:-1], dtype=y.dtype)
+
+    def init_params(self, key: PRNGKey, context_dim: int = 0) -> dict:
+        """Identity params: u = 0, so W = I. key and context_dim are unused."""
+        del key, context_dim
+        return {"u": jnp.zeros((self.dim, self.dim), dtype=jnp.float32)}
+
+    @classmethod
+    def create(cls, key: PRNGKey, dim: int, *, scale: float = 1.0) -> Tuple["OrthogonalTransform", dict]:
+        """Create an OrthogonalTransform at the identity; raises ValueError if dim or scale <= 0."""
+        if dim <= 0:
+            raise ValueError(f"OrthogonalTransform.create: dim must be positive, got {dim}.")
+        if scale <= 0:
+            raise ValueError(f"OrthogonalTransform.create: scale must be positive, got {scale}.")
+        transform = cls(dim=dim, scale=scale)
+        return transform, transform.init_params(key)

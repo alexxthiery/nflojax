@@ -12,6 +12,7 @@ from ..transforms import (
     CompositeTransform,
     LinearTransform,
     LoftTransform,
+    OrthogonalTransform,
     Permutation,
     SplineCoupling,
 )
@@ -39,6 +40,8 @@ def _build_coupling_flow(
     res_scale: float,
     use_permutation: bool,
     use_linear: bool,
+    use_orthogonal: bool,
+    orthogonal_scale: float,
     use_loft: bool,
     loft_tau: float,
     trainable_base: bool,
@@ -112,6 +115,12 @@ def _build_coupling_flow(
             blocks.append(perm_block)
             block_params.append(perm_params)
 
+    if use_orthogonal:
+        # After the couplings (data side), so coordinate-wise structure can be rotated.
+        orth_block, orth_params = OrthogonalTransform.create(key, dim=dim, scale=orthogonal_scale)
+        blocks.append(orth_block)
+        block_params.append(orth_params)
+
     if use_loft:
         key, loft_key = jax.random.split(key)
         loft_block, loft_params = LoftTransform.create(loft_key, dim=dim, tau=loft_tau)
@@ -151,6 +160,8 @@ def build_realnvp(
     res_scale: float = 0.1,
     use_permutation: bool = False,
     use_linear: bool = False,
+    use_orthogonal: bool = False,
+    orthogonal_scale: float = 10.0,
     use_loft: bool = True,
     trainable_base: bool = False,
     base_dist: Any | None = None,
@@ -176,6 +187,11 @@ def build_realnvp(
         res_scale: Conditioner residual scale.
         use_permutation: Insert fixed reverse permutations between couplings.
         use_linear: Prepend a learnable linear transform.
+        use_orthogonal: Add a learnable rotation (``OrthogonalTransform``)
+            after the couplings, before LOFT. Prefer it to ``use_linear`` when
+            the target's structure lies along rotated axes.
+        orthogonal_scale: Its generator scale; 10 by default (scale 1 can
+            stall on a near-Gaussian plateau, see ``OrthogonalTransform``).
         use_loft: Append a LOFT tail stabilizer.
         trainable_base: Use ``DiagNormal((dim,))`` when no custom base is given.
         base_dist: Optional custom base. If it exposes ``event_shape``, it must
@@ -215,6 +231,7 @@ def build_realnvp(
         context_feature_dim=context_feature_dim,
         activation=activation, res_scale=res_scale,
         use_permutation=use_permutation, use_linear=use_linear,
+        use_orthogonal=use_orthogonal, orthogonal_scale=orthogonal_scale,
         use_loft=use_loft, loft_tau=loft_tau,
         trainable_base=trainable_base, base_dist=base_dist,
         base_params=base_params, return_transform_only=return_transform_only,
@@ -245,6 +262,8 @@ def build_spline_realnvp(
     res_scale: float = 0.1,
     use_permutation: bool = False,
     use_linear: bool = False,
+    use_orthogonal: bool = False,
+    orthogonal_scale: float = 10.0,
     use_loft: bool = True,
     trainable_base: bool = False,
     base_dist: Any | None = None,
@@ -275,6 +294,11 @@ def build_spline_realnvp(
         res_scale: Conditioner residual scale.
         use_permutation: Insert fixed reverse permutations between couplings.
         use_linear: Prepend a learnable linear transform.
+        use_orthogonal: Add a learnable rotation (``OrthogonalTransform``)
+            after the couplings, before LOFT. Prefer it to ``use_linear`` when
+            the target's structure lies along rotated axes.
+        orthogonal_scale: Its generator scale; 10 by default (scale 1 can
+            stall on a near-Gaussian plateau, see ``OrthogonalTransform``).
         use_loft: Append a LOFT tail stabilizer.
         trainable_base: Use ``DiagNormal((dim,))`` when no custom base is given.
         base_dist: Optional custom base. If it exposes ``event_shape``, it must
@@ -326,6 +350,7 @@ def build_spline_realnvp(
         context_feature_dim=context_feature_dim,
         activation=activation, res_scale=res_scale,
         use_permutation=use_permutation, use_linear=use_linear,
+        use_orthogonal=use_orthogonal, orthogonal_scale=orthogonal_scale,
         use_loft=use_loft, loft_tau=loft_tau,
         trainable_base=trainable_base, base_dist=base_dist,
         base_params=base_params, return_transform_only=return_transform_only,

@@ -306,6 +306,8 @@ Identity-at-init holds for the learnable part: `SplitCoupling._patch_dense_out` 
 | `activation` | callable | `jax.nn.tanh` | Conditioner MLP activation |
 | `use_permutation` | bool | False | Reverse permutations between couplings |
 | `use_linear` | bool | False | Prepend LU-parameterized linear transform |
+| `use_orthogonal` | bool | False | Add an `OrthogonalTransform` after the couplings (before LOFT) |
+| `orthogonal_scale` | float | 10.0 | Its generator scale (see [OrthogonalTransform](#orthogonaltransform)) |
 | `use_loft` | bool | True | Append LoftTransform for tail stabilization |
 | `loft_tau` | float | 1000.0 | LOFT threshold parameter |
 | `trainable_base` | bool | False | Use DiagNormal with learnable loc/scale |
@@ -410,6 +412,7 @@ Shapes: `x`, `y` are `(..., dim)`. `log_det` is `(...,)` (one scalar per sample)
 | `ProductSplineCoupling` | Flat mixed-domain spline coupling |
 | `SplitCoupling` | Spline coupling for rank-N (particle-system) events |
 | `LinearTransform` | LU-parameterized invertible linear map |
+| `OrthogonalTransform` | Rotation `W = expm(A)`, `A` skew-symmetric |
 | `Permutation` | Fixed shuffle along any negative event axis |
 | `Rescale` | Fixed per-axis affine from `geometry.box` to a canonical target range |
 | `CoMProjection` | Translation-gauge bijection `(N, d) ↔ (N−1, d)`; zero log-det on subspace |
@@ -684,6 +687,41 @@ transform, params = LinearTransform.create(key, dim, **kwargs)
 **Gating:** The LU factors are gated component-wise: `L_off -> g * L_off`, `U_off -> g * U_off`, `s -> 1 - g + g * s`, `shift -> g * shift`. At `g=0` this gives `L=I`, `T=I`, so the transform is exactly identity. At `g=1` it acts as the full learned transform. The interpolation path is not the same as `g * W + (1-g) * I` due to cross-terms in the LU product.
 
 **Init:** `W = I`, shift = 0 (MLP output layer zero-initialized).
+
+### OrthogonalTransform
+
+**What:** Learnable rotation. `W = expm(A)` with `A = scale * (U - U^T)` and `U = triu(u, k=1)`, so `W` is exactly orthogonal with `det W = +1`, and every rotation is reachable. Use it to map coordinate-wise structure (couplings, elementwise splines) onto dependent coordinates, for example after the couplings when the target's structure lies along rotated axes.
+
+**Forward:** `y = x @ W^T`, log_det = 0. **Inverse:** `x = y @ W`, log_det = 0.
+
+**Why not `LinearTransform` for a rotation:** without pivoting, the LU factors of a generic rotation are badly conditioned (a random `32 x 32` rotation needs entries up to about 300). Adam then moves `W` by O(1) per step, and float32 (TF32 on GPU) rounding in `L T x` is amplified.
+
+**Create:**
+
+```python
+transform, params = OrthogonalTransform.create(key, dim, scale=1.0)
+```
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `dim` | int | required | Input/output dimensionality |
+| `scale` | float | `1.0` | Multiplies the generator; under Adam, the rotation's learning rate |
+
+The builders default to `orthogonal_scale=10.0`. Learning a rotation from `W = I` can start on a plateau: through a rotation, each coordinate mixes many independent ones and looks nearly Gaussian, so the gradient is weak. With a spline RealNVP at `dim = 32` and Adam at `1e-3`, scale 1 stalled with the rotation half found; scale 10 found it within 2500 steps.
+
+**Params dict:**
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `"u"` | `(dim, dim)` | Generator; only the strict upper triangle is used |
+
+**Gating:** `W(g) = expm(g * A)`: orthogonal for every `g`, identity at `g=0`, the learned rotation at `g=1`. A per-sample gate computes one matrix exponential per sample.
+
+**Context:** unconditional; `context` is accepted and ignored.
+
+**Init:** `u = 0`, so `W = I`.
+
+**Matrix:** `transform.matrix(params)` returns the ungated `W`, shape `(dim, dim)`.
 
 ### Permutation
 
@@ -1584,6 +1622,7 @@ params = {
 
 Optional blocks when enabled:
 - `use_linear=True`: first entry is `{"lower": (d,d), "upper": (d,d), "raw_diag": (d,)}`
+- `use_orthogonal=True`: `{"u": (d,d)}` after the last coupling, just before the LOFT entry (the last entry if `use_loft=False`)
 - `use_permutation=True`: empty dict `{}` entries between couplings
 
 ## Forward/Inverse Convention
@@ -1638,6 +1677,8 @@ For the math behind conditioning, see [INTERNALS.md](INTERNALS.md#conditional-no
 **Raw context vs extracted features.** When using a feature extractor, the identity gate still receives the raw context, not extracted features. Coupling layers see extracted features. This is intentional: the gate encodes known structure (e.g., boundary conditions) and operates on interpretable inputs.
 
 **Residual scaling defaults to 0.1.** Both MLP and ResNet conditioners use `res_scale=0.1`, scaling residual branch outputs. Most implementations default to 1.0. This improves stability but can make convergence appear slower. Adjustable via the `res_scale` parameter.
+
+**Axis-aligned couplings cannot mix coordinates.** A coupling flow fits coordinate-wise structure; a target with the same structure along rotated axes defeats it. Add `use_orthogonal=True` rather than `use_linear=True`: the LU map cannot learn a generic rotation (see [OrthogonalTransform](#orthogonaltransform)).
 
 **LOFT tau=1000 barely activates.** The default `loft_tau=1000.0` only compresses values beyond magnitude 1000, acting as a gentle safety net. For active tail compression, lower tau significantly.
 

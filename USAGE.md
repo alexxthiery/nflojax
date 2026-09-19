@@ -60,6 +60,22 @@ flow, params = build_spline_realnvp(
 Spline-specific options: [REFERENCE.md#builder-options](REFERENCE.md#builder-options).
 How splines work: [INTERNALS.md#spline-coupling](INTERNALS.md#spline-coupling)
 
+## Rotated Structure
+
+Coupling layers transform axis-aligned halves of the coordinates, so they fit coordinate-wise structure (for example independent multimodal coordinates) but not the same structure along rotated axes.
+`use_orthogonal=True` adds a learnable rotation after the couplings:
+
+```python
+flow, params = build_spline_realnvp(
+    key, dim=32, num_layers=4, hidden_dim=64, n_hidden_layers=2,
+    use_orthogonal=True,  # rotation W = expm(A) after the couplings; W = I at init
+)
+W = flow.transform.blocks[-2].matrix(params["transform"][-2])   # (32, 32), orthogonal
+```
+
+Prefer it to `use_linear=True` here: the LU map cannot learn a generic rotation.
+Details: [REFERENCE.md#orthogonaltransform](REFERENCE.md#orthogonaltransform), [INTERNALS.md#orthogonal-transform](INTERNALS.md#orthogonal-transform)
+
 ## Conditional Flows
 
 Model $p(x \mid \text{context})$ by setting `context_dim > 0`. Context is concatenated to conditioner inputs.

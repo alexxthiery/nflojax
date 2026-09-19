@@ -25,6 +25,7 @@ from nflojax.transforms import (
     Permutation,
     LinearTransform,
     LoftTransform,
+    OrthogonalTransform,
 )
 from nflojax.distributions import DiagNormal, StandardNormal, UniformBox
 from nflojax.geometry import Geometry
@@ -347,6 +348,61 @@ class TestBuildSplineRealNVP:
                 key, dim=dim, num_layers=2, hidden_dim=8, n_hidden_layers=1,
                 num_bins=4, min_bin_width=0.3  # 0.3 * 4 = 1.2 >= 1
             )
+
+
+# ============================================================================
+# use_orthogonal Tests
+# ============================================================================
+class TestUseOrthogonal:
+    """use_orthogonal adds an OrthogonalTransform after the couplings, before LOFT."""
+
+    @pytest.mark.parametrize("builder", [build_realnvp, build_spline_realnvp])
+    def test_block_position_and_init(self, key, dim, builder):
+        """The block sits just before LOFT, starts at u = 0, and takes orthogonal_scale."""
+        flow, params = builder(key, dim=dim, num_layers=2, hidden_dim=8, n_hidden_layers=1,
+                               use_orthogonal=True, orthogonal_scale=4.0)
+        blocks = flow.transform.blocks
+
+        assert isinstance(blocks[-2], OrthogonalTransform)
+        assert isinstance(blocks[-1], LoftTransform)
+        assert blocks[-2].scale == 4.0
+        assert jnp.array_equal(params["transform"][-2]["u"], jnp.zeros((dim, dim)))
+
+    def test_default_scale(self, key, dim):
+        """orthogonal_scale defaults to 10.0 in the builders."""
+        flow, _ = build_spline_realnvp(key, dim=dim, num_layers=2, hidden_dim=8, n_hidden_layers=1,
+                                       use_orthogonal=True)
+
+        assert flow.transform.blocks[-2].scale == 10.0
+
+    def test_density_is_the_rotated_plain_flow(self, key, dim):
+        """Without LOFT, q(x) = q_plain(x W): the orthogonal block rotates the plain flow.
+
+        Both flows come from the same key, so their couplings are identical; the
+        block's inverse maps x to x W and has log |det| = 0.
+        """
+        kwargs = dict(dim=dim, num_layers=2, hidden_dim=8, n_hidden_layers=1, use_loft=False)
+        flow, params = build_spline_realnvp(key, use_orthogonal=True, orthogonal_scale=1.0, **kwargs)
+        plain, plain_params = build_spline_realnvp(key, **kwargs)
+        u = jax.random.normal(jax.random.PRNGKey(5), (dim, dim))
+        params["transform"][-1] = {"u": u}
+        w = flow.transform.blocks[-1].matrix({"u": u})
+        x = jax.random.normal(jax.random.PRNGKey(6), (16, dim))
+
+        assert jnp.allclose(flow.log_prob(params, x), plain.log_prob(plain_params, x @ w), atol=1e-5)
+
+    def test_invertibility_with_rotation(self, key, dim):
+        """A flow with a non-trivial rotation is invertible, with consistent log-dets."""
+        flow, params = build_realnvp(key, dim=dim, num_layers=2, hidden_dim=8, n_hidden_layers=1,
+                                     use_orthogonal=True)
+        params["transform"][-2] = {"u": 0.1 * jax.random.normal(jax.random.PRNGKey(5), (dim, dim))}
+        x = jax.random.normal(key, (20, dim))
+
+        z, ld_inv = flow.inverse(params, x)
+        x_rec, ld_fwd = flow.forward(params, z)
+
+        assert jnp.abs(x - x_rec).max() < 1e-4
+        assert jnp.abs(ld_fwd + ld_inv).max() < 1e-4
 
 
 # ============================================================================

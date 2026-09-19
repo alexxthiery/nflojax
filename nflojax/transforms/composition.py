@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from ..nets import Array, PRNGKey
 from .couplings import AffineCoupling, SplineCoupling
-from .linear import LinearTransform
+from .linear import LinearTransform, OrthogonalTransform
 from .product import CircularCoordinateShift, ProductSplineCoupling
 from .stabilizers import LoftTransform
 
@@ -25,6 +25,7 @@ def _block_supports_gvalue(block: Any) -> bool:
             ProductSplineCoupling,
             CircularCoordinateShift,
             LinearTransform,
+            OrthogonalTransform,
             LoftTransform,
         ),
     )

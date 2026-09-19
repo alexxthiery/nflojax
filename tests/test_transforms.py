@@ -11,6 +11,7 @@ pytestmark = pytest.mark.slow
 
 from nflojax.transforms import (
     LinearTransform,
+    OrthogonalTransform,
     Permutation,
     AffineCoupling,
     SplineCoupling,
@@ -295,6 +296,114 @@ class TestLinearTransform:
 
         with pytest.raises(KeyError):
             transform.forward({}, x)
+
+
+# ============================================================================
+# OrthogonalTransform Tests
+# ============================================================================
+class TestOrthogonalTransform:
+    """Tests for OrthogonalTransform (W = expm(scale (U - U^T)))."""
+
+    @pytest.fixture
+    def random_params(self, key, dim):
+        """Random generator (all entries; only the strict upper triangle is used)."""
+        return {"u": jax.random.normal(key, (dim, dim))}
+
+    def test_identity_at_init(self, key, dim):
+        """create() gives W = I exactly: y = x and log_det = 0."""
+        transform, params = OrthogonalTransform.create(key, dim=dim, scale=10.0)
+        x = jnp.arange(3 * dim, dtype=jnp.float32).reshape(3, dim)
+
+        y, ld = transform.forward(params, x)
+
+        assert jnp.array_equal(y, x)
+        assert jnp.array_equal(ld, jnp.zeros(3))
+
+    def test_plane_rotation_closed_form(self, key):
+        """A single entry u[i, j] = t (i < j) rotates the (i, j) plane by a = scale t.
+
+        expm([[0, a], [-a, 0]]) = [[cos a, sin a], [-sin a, cos a]], so
+        W[i, i] = W[j, j] = cos a, W[i, j] = sin a, W[j, i] = -sin a, and W is the
+        identity on every other coordinate.
+        """
+        dim, i, j, t, scale = 5, 1, 3, 0.4, 2.5
+        a = scale * t
+        transform = OrthogonalTransform(dim=dim, scale=scale)
+        params = {"u": jnp.zeros((dim, dim)).at[i, j].set(t)}
+        expected = (jnp.eye(dim).at[i, i].set(jnp.cos(a)).at[j, j].set(jnp.cos(a))
+                    .at[i, j].set(jnp.sin(a)).at[j, i].set(-jnp.sin(a)))
+        x = jax.random.normal(key, (4, dim))
+
+        y, _ = transform.forward(params, x)
+
+        assert jnp.allclose(transform.matrix(params), expected, atol=1e-6)
+        assert jnp.allclose(y, x @ expected.T, atol=1e-6)
+
+    def test_only_strict_upper_triangle_used(self, dim, random_params):
+        """The diagonal and lower triangle of u do not change W."""
+        transform = OrthogonalTransform(dim=dim)
+        other = {"u": random_params["u"] + jnp.tril(jax.random.normal(jax.random.PRNGKey(7), (dim, dim)))}
+
+        assert jnp.array_equal(transform.matrix(random_params), transform.matrix(other))
+
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 10.0])
+    def test_orthogonal_with_unit_determinant(self, dim, random_params, scale):
+        """W W^T = I and det W = +1, for generators of every size."""
+        w = OrthogonalTransform(dim=dim, scale=scale).matrix(random_params)
+
+        assert jnp.allclose(w @ w.T, jnp.eye(dim), atol=1e-5)
+        assert abs(float(jnp.linalg.det(w)) - 1.0) < 1e-4
+
+    def test_shapes(self, key, dim, random_params):
+        """Forward and inverse keep any batch shape; log_det has the batch shape."""
+        transform = OrthogonalTransform(dim=dim)
+        x = jax.random.normal(key, (2, 3, dim))
+
+        y, ld_fwd = transform.forward(random_params, x)
+        x_back, ld_inv = transform.inverse(random_params, y)
+
+        assert y.shape == x_back.shape == (2, 3, dim)
+        assert ld_fwd.shape == ld_inv.shape == (2, 3)
+
+    def test_invertibility(self, key, dim, random_params):
+        """inverse(forward(x)) = x, with zero log-dets both ways."""
+        transform = OrthogonalTransform(dim=dim, scale=3.0)
+        x = jax.random.normal(key, (50, dim))
+
+        y, ld_fwd = transform.forward(random_params, x)
+        x_rec, ld_inv = transform.inverse(random_params, y)
+
+        assert float(jnp.abs(x - x_rec).max()) < 1e-5
+        assert jnp.array_equal(ld_fwd, jnp.zeros(50))
+        assert jnp.array_equal(ld_inv, jnp.zeros(50))
+
+    def test_logdet_vs_autodiff(self, key, dim, random_params):
+        """log_det = 0 matches log |det J| of the autodiff Jacobian."""
+        transform = OrthogonalTransform(dim=dim, scale=3.0)
+        x = jax.random.normal(key, (dim,))
+
+        result = check_logdet_vs_autodiff(lambda z: transform.forward(random_params, z), x)
+
+        assert result["error"] < 1e-4, result
+
+    def test_params_and_input_validation(self, key, dim):
+        """Missing u, a u of the wrong shape, and inputs of the wrong width raise."""
+        transform = OrthogonalTransform(dim=dim)
+        x = jax.random.normal(key, (3, dim))
+
+        with pytest.raises(KeyError):
+            transform.forward({}, x)
+        with pytest.raises(ValueError):
+            transform.forward({"u": jnp.zeros((dim + 1, dim + 1))}, x)
+        with pytest.raises(ValueError):
+            transform.forward({"u": jnp.zeros((dim, dim))}, jnp.zeros((3, dim + 1)))
+
+    def test_create_validation(self, key):
+        """create() rejects a non-positive dim or scale."""
+        with pytest.raises(ValueError):
+            OrthogonalTransform.create(key, dim=0)
+        with pytest.raises(ValueError):
+            OrthogonalTransform.create(key, dim=3, scale=0.0)
 
 
 # ============================================================================

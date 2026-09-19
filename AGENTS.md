@@ -107,7 +107,7 @@ builder just because another builder supports it.
 | Custom base | yes, flat `(dim,)` | yes, `domain.event_shape` | yes, `(N, d)` or `(N-1, d)` with CoM | caller-defined |
 | Context / identity gate | yes | yes | no | caller-defined |
 | Context feature extractor | yes | no | no | yes |
-| LOFT / linear / flat permutations | yes | no | no | caller-defined |
+| LOFT / linear / orthogonal / flat permutations | yes | no | no | caller-defined |
 | Circular coordinate shifts | no | yes | no | caller-defined |
 | Circular conditioner inputs | no | yes (`circular_n_freq`, product feature map) | yes (factory gets `geometry`; nets' `circular_n_freq`) | caller-defined |
 | Particle circular shifts / CoM | no | no | yes | caller-defined |

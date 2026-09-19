@@ -61,7 +61,7 @@ nflojax is the toolkit for building, sampling, and scoring a normalizing flow on
 
 ### 3.1 Core flow machinery
 
-- **Bijections** covering Cartesian, torus, product-domain, and particle-coordinate regimes. Today: `AffineCoupling`, `SplineCoupling`, `SplitCoupling` (rank-N), `ProductSplineCoupling`, `LinearTransform`, `Permutation` (axis-aware), `CircularShift`, `CircularCoordinateShift`, `Rescale`, `CoMProjection`, `LoftTransform`, `CompositeTransform`.
+- **Bijections** covering Cartesian, torus, product-domain, and particle-coordinate regimes. Today: `AffineCoupling`, `SplineCoupling`, `SplitCoupling` (rank-N), `ProductSplineCoupling`, `LinearTransform`, `OrthogonalTransform`, `Permutation` (axis-aware), `CircularShift`, `CircularCoordinateShift`, `Rescale`, `CoMProjection`, `LoftTransform`, `CompositeTransform`.
 - **Base distributions.** Today: `StandardNormal`, `DiagNormal`, `UniformBox`, `ProductBase`, `LatticeBase` (with factories for FCC, diamond, BCC, HCP, hexagonal ice).
 - **Composition** primitives: `CompositeTransform`, the assembly API (`assemble_flow` / `assemble_bijection`), builders for common topologies (`build_realnvp`, `build_spline_realnvp`, `build_product_spline_flow`, `build_particle_flow`).
 
