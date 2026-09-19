@@ -916,13 +916,16 @@ class TestGNN:
         params = gnn.set_output_layer(params, kernel, jnp.zeros_like(
             params["dense_out"]["bias"]))
 
-        # Well-separated positions: nearest-neighbour gap ~ 0.5, jitter 1e-4.
-        x = jnp.array([[0.0, 0.0, 0.0],
-                       [0.5, 0.0, 0.0],
-                       [0.0, 0.5, 0.0],
-                       [0.0, 0.0, 0.5],
-                       [0.5, 0.5, 0.0],
-                       [0.5, 0.0, 0.5]])[None, ...]
+        # Well-separated positions with no tie at the K-th neighbour: distinct
+        # axis scales leave every particle's 3rd and 4th neighbours >= 0.08
+        # apart, far above the 1e-4 jitter. (The unscaled cube corners tie for
+        # 4 of the 6 particles, so the neighbour set could flip.)
+        x = (jnp.array([[0.0, 0.0, 0.0],
+                        [0.5, 0.0, 0.0],
+                        [0.0, 0.5, 0.0],
+                        [0.0, 0.0, 0.5],
+                        [0.5, 0.5, 0.0],
+                        [0.5, 0.0, 0.5]]) * jnp.array([1.0, 0.8, 0.6]))[None, ...]
         eps = jax.random.uniform(key, x.shape) * 1e-4
         y1 = gnn.apply({"params": params}, x)
         y2 = gnn.apply({"params": params}, x + eps)

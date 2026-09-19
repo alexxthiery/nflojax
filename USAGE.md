@@ -412,7 +412,11 @@ signatures.
 `build_particle_flow` composes `Rescale`, alternating-swap `SplitCoupling`
 pairs, `CircularShift`, and an optional `_CoMEmbed` shim into the canonical
 DM / bgmat topology. Pick a base (liquid or solid), pick a conditioner
-(flat or per-token), and pass a keyword-only factory.
+(flat or per-token), and pass a keyword-only factory. The factory also
+receives `geometry`, the cube the conditioner sees: pass it to the net, so
+that on a periodic box its first layer reads circular features of the
+coordinates (`circular_n_freq`, 8 harmonics by default), continuous across
+the cube's seam, instead of raw coordinates that jump by the box side there.
 
 ### Liquid: `UniformBox` base + `DeepSets`
 
@@ -432,9 +436,9 @@ flow, params = build_particle_flow(
     geometry=geom,
     event_shape=(N, d),
     num_layers=4,
-    conditioner=(lambda *, required_out_dim, **_: DeepSets(
+    conditioner=(lambda *, required_out_dim, geometry, **_: DeepSets(
         phi_hidden=(64, 64), rho_hidden=(64,),
-        out_dim=required_out_dim,
+        out_dim=required_out_dim, geometry=geometry,
     )),
     base_dist=UniformBox(geometry=geom, event_shape=(N, d)),
     num_bins=8, tail_bound=5.0,
@@ -459,9 +463,9 @@ flow, params = build_particle_flow(
     geometry=geom,
     event_shape=(N, 3),
     num_layers=4,
-    conditioner=(lambda *, out_per_particle, **_: Transformer(
+    conditioner=(lambda *, out_per_particle, geometry, **_: Transformer(
         num_layers=2, num_heads=4, embed_dim=64,
-        out_per_particle=out_per_particle,
+        out_per_particle=out_per_particle, geometry=geometry,
     )),
     base_dist=lb,
     num_bins=8, tail_bound=5.0,
@@ -570,7 +574,9 @@ geom    = lb.geometry                              # box [0, 2]^3 ready for Resc
 
 ## Conditioner features (embeddings)
 
-Stateless feature transforms for the input side of a custom conditioner:
+The particle nets (`DeepSets`, `Transformer`, `GNN`) apply `circular_embed`
+themselves when given a periodic `geometry` (their `circular_n_freq` field).
+The transforms below are for the input side of a custom conditioner:
 
 - `nflojax.embeddings.circular_embed(x, geometry, n_freq)` — per-coord
   Fourier features on a periodic box; lowest harmonic tiles `geometry.box`

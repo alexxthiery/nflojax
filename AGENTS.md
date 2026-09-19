@@ -74,11 +74,11 @@ flows        -> transforms (gate), nets (types)
 transforms   -> nets (MLP), splines, scalar_function, geometry, domains
 distributions -> geometry (UniformBox), domains (ProductBase), utils.lattice (LatticeBase factories), nets (types)
 domains      -> numpy, jax.numpy (flat coordinate topology metadata)
-embeddings   -> geometry (circular_embed), nets (types)
+embeddings   -> geometry (circular_embed)
 utils.pbc    -> geometry, nets (types)
 utils.lattice -> numpy (no JAX / Flax — static lattice positions)
 geometry     -> numpy (no JAX / Flax — configuration values only)
-nets         -> flax.linen
+nets         -> flax.linen, embeddings (circular inputs), geometry, utils.pbc (GNN distances)
 ```
 
 ## Entry Points
@@ -109,6 +109,7 @@ builder just because another builder supports it.
 | Context feature extractor | yes | no | no | yes |
 | LOFT / linear / flat permutations | yes | no | no | caller-defined |
 | Circular coordinate shifts | no | yes | no | caller-defined |
+| Circular conditioner inputs | no | yes (`circular_n_freq`, product feature map) | yes (factory gets `geometry`; nets' `circular_n_freq`) | caller-defined |
 | Particle circular shifts / CoM | no | no | yes | caller-defined |
 
 ## Key Patterns
@@ -216,6 +217,14 @@ Previously fixed:
   Gaussian `LatticeBase`, score samples with the forward `log_q` from
   `sample_and_log_prob`, not `log_prob(x)` — the inverse path is unreliable for
   samples that wrap across the box seam.
+- **On a torus, conditioners must not read raw coordinates.** The cube's faces
+  are one seam: a frozen particle just below `+B` and one just above `-B` are
+  neighbours, yet raw coordinates differ by `2B`, so the conditioner is
+  discontinuous exactly where lattice sites often sit (`LatticeBase` puts many
+  sites on the box edge). Pass the builder's `geometry` to the particle nets:
+  on a fully periodic geometry they then feed `circular_embed` features to
+  their first layer (`circular_n_freq`, default 8). In bgmat-clean, moving the
+  sites off the seam alone raised mW N=8 ESS from 8 % to 19 %.
 
 ## Sibling repos
 

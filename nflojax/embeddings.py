@@ -2,9 +2,10 @@
 """
 Stateless feature transforms for conditioner inputs.
 
-Two pure functions, both jit-friendly, used by Stage D conditioners
-(Transformer, GNN) and by any user-supplied conditioner that wants
-ready-made periodic / scalar features:
+Two pure functions, both jit-friendly. ``circular_embed`` is the first-layer
+input of the particle conditioners (DeepSets, Transformer, GNN) on a periodic
+geometry (their ``circular_n_freq`` field); both are also for any
+user-supplied conditioner that wants ready-made periodic / scalar features:
 
 - `circular_embed(x, geometry, n_freq)` -- per-coord Fourier features
   on a periodic box.
@@ -20,7 +21,9 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from .geometry import Geometry
-from .nets import Array
+
+# Defined here, not imported from .nets: nets imports this module.
+Array = jnp.ndarray
 
 
 def circular_embed(x: Array, geometry: Geometry, n_freq: int) -> Array:

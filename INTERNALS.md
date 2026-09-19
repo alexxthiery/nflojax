@@ -587,9 +587,13 @@ A conditioner is a Flax `nn.Module` with:
    coupling reshapes based on total element count, so it doesn't care
    which shape you emit.
 
-That is the full contract for a working conditioner. Everything below is
-opt-in — it makes the coupling's identity-at-init path work without
-manual intervention.
+That is the full contract for a working conditioner. On the input side,
+nothing is required; but on a periodic box raw coordinates jump by the box
+side at the cube's seam, so the particle nets feed `circular_embed`
+features to their first layer when given a periodic `geometry`
+(`circular_n_freq`; the GNN keeps raw coordinates for its minimum-image
+distances). Everything below is opt-in — it makes the coupling's
+identity-at-init path work without manual intervention.
 
 ### The optional half (identity-at-init)
 

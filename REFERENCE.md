@@ -263,15 +263,16 @@ for _ in range(num_layers):
 
 `_CoMEmbed` is a private direction-flipped view of `CoMProjection` so that `Flow.sample` (base → data) hits the expansion direction. Particle coverage comes from alternating `swap` on `SplitCoupling`; no per-layer `Permutation` is inserted.
 
-**Conditioner factory contract.** `conditioner` is a **keyword-only callable** invoked once per coupling layer with three kwargs:
+**Conditioner factory contract.** `conditioner` is a **keyword-only callable** invoked once per coupling layer with four kwargs:
 
 | kwarg | value | used by |
 |-------|-------|---------|
 | `required_out_dim` | `N_transformed * d * params_per_scalar` | flat-output conditioners (`DeepSets`) |
 | `out_per_particle` | `d * params_per_scalar` | per-token conditioners (`Transformer`, `GNN`) |
 | `n_frozen` | `N_frozen` | user conditioners that size per-particle context |
+| `geometry` | the cube the conditioner sees, `[-tail_bound, tail_bound]^d`, periodic where `geometry` is | pass it to the particle nets: on a torus they then use circular input features (`circular_n_freq`), continuous across the cube's seam, and the `GNN` measures minimum-image distances in the right box |
 
-The factory returns a fresh `flax.linen.Module`. Absorb unused kwargs with `**_`. With asymmetric splits (odd `N_eff` under `use_com_shift=True`), `required_out_dim` differs between `swap=False` and `swap=True` layers — the builder recomputes per-layer. Per-token conditioners require `N_frozen == N_transformed` (even `N_eff`).
+The factory returns a fresh `flax.linen.Module`. Absorb unused kwargs with `**_` (a factory that ignores `geometry` gets raw coordinates). With asymmetric splits (odd `N_eff` under `use_com_shift=True`), `required_out_dim` differs between `swap=False` and `swap=True` layers — the builder recomputes per-layer. Per-token conditioners require `N_frozen == N_transformed` (even `N_eff`).
 
 **Base distribution.** Mandatory. Must match the inner event shape:
 
@@ -1024,6 +1025,8 @@ ds_params = init_conditioner(key, ds, jnp.zeros((1, N_frozen, d)))
 | `out_dim` | int | Total flat output size (typically `N_transformed · d · (3K − 1)`) |
 | `context_dim` | int | 0 for unconditional; context is broadcast across the particle axis |
 | `activation` | callable | Default `nn.elu` |
+| `geometry` | `Geometry` \| None | Period of the circular input features (the particle builder passes the flow-frame cube); default `None` |
+| `circular_n_freq` | int \| None | Harmonics per coordinate fed to `phi_0` via `circular_embed`; `None` (default) = `nflojax.nets.DEFAULT_CIRCULAR_N_FREQ` (8) on a fully periodic `geometry`, else raw coordinates; `0` = raw. Same rule in `Transformer` and `GNN` |
 
 **Params dict:** `{"phi_0": …, "phi_1": …, …, "rho_0": …, …, "dense_out": {"kernel", "bias"}}`.
 
@@ -1057,6 +1060,8 @@ params = coupling.init_params(key)
 | `out_per_particle` | int | Per-particle output; `d · (3K − 1)` for a spline coupling |
 | `ffn_multiplier` | int | FFN hidden width = `ffn_multiplier · embed_dim` (default 4) |
 | `context_dim` | int | 0 for unconditional; context projected to `embed_dim` and broadcast-added to every token |
+| `geometry` | `Geometry` \| None | Period of the circular input features; default `None` |
+| `circular_n_freq` | int \| None | Harmonics per coordinate fed to `input_proj`; `None` (default) = 8 on a fully periodic `geometry`, else raw; `0` = raw |
 
 ### GNN
 
@@ -1078,7 +1083,7 @@ coupling = SplitCoupling(
 params = coupling.init_params(key)
 ```
 
-**Architecture:** per-particle `embed` → for each layer, compute the top-`num_neighbours` neighbour list via `nflojax.utils.pbc.pairwise_distance_sq(x, geometry)` and `jax.lax.top_k(-d_sq)` (self-edge pinned to +∞ via `jnp.where`), run a message MLP over `[h_i, h_j, d_ij]`, sum-aggregate, residual node update → per-token `dense_out`. Equivariance holds per-token.
+**Architecture:** per-particle `embed` (of `circular_embed` features on a fully periodic `geometry`, else of raw coordinates) → for each layer, compute the top-`num_neighbours` neighbour list via `nflojax.utils.pbc.pairwise_distance_sq(x, geometry)` and `jax.lax.top_k(-d_sq)` (self-edge pinned to +∞ via `jnp.where`), run a message MLP over `[h_i, h_j, d_ij]`, sum-aggregate, residual node update → per-token `dense_out`. Equivariance holds per-token.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -1087,9 +1092,10 @@ params = coupling.init_params(key)
 | `out_per_particle` | int | required | Per-particle output |
 | `num_neighbours` | int | `12` | K nearest neighbours per forward (resolved in PLAN.md §10.5; apps may override) |
 | `cutoff` | float \| None | `None` | If set, messages from neighbours with distance ≥ `cutoff` are zero-weighted |
-| `geometry` | `Geometry` \| None | `None` | `None` → Euclidean distances; `Geometry` → PBC minimum-image |
+| `geometry` | `Geometry` \| None | `None` | `None` → Euclidean distances; `Geometry` → PBC minimum-image, and the period of the circular node features |
 | `context_dim` | int | `0` | 0 for unconditional |
 | `activation` | callable | `nn.silu` | Activation inside message and update MLPs |
+| `circular_n_freq` | int \| None | `None` | Harmonics per coordinate fed to `embed`; `None` = 8 on a fully periodic `geometry`, else raw; `0` = raw. Distances always use raw coordinates |
 
 Note: not SE(3)-equivariant — only permutation-equivariant. For E(3)/SE(3), supply a user-side EGNN / NequIP / MACE conditioner (see [DESIGN.md §4 item 7](DESIGN.md)).
 
@@ -1481,9 +1487,11 @@ non-orthorhombic cells (DESIGN.md §4.8).
 from nflojax.embeddings import circular_embed, positional_embed
 ```
 
-Stateless feature transforms used by Stage D conditioners (Transformer,
-GNN) and any user-supplied conditioner that wants ready-made periodic /
-scalar features. No learnable parameters; no random state.
+Stateless feature transforms. `circular_embed` is the first-layer input of
+the particle nets (`DeepSets`, `Transformer`, `GNN`) on a periodic geometry
+(their `circular_n_freq` field); both are also for any user-supplied
+conditioner that wants ready-made periodic / scalar features. No learnable
+parameters; no random state.
 
 | Function | Signature | Purpose |
 |----------|-----------|---------|

@@ -303,6 +303,13 @@ theta = self.conditioner.apply({"params": mlp_params}, cond_input, context)
   permutation-aware conditioners — the three built-in examples
   (`DeepSets`, `Transformer`, `GNN`) all use this path.
 
+On a torus the frozen coordinates live in a cube whose faces are one seam:
+two neighbouring configurations can differ by the box side in a raw
+coordinate. A custom conditioner should read `circular_embed(x, geometry,
+n_freq)` features there, as the built-in particle nets do through their
+`circular_n_freq` field; `build_particle_flow` hands every factory the
+cube as `geometry`.
+
 The output-side reshape only depends on total element count. The
 conditioner may emit either a flat `(*batch, transformed_flat · (3K − 1))`
 or a structured `(*batch, *transformed_shape, 3K − 1)` tensor of the

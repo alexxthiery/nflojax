@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
 import jax
+import numpy as np
 
 from ..flows import Bijection, Flow
 from ..geometry import Geometry
@@ -113,26 +114,34 @@ def build_particle_flow(
     Conditioner contract
     --------------------
     ``conditioner`` is a **keyword-only factory**, called once per
-    coupling layer, with three kwargs::
+    coupling layer, with four kwargs::
 
         required_out_dim = N_transformed * d * params_per_scalar
         out_per_particle = d * params_per_scalar
         n_frozen         = N_frozen
+        geometry         = the cube the conditioner sees, [-tail_bound, tail_bound]^d,
+                           periodic on the axes where ``geometry`` is
+
+    Pass ``geometry`` on to the net: on a torus the particle nets then feed
+    circular features to their first layer (``circular_n_freq``), so they
+    are continuous across the cube's seam, and the GNN computes
+    minimum-image distances in the right box. Factories that end in ``**_``
+    may ignore it (raw coordinates).
 
     The factory returns a fresh ``flax.linen.Module``. Canonical usages::
 
         from nflojax.nets import DeepSets, Transformer, GNN
 
         # Flat-output conditioner (DeepSets): uses required_out_dim.
-        lambda *, required_out_dim, **_: DeepSets(
+        lambda *, required_out_dim, geometry, **_: DeepSets(
             phi_hidden=(64, 64), rho_hidden=(64,),
-            out_dim=required_out_dim,
+            out_dim=required_out_dim, geometry=geometry,
         )
 
         # Per-token conditioner (Transformer / GNN): uses out_per_particle.
-        lambda *, out_per_particle, **_: Transformer(
-            num_layers=2, num_heads=4, embed_dim=64,
-            out_per_particle=out_per_particle,
+        lambda *, out_per_particle, geometry, **_: GNN(
+            num_layers=2, hidden=64, out_per_particle=out_per_particle,
+            geometry=geometry,
         )
 
     Per-token conditioners require ``N_frozen == N_transformed`` (a
@@ -248,6 +257,12 @@ def build_particle_flow(
     spline_geometry = Geometry.cubic(
         d=d, side=2.0 * tail_bound, lower=-float(tail_bound),
     )
+    # What the conditioners see: the same cube, periodic where the physical
+    # box is (a slab keeps its open axis).
+    conditioner_geometry = Geometry(
+        lower=np.full(d, -float(tail_bound)), upper=np.full(d, float(tail_bound)),
+        periodic=geometry.periodic,
+    )
 
     # Pre-split the key: one sub-key per SplitCoupling init plus one per
     # CircularShift. Rescale and _CoMEmbed are parameter-free, so they
@@ -281,6 +296,7 @@ def build_particle_flow(
                 required_out_dim=required_out_dim,
                 out_per_particle=out_per_particle,
                 n_frozen=n_frozen,
+                geometry=conditioner_geometry,
             )
             coupling = SplitCoupling(
                 event_shape=(N_eff, d),

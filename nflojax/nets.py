@@ -38,12 +38,36 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from .embeddings import circular_embed
 from .geometry import Geometry
 from .utils.pbc import pairwise_distance_sq
 
 
 Array = jnp.ndarray
 PRNGKey = jax.Array  # type alias for JAX random keys
+
+# Harmonics per coordinate when a particle net's `circular_n_freq` is None on a
+# fully periodic geometry (bgmat and DeepMind's solid flows use 8 at small N).
+DEFAULT_CIRCULAR_N_FREQ = 8
+
+
+def _particle_features(x: Array, geometry: Geometry | None, n_freq: int | None) -> Array:
+    """First-layer input of a particle net: circular features on a torus, else `x`.
+
+    On a periodic box the cube's faces are one seam: raw coordinates jump by
+    the box side between two neighbouring configurations, circular features
+    do not. `n_freq=None` means `DEFAULT_CIRCULAR_N_FREQ` when `geometry` is
+    set and every axis is periodic, else raw coordinates; `0` forces raw.
+    """
+    if n_freq is None:
+        n_freq = DEFAULT_CIRCULAR_N_FREQ if geometry is not None and geometry.is_periodic() else 0
+    if n_freq < 0:
+        raise ValueError(f"circular_n_freq must be >= 0 or None, got {n_freq}.")
+    if n_freq == 0:
+        return x
+    if geometry is None:
+        raise ValueError(f"circular_n_freq={n_freq} needs a geometry (the period of each axis).")
+    return circular_embed(x, geometry, n_freq)
 
 
 # Module-level helper used by GNN to gather per-particle neighbour features
@@ -418,6 +442,8 @@ class DeepSets(nn.Module):
     Permutation-invariant conditioner for particle-axis events.
 
     Architecture:
+      0. Per-particle input features: `circular_embed` of the coordinates
+         on a fully periodic `geometry` (see `circular_n_freq`), else raw.
       1. (optional) Broadcast `context` across the particle axis and
          concatenate into each per-particle feature vector.
       2. phi: a Dense stack applied per-particle with shared weights.
@@ -449,12 +475,20 @@ class DeepSets(nn.Module):
       context_dim: Context width (0 for unconditional). Context is
         broadcast across the particle axis.
       activation: Activation between Dense layers (default: elu).
+      geometry: Optional `Geometry` of the coordinates the net sees (the
+        particle builder passes the flow-frame cube). Sets the period of
+        the circular input features.
+      circular_n_freq: Harmonics per coordinate for the input features;
+        `None` = 8 on a fully periodic `geometry`, else raw coordinates;
+        `0` = raw coordinates.
     """
     phi_hidden: Sequence[int]
     rho_hidden: Sequence[int]
     out_dim: int
     context_dim: int = 0
     activation: Callable[[Array], Array] = nn.elu
+    geometry: Geometry | None = None
+    circular_n_freq: int | None = None
 
     @nn.compact
     def __call__(self, x: Array, context: Array | None = None) -> Array:
@@ -463,6 +497,7 @@ class DeepSets(nn.Module):
                 f"DeepSets expects input with rank >= 2 "
                 f"(a particle axis is required); got shape {x.shape}."
             )
+        x = _particle_features(x, self.geometry, self.circular_n_freq)
 
         if context is not None and self.context_dim == 0:
             raise ValueError(
@@ -565,7 +600,9 @@ class Transformer(nn.Module):
     Permutation-equivariant self-attention conditioner.
 
     Architecture (pre-norm):
-      1. `input_proj`: Dense(embed_dim) applied per-particle.
+      1. `input_proj`: Dense(embed_dim) applied per-particle, to
+         `circular_embed` features of the coordinates on a fully periodic
+         `geometry` (see `circular_n_freq`), else to the raw coordinates.
       2. (optional) Broadcast-add a learned context projection to every
          token.
       3. For each of `num_layers` blocks:
@@ -596,6 +633,11 @@ class Transformer(nn.Module):
         (default 4, standard Transformer).
       context_dim: Context width (0 for unconditional). Context is
         projected to `embed_dim` and broadcast-added to every token.
+      geometry: Optional `Geometry` of the coordinates the net sees; sets
+        the period of the circular input features.
+      circular_n_freq: Harmonics per coordinate for the input features;
+        `None` = 8 on a fully periodic `geometry`, else raw coordinates;
+        `0` = raw coordinates.
     """
     num_layers: int
     num_heads: int
@@ -603,6 +645,8 @@ class Transformer(nn.Module):
     out_per_particle: int
     ffn_multiplier: int = 4
     context_dim: int = 0
+    geometry: Geometry | None = None
+    circular_n_freq: int | None = None
 
     @nn.compact
     def __call__(self, x: Array, context: Array | None = None) -> Array:
@@ -627,7 +671,8 @@ class Transformer(nn.Module):
                 f"context_dim={self.context_dim} but context was not passed."
             )
 
-        h = nn.Dense(self.embed_dim, name="input_proj")(x)
+        h = nn.Dense(self.embed_dim, name="input_proj")(
+            _particle_features(x, self.geometry, self.circular_n_freq))
 
         if context is not None and self.context_dim > 0:
             if context.shape[-1] != self.context_dim:
@@ -688,7 +733,9 @@ class GNN(nn.Module):
     Permutation-equivariant message-passing conditioner.
 
     Architecture:
-      1. `embed`: Dense(hidden) applied per-particle.
+      1. `embed`: Dense(hidden) applied per-particle, to `circular_embed`
+         features of the coordinates on a fully periodic `geometry` (see
+         `circular_n_freq`), else to the raw coordinates.
       2. (optional) Context broadcast-added to each node (projected to
          `hidden`).
       3. Per-forward neighbour list: top-`num_neighbours` nearest
@@ -713,10 +760,14 @@ class GNN(nn.Module):
       num_neighbours: K nearest neighbours per forward. Default 12.
       cutoff: Optional distance cutoff; messages from neighbours farther
         than `cutoff` are zero-weighted. `None` keeps all K neighbours.
-      geometry: Optional `Geometry` for PBC minimum-image distances.
-        `None` uses plain Euclidean distances.
+      geometry: Optional `Geometry` for PBC minimum-image distances and
+        the period of the circular input features. `None` uses plain
+        Euclidean distances and raw coordinates.
       context_dim: Context width (0 for unconditional).
       activation: Activation inside message and update MLPs.
+      circular_n_freq: Harmonics per coordinate for the node features;
+        `None` = 8 on a fully periodic `geometry`, else raw coordinates;
+        `0` = raw coordinates. Distances always use the raw coordinates.
     """
     num_layers: int
     hidden: int
@@ -726,6 +777,7 @@ class GNN(nn.Module):
     geometry: Geometry | None = None
     context_dim: int = 0
     activation: Callable[[Array], Array] = nn.silu
+    circular_n_freq: int | None = None
 
     @nn.compact
     def __call__(self, x: Array, context: Array | None = None) -> Array:
@@ -751,7 +803,8 @@ class GNN(nn.Module):
                 f"context_dim={self.context_dim} but context was not passed."
             )
 
-        h = nn.Dense(self.hidden, name="embed")(x)
+        h = nn.Dense(self.hidden, name="embed")(
+            _particle_features(x, self.geometry, self.circular_n_freq))
 
         if context is not None and self.context_dim > 0:
             if context.shape[-1] != self.context_dim:
