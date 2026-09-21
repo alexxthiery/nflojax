@@ -634,6 +634,18 @@ The additional field `flatten_input: bool = True` selects the conditioner input 
 
 The output-side reshape only depends on total element count, so the conditioner may emit either a flat `(*batch, transformed_flat * (3K - 1))` or a structured `(*batch, *transformed_shape, 3K - 1)` tensor of the same total size — both unflatten correctly.
 
+`feature_map: Callable[[Array], Array] | None = None` decides **what the conditioner sees**. It is a pure function applied to the structured frozen slice before the conditioner (and before any flattening), so the conditioner can read something other than the variable being transformed:
+
+```python
+sites = lattice_sites[:N // 2]                      # fixed, per token
+coupling = SplitCoupling(
+    ..., flatten_input=False,
+    feature_map=lambda frozen: frozen + sites,       # condition on positions
+)                                                    # while transforming displacements
+```
+
+The frozen slice itself passes through the coupling untouched, so a feature map cannot affect invertibility or the log-det, and `init_params` sizes the conditioner from the mapped width (a map that concatenates features widens the first layer accordingly). Downstream motivation: a crystal flow wants to transform displacements from lattice sites (so that no length depends on the box, which is what transfer across system sizes needs) while conditioning on positions; conditioning on displacements alone hides the lattice from a conditioner that has no positional encoding, and bgmat-clean measured the cost as a nat of reverse KL and a fall from 84% to 1% ESS.
+
 **Params dict:**
 
 | Key | Shape | Description |

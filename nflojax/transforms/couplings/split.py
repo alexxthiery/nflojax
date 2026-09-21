@@ -50,6 +50,18 @@ class SplitCoupling:
                    `linear_tails` or `transformed_flat * 3K` for `circular`.
                    Input shape depends on `flatten_input` (see below).
       swap:        if False, the first partition is frozen; if True, the last.
+      feature_map: optional pure function applied to the structured frozen
+                   slice before the conditioner sees it (and before any
+                   flattening). Use it to condition on something other than the
+                   transformed variable: a crystal flow transforms each
+                   particle's displacement from its lattice site but must
+                   condition on positions, or the conditioner cannot tell which
+                   site a particle occupies (bgmat-clean measured a nat of
+                   reverse KL and a drop from 84% to 1% ESS when it could not).
+                   The frozen slice itself passes through the coupling
+                   untouched, so a feature map cannot affect invertibility or
+                   the log-det, and `init_params` sizes the conditioner from the
+                   mapped width.
       flatten_input: when True (default), the frozen slice is flattened to
                    `(*batch, frozen_flat)` before the conditioner call — the
                    contract `MLP` expects. When False, the conditioner sees
@@ -85,6 +97,7 @@ class SplitCoupling:
     max_derivative: float = 10.0
     boundary_slopes: str = "linear_tails"
     flatten_input: bool = True
+    feature_map: Callable[[Array], Array] | None = None
 
     def __post_init__(self):
         self.event_shape = tuple(int(d) for d in self.event_shape)
@@ -255,6 +268,19 @@ class SplitCoupling:
                 f"got {x.shape[-self.event_ndims:]}."
             )
 
+    def _cond_input(self, frozen: Array, batch_shape: Tuple[int, ...]) -> Array:
+        """What the conditioner sees: the frozen slice, optionally re-featured.
+
+        `feature_map` is applied to the structured frozen slice before any
+        flattening, so a caller can attach fixed per-token features (lattice
+        sites, for instance) or replace the coordinates entirely. It is a pure
+        function and the frozen slice passes through the coupling untouched, so
+        it cannot affect invertibility or the log-det.
+        """
+        if self.feature_map is not None:
+            frozen = self.feature_map(frozen)
+        return frozen.reshape(batch_shape + (-1,)) if self.flatten_input else frozen
+
     def _forward_or_inverse(
         self,
         params: Any,
@@ -276,7 +302,7 @@ class SplitCoupling:
         # over the transformed slice. The output reshape depends only on the
         # total element count, so the conditioner is free to emit a flat or
         # structured tensor of the right size.
-        cond_input = frozen.reshape(batch_shape + (-1,)) if self.flatten_input else frozen
+        cond_input = self._cond_input(frozen, batch_shape)
         theta = self.conditioner.apply({"params": mlp_params}, cond_input, context)
         theta = theta.reshape(batch_shape + transformed_event_shape + (params_per_scalar,))
         widths = theta[..., :K]
@@ -368,18 +394,19 @@ class SplitCoupling:
             self.event_shape, self.split_axis, self.split_index,
             self.event_ndims, self.swap,
         )
-        if self.flatten_input:
-            dummy_x = jnp.zeros((1, frozen_flat), dtype=jnp.float32)
-        else:
-            event_axis = self.event_ndims + self.split_axis
-            axis_size = self.event_shape[event_axis]
-            frozen_sz = self.split_index if not self.swap else axis_size - self.split_index
-            frozen_shape = list(self.event_shape)
-            frozen_shape[event_axis] = frozen_sz
-            dummy_x = jnp.zeros((1,) + tuple(frozen_shape), dtype=jnp.float32)
+        # Build the structured dummy and take it through `_cond_input`, the same
+        # path the forward pass uses, so `feature_map` sees the same shape at
+        # init as it will in use and the conditioner is sized from its output.
+        event_axis = self.event_ndims + self.split_axis
+        axis_size = self.event_shape[event_axis]
+        frozen_sz = self.split_index if not self.swap else axis_size - self.split_index
+        frozen_shape = list(self.event_shape)
+        frozen_shape[event_axis] = frozen_sz
+        dummy_x = jnp.zeros((1,) + tuple(frozen_shape), dtype=jnp.float32)
         dummy_context = (
             jnp.zeros((1, context_dim), dtype=jnp.float32) if context_dim > 0 else None
         )
+        dummy_x = self._cond_input(dummy_x, (1,))
         variables = self.conditioner.init(key, dummy_x, dummy_context)
         mlp_params = variables["params"]
         mlp_params = self._patch_dense_out(mlp_params)

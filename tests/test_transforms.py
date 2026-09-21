@@ -1574,6 +1574,96 @@ class TestLogdetVsAutodiff:
 # a tensor axis (not a flat mask) and sums log-det over the trailing
 # event_ndims axes. Target use case: (B, N, d) particle systems with
 # split_axis=-2 (particle axis), event_ndims=2.
+class TestSplitCouplingFeatureMap:
+    """`SplitCoupling(feature_map=...)`: what the conditioner sees.
+
+    Motivation (bgmat-clean R1b.4, 2026-09-21): a crystal flow transforms each
+    particle's displacement from its lattice site, but its conditioner must read
+    positions, or it cannot tell which site a particle occupies or which
+    particles are neighbours. Downstream measured the cost of conflating the two:
+    the flow's reverse KL plateaued a nat worse and its effective sample size
+    fell from 84% to 1%. Before this hook the only ways were a wrapper module
+    (which breaks the `dense_out` identity-at-init patching) or threading a
+    constant context through every call site.
+
+    `feature_map` is a pure function of the frozen slice, applied before the
+    conditioner. It cannot affect invertibility or the log-det, since the frozen
+    slice passes through untouched.
+    """
+
+    def _coupling(self, key, feature_map=None, swap=False):
+        from nflojax.nets import DeepSets
+        n, d, bins = 8, 3, 4
+        conditioner = DeepSets(
+            phi_hidden=(16,), rho_hidden=(16,),
+            out_dim=(n // 2) * d * (3 * bins - 1),
+        )
+        block = SplitCoupling(
+            event_shape=(n, d), split_axis=-2, split_index=n // 2, event_ndims=2,
+            conditioner=conditioner, swap=swap, num_bins=bins, tail_bound=5.0,
+            boundary_slopes="linear_tails", flatten_input=False, feature_map=feature_map,
+        )
+        return block, block.init_params(key)
+
+    def test_identity_at_init_and_round_trip_with_a_feature_map(self):
+        """The hook must not disturb the two invariants every coupling keeps."""
+        key = jax.random.PRNGKey(0)
+        sites = jnp.arange(4 * 3, dtype=jnp.float32).reshape(4, 3)
+        block, params = self._coupling(key, feature_map=lambda f: f + sites)
+        x = jax.random.normal(jax.random.PRNGKey(1), (5, 8, 3))
+        y, log_det = block.forward(params, x)
+        assert jnp.allclose(y, x, atol=1e-5)
+        assert jnp.allclose(log_det, 0.0, atol=1e-5)
+        back, _ = block.inverse(params, y)
+        assert jnp.allclose(back, x, atol=1e-5)
+
+    def test_the_mapped_features_reach_the_conditioner(self):
+        """Behavioural: a map that discards its input must make the transform
+        independent of the frozen half. With perturbed parameters, changing the
+        frozen particles then leaves the transformed ones untouched, which is not
+        true without the map."""
+        key = jax.random.PRNGKey(0)
+        x = jax.random.normal(jax.random.PRNGKey(1), (1, 8, 3))
+        other = x.at[:, :4].add(0.7)
+
+        def transformed_half(feature_map):
+            block, params = self._coupling(key, feature_map=feature_map)
+            noisy = jax.tree_util.tree_map(lambda p: p + 0.1, params)
+            return [block.forward(noisy, z)[0][:, 4:] for z in (x, other)]
+
+        blind_a, blind_b = transformed_half(lambda f: jnp.zeros_like(f))
+        assert jnp.allclose(blind_a, blind_b, atol=1e-6)
+        seeing_a, seeing_b = transformed_half(None)
+        assert not jnp.allclose(seeing_a, seeing_b, atol=1e-3)
+
+    def test_a_wider_feature_map_sizes_the_conditioner_at_init(self):
+        """Concatenating features widens the conditioner's input; init must size
+        the first layer from the mapped width, not the raw one."""
+        key = jax.random.PRNGKey(0)
+        sites = jnp.ones((4, 3), dtype=jnp.float32)
+
+        def with_sites(frozen):
+            return jnp.concatenate([frozen, jnp.broadcast_to(sites, frozen.shape)], axis=-1)
+
+        block, params = self._coupling(key, feature_map=with_sites)
+        first = params["mlp"]["phi_0"]["kernel"]
+        assert first.shape[0] == 6      # 3 coordinates + 3 site features
+        x = jax.random.normal(jax.random.PRNGKey(1), (2, 8, 3))
+        y, log_det = block.forward(params, x)
+        assert jnp.allclose(y, x, atol=1e-5) and jnp.allclose(log_det, 0.0, atol=1e-5)
+
+    def test_swap_gets_the_other_half(self):
+        """With `swap=True` the frozen slice is the other half, so a feature map
+        that depends on position in the array sees different values; it must
+        still build and stay identity at init."""
+        key = jax.random.PRNGKey(0)
+        for swap in (False, True):
+            block, params = self._coupling(key, feature_map=lambda f: 2.0 * f, swap=swap)
+            x = jax.random.normal(jax.random.PRNGKey(1), (3, 8, 3))
+            y, _ = block.forward(params, x)
+            assert jnp.allclose(y, x, atol=1e-5)
+
+
 class TestSplitCoupling:
     """Tests for SplitCoupling on rank-2 events shaped (N, d)."""
 
