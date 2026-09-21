@@ -373,7 +373,15 @@ class TestOrthogonalTransform:
         y, ld_fwd = transform.forward(random_params, x)
         x_rec, ld_inv = transform.inverse(random_params, y)
 
-        assert float(jnp.abs(x - x_rec).max()) < 1e-5
+        # The round trip goes through two matrix exponentials of a skew matrix
+        # whose norm is large here (||A||_F is 12 at dim=4 and 26 at dim=8 with
+        # scale=3), which costs about three decimal digits in float32: the
+        # measured error is 1.9e-3 to 3.0e-3 and grows with the norm, while
+        # under x64 it is ~1e-12. The tolerance therefore has to follow the
+        # precision; a flat 1e-5 failed in float32 (found 2026-09-21, from
+        # 8537cb8). It still catches a real inversion bug, which would be O(1).
+        atol = 1e-9 if jax.config.jax_enable_x64 else 5e-3
+        assert float(jnp.abs(x - x_rec).max()) < atol
         assert jnp.array_equal(ld_fwd, jnp.zeros(50))
         assert jnp.array_equal(ld_inv, jnp.zeros(50))
 
