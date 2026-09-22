@@ -445,9 +445,12 @@ half at inference. Translation invariance is handled *inside* the
 augmented flow by centring both halves symmetrically — no `CoMProjection`
 needed.
 
-The full pattern — base, `SplitCoupling` across the physical / auxiliary
-boundary, inference-time marginalisation — is expressible with primitives
-that ship in nflojax:
+**Use `build_augmented_flow`** (`nflojax.builders`, 0.4.0) unless you need a
+topology it does not cover: it assembles this pattern with the torus-correct
+frame, the periodic guard, per-coupling conditioner sizing and a `feature_map`
+hook, exactly as `build_particle_flow` does for the particle split. The
+hand-rolled version below is kept because it shows what the builder composes,
+and because the pieces are public:
 
 ```python
 import jax, jax.numpy as jnp
@@ -496,11 +499,27 @@ The `MLP` above is shown for simplicity; any conditioner in
 `flatten_input=True` and use `DeepSets` / `Transformer` / `GNN` for
 permutation-aware variants.
 
-**Translation invariance.** Both halves of the base are zero-centred
-Gaussian, so the joint distribution is invariant under simultaneous
-translation `(x, x_aux) → (x + c, x_aux + c)`. The `SplitCoupling` layers
-preserve this because they only couple the two halves to each other; no
-layer independently shifts one half. No `CoMProjection` is needed.
+**Translation: the augmented pattern does not solve it** (corrected
+2026-09-22; an earlier version of this section claimed it did). Two reasons,
+both easy to check:
+
+- a zero-centred Gaussian base is *not* translation invariant — `N(x; 0, σ²)`
+  changes under `x → x + c`; only an improper flat direction would be invariant;
+- the couplings are not translation equivariant either. A spline acts on the
+  **absolute** coordinates of the transformed half with parameters that are a
+  general function of the frozen half, so nothing makes
+  `f(x + c) = f(x) + c` hold. Measured on a two-layer augmented flow with
+  perturbed parameters, `|f(x + c) − f(x) − c|` is as large as the output
+  itself (`tests/test_augmented.py::TestTranslation`).
+
+What Pattern B does fix is the **permutation** restriction (`S_N` per half
+instead of `S_frozen × S_transformed`), not translation. A translation-invariant
+target still needs application-side handling of the flat direction. Two known
+routes: interleave centre-of-mass shifts so the conditioning half is centred and
+the translation lives in the transformed half (bgmat), or tether the centre of
+mass and correct `log Z` analytically (bgmat-clean). Either way it is the
+application's business — and `CoMProjection` is still the wrong tool here, for
+the density reason below.
 
 **Do not add the `(d/2) · log(N)` correction here.** Doubling the degrees
 of freedom keeps the ambient dimension intact; the auxiliary

@@ -10,6 +10,7 @@ from .assembly import (
 from .flat import build_realnvp, build_spline_realnvp
 from .product import build_product_spline_flow
 from .particle import build_particle_flow
+from .augmented import build_augmented_flow
 
 __all__ = [
     "analyze_mask_coverage",
@@ -21,4 +22,5 @@ __all__ = [
     "build_spline_realnvp",
     "build_product_spline_flow",
     "build_particle_flow",
+    "build_augmented_flow",
 ]

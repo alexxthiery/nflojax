@@ -38,7 +38,7 @@ This is JAX scientific computing code. Every decision follows from that.
 ```
 nflojax/
   __init__.py          empty
-  builders/            Public builder facade plus assembly/flat/product/particle modules
+  builders/            Public builder facade plus assembly/flat/product/particle/augmented modules
   flows.py             Flow and Bijection classes
   transforms/          Public transform facade plus focused implementation modules
   distributions.py     StandardNormal, DiagNormal, UniformBox
@@ -64,6 +64,7 @@ tests/
   test_embeddings.py
   test_utils_pbc.py
   test_utils_lattice.py
+  test_augmented.py    Pattern B builder: the split, odd N, translation (non-)equivariance
 ```
 
 ## Module Dependency Graph
@@ -97,6 +98,7 @@ already supports them.
 | `build_spline_realnvp` | flat rank-1 | all real | `StandardNormal` or `DiagNormal` | MLP | product bounds, rank-N events |
 | `build_product_spline_flow` | flat rank-1 | mixed real/interval/circular | `ProductBase` | MLP with default product feature map | LOFT, linear mixing, permutations |
 | `build_particle_flow` | structured rank-N | box/torus particle events | caller-provided | keyword-only conditioner factory | flat masks, feature extractor |
+| `build_augmented_flow` | structured rank-2 | Pattern B `(2N, d)`: physical + auxiliary | caller-provided on `(2N, d)` | splits on the physical/auxiliary boundary, so every coupling sees all N | translation handling, the auxiliary target, marginal density |
 | `assemble_bijection` / `assemble_flow` | custom | caller-defined | caller-provided | caller-defined | automatic topology decisions |
 
 Builder option sets are intentionally different. Do not add an option to a

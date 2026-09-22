@@ -144,6 +144,7 @@ when a contributor needs a narrower implementation entry point.
 | `build_spline_realnvp` | flat rank-1 | all real | `StandardNormal` or `DiagNormal` | MLP | product bounds, rank-N events |
 | `build_product_spline_flow` | flat rank-1 | mixed real/interval/circular | `ProductBase` | MLP with default product feature map | LOFT, linear mixing, permutations |
 | `build_particle_flow` | structured rank-N | box/torus particle events | caller-provided | keyword-only conditioner factory | flat masks, feature extractor |
+| `build_augmented_flow` | structured rank-2 | Pattern B: `(2N, d)` physical + auxiliary | caller-provided on `(2N, d)` | splits on the physical/auxiliary boundary; `feature_map` hook | translation handling, aux target, marginal density |
 | `assemble_bijection` / `assemble_flow` | custom | caller-defined | caller-provided | caller-defined | automatic topology decisions |
 
 Builder option sets are intentionally not identical. If an option is not in
@@ -291,6 +292,45 @@ The factory returns a fresh `flax.linen.Module`. Absorb unused kwargs with `**_`
 | `return_transform_only` | bool | False | Return `Bijection` instead of `Flow` |
 
 Identity-at-init holds for the learnable part: `SplitCoupling._patch_dense_out` zero-patches every conditioner's `dense_out`, so the couplings are identity on first forward. The only non-zero init log-det contribution is the constant `Rescale` term.
+
+### build_augmented_flow
+
+Pattern B as a builder (0.4.0): the event is doubled to `(2N, d)`, `N` physical
+particles then `N` auxiliary ones, and every `SplitCoupling` splits across that
+boundary (`split_axis=-2`, `split_index=N`) rather than along the particle axis.
+
+```python
+from nflojax.builders import build_augmented_flow
+from nflojax.distributions import DiagNormal
+
+base = DiagNormal(event_shape=(2 * N, d))          # the augmented event
+flow, params = build_augmented_flow(
+    key, geometry=geometry, event_shape=(N, d),    # the PHYSICAL half
+    num_layers=8, conditioner=conditioner_factory,
+    base_dist=base, base_params=base.init_params(), num_bins=16,
+)
+joint = flow.sample(params, key, (batch,))         # (batch, 2N, d)
+physical = joint[..., :N, :]
+```
+
+Why it exists, and what it does not do:
+
+- **each coupling conditions on a full copy of all `N` particles**, where a
+  particle split conditions on half of them (at `N = 8`, four of eight);
+- **both partitions are exactly `N`**, so per-token conditioners work for odd
+  `N`, which a particle split cannot serve;
+- it is `S_N`-equivariant per half when the conditioner is;
+- it does **not** make the flow translation invariant, and the base is not
+  either (see EXTENDING.md, "Translation"); the flat direction is the
+  application's to handle;
+- what the auxiliary half means, and any physical-marginal density, are also
+  the application's. The canonical choice is a conditional target whose
+  auxiliary factor is normalised, so the joint's `log Z` is the physical one.
+
+Same conditioner-factory contract, periodic/`linear_tails` guard and
+`{"base", "transform"}` params as `build_particle_flow`. `feature_map` is passed
+to every coupling for conditioning on derived features; a map that widens the
+last axis needs a conditioner that does not apply its own coordinate embedding.
 
 ### Builder Options
 
